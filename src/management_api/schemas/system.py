@@ -4,9 +4,17 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from .base import StrictSchema
+
+
+class StrictRequestSchema(StrictSchema):
+    """P6 body base: OpenAPI JSON scalar types are never coerced."""
+
+    model_config = ConfigDict(
+        extra="forbid", populate_by_name=True, strict=True,
+    )
 
 
 class RetryErrorsData(StrictSchema):
@@ -35,27 +43,27 @@ class RetrySettingsData(StrictSchema):
     revision: str
 
 
-class RetryErrorsPatch(StrictSchema):
+class RetryErrorsPatch(StrictRequestSchema):
     openaiServerOverloaded: bool | None = None
     openaiServerError: bool | None = None
     claudeOverloaded: bool | None = None
     xaiUnavailable: bool | None = None
 
 
-class RetryRecoveryPatch(StrictSchema):
+class RetryRecoveryPatch(StrictRequestSchema):
     oauthRefresh: bool | None = None
     invalidEncryptedContent: bool | None = None
     claudeContext1mFallback: bool | None = None
 
 
-class RetryTransientPatch(StrictSchema):
+class RetryTransientPatch(StrictRequestSchema):
     enabled: bool | None = None
     maxExtraAttempts: int | None = Field(default=None, ge=1, le=5)
     backoffSeconds: list[float] | None = Field(default=None, min_length=1, max_length=5)
     errors: RetryErrorsPatch | None = None
 
 
-class RetrySettingsPatch(StrictSchema):
+class RetrySettingsPatch(StrictRequestSchema):
     transient: RetryTransientPatch | None = None
     recovery: RetryRecoveryPatch | None = None
 
@@ -68,7 +76,7 @@ class TimeoutSettingsData(StrictSchema):
     revision: str
 
 
-class TimeoutSettingsPatch(StrictSchema):
+class TimeoutSettingsPatch(StrictRequestSchema):
     connect: int | None = Field(default=None, ge=1)
     firstByte: int | None = Field(default=None, ge=1)
     idle: int | None = Field(default=None, ge=1)
@@ -83,7 +91,7 @@ class ErrorCooldownSettingsData(StrictSchema):
     revision: str
 
 
-class ErrorCooldownSettingsPatch(StrictSchema):
+class ErrorCooldownSettingsPatch(StrictRequestSchema):
     errorWindows: list[int] | None = Field(default=None, min_length=1)
     oauthGraceCount: int | None = Field(default=None, ge=0, le=100)
     ladderMinIntervalSeconds: int | None = Field(default=None, ge=0, le=3600)
@@ -98,7 +106,7 @@ class ScoringSettingsData(StrictSchema):
     revision: str
 
 
-class ScoringSettingsPatch(StrictSchema):
+class ScoringSettingsPatch(StrictRequestSchema):
     emaAlpha: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     recentWindow: int | None = Field(default=None, ge=1, le=1000)
     errorPenaltyFactor: int | None = Field(default=None, ge=0, le=100)
@@ -110,7 +118,7 @@ class AffinitySettingsData(StrictSchema):
     revision: str
 
 
-class AffinitySettingsPatch(StrictSchema):
+class AffinitySettingsPatch(StrictRequestSchema):
     ttlMinutes: int | None = Field(default=None, ge=1, le=1440)
 
 
@@ -119,7 +127,7 @@ class CchSettingsData(StrictSchema):
     revision: str
 
 
-class CchSettingsPatch(StrictSchema):
+class CchSettingsPatch(StrictRequestSchema):
     mode: Literal["disabled", "dynamic"] | None = None
 
 
@@ -130,7 +138,7 @@ class ConcurrencySettingsData(StrictSchema):
     revision: str
 
 
-class ConcurrencySettingsPatch(StrictSchema):
+class ConcurrencySettingsPatch(StrictRequestSchema):
     enabled: bool | None = None
     queueWaitSeconds: int | None = Field(default=None, ge=0)
     defaultMaxConcurrent: int | None = Field(default=None, ge=0)
@@ -144,7 +152,7 @@ class ApiKeyConcurrencySettingsData(StrictSchema):
     revision: str
 
 
-class ApiKeyConcurrencySettingsPatch(StrictSchema):
+class ApiKeyConcurrencySettingsPatch(StrictRequestSchema):
     enabled: bool | None = None
     defaultMaxConcurrent: int | None = Field(default=None, ge=0)
     defaultMaxQueue: int | None = Field(default=None, ge=0)
@@ -158,7 +166,7 @@ class QuotaMonitorSettingsData(StrictSchema):
     revision: str
 
 
-class QuotaMonitorSettingsPatch(StrictSchema):
+class QuotaMonitorSettingsPatch(StrictRequestSchema):
     enabled: bool | None = None
     intervalSeconds: int | None = Field(default=None, ge=10, le=86400)
     thresholdPercent: float | None = Field(default=None, ge=1, le=100, allow_inf_nan=False)
@@ -174,10 +182,12 @@ class NotificationEventsData(StrictSchema):
     oauthRefreshFailed: bool
     noChannels: bool
     openaiStoreSaveFailed: bool
+    statusAlert: bool
+    appUpdate: bool
     networkMonitor: bool
 
 
-class NotificationEventsPatch(StrictSchema):
+class NotificationEventsPatch(StrictRequestSchema):
     channelPermanent: bool | None = None
     channelRecovered: bool | None = None
     quotaDisabled: bool | None = None
@@ -187,6 +197,8 @@ class NotificationEventsPatch(StrictSchema):
     oauthRefreshFailed: bool | None = None
     noChannels: bool | None = None
     openaiStoreSaveFailed: bool | None = None
+    statusAlert: bool | None = None
+    appUpdate: bool | None = None
     networkMonitor: bool | None = None
 
 
@@ -196,7 +208,7 @@ class NotificationSettingsData(StrictSchema):
     revision: str
 
 
-class NotificationSettingsPatch(StrictSchema):
+class NotificationSettingsPatch(StrictRequestSchema):
     enabled: bool | None = None
     events: NotificationEventsPatch | None = None
 
@@ -206,11 +218,11 @@ class OpenAiWebSocketSettingsData(StrictSchema):
     revision: str
 
 
-class OpenAiWebSocketSettingsPatch(StrictSchema):
+class OpenAiWebSocketSettingsPatch(StrictRequestSchema):
     responsesUpstreamWsForOAuth: bool | None = None
 
 
-class BlacklistTermRequest(StrictSchema):
+class BlacklistTermRequest(StrictRequestSchema):
     term: str = Field(min_length=1, max_length=200)
 
 

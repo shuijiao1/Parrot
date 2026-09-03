@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from typing import Annotated
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, Header, Path, Request, Response, status
 
@@ -49,6 +50,17 @@ def _data(value) -> ContentBlacklistData:
     return ContentBlacklistData.model_validate(asdict(value))
 
 
+def _raw_channel_term(request: Request) -> tuple[str, str]:
+    """Split encoded DELETE segments before ASGI's percent-decoding loses `/`."""
+    raw_path = bytes(request.scope.get("raw_path") or b"").decode("latin-1")
+    marker = "/content-blacklist/channels/"
+    encoded = raw_path.split(marker, 1)[-1]
+    channel, separator, term = encoded.partition("/")
+    if not separator:
+        return "", ""
+    return unquote(channel), unquote(term)
+
+
 @router.get(
     "/content-blacklist", operation_id="getContentBlacklist",
     dependencies=[Depends(reject_unknown_query())], tags=["management-system"],
@@ -84,7 +96,7 @@ def delete_default_blacklist_term(
 
 
 @router.post(
-    "/content-blacklist/channels/{channelId}", operation_id="addChannelBlacklistTerm",
+    "/content-blacklist/channels/{channelId:path}", operation_id="addChannelBlacklistTerm",
     dependencies=[Depends(reject_unknown_query())], tags=["management-system"],
     status_code=status.HTTP_201_CREATED,
     response_model=DataEnvelope[ContentBlacklistData], responses=_CREATE_RESPONSES,
@@ -99,15 +111,20 @@ def add_channel_blacklist_term(
 
 
 @router.delete(
-    "/content-blacklist/channels/{channelId}/{term:path}", operation_id="deleteChannelBlacklistTerm",
+    "/content-blacklist/channels/{channelId:path}/{term:path}", operation_id="deleteChannelBlacklistTerm",
     dependencies=[Depends(reject_unknown_query())], tags=["management-system"],
     status_code=status.HTTP_204_NO_CONTENT,
     responses={204: {"description": "Channel blacklist term removed"}, **management_error_responses(*_ERRORS)},
 )
 def delete_channel_blacklist_term(
+    request: Request,
     channel_id: Annotated[str, Path(alias="channelId", min_length=1, max_length=512)],
     term: Annotated[str, Path(min_length=1, max_length=200)], context: DestroyContext,
     controls: Controls, if_match: IfMatch = None,
 ) -> Response:
-    controls.blacklist.delete_channel(context, channel_id, term, expected_revision=if_match)
+    raw_channel, raw_term = _raw_channel_term(request)
+    controls.blacklist.delete_channel(
+        context, raw_channel or channel_id, raw_term or term,
+        expected_revision=if_match,
+    )
     return Response(status_code=204)

@@ -31,6 +31,12 @@ _TERMINAL = {
     OperationStatus.FAILED,
     OperationStatus.CANCELLED,
 }
+
+
+class PublicIdentifier(str):
+    """Explicit marker for a reviewed public identifier in an Operation DTO."""
+
+
 _SENSITIVE_KEYS = {
     "apikey",
     "accesstoken",
@@ -51,7 +57,13 @@ def _public_value(value: Any) -> Any:
         public: dict[str, Any] = {}
         for key, item in value.items():
             normalized = "".join(ch for ch in str(key).lower() if ch.isalnum())
-            public[str(key)] = "[REDACTED]" if normalized in _SENSITIVE_KEYS else _public_value(item)
+            public[str(key)] = (
+                str(item)
+                if normalized in _SENSITIVE_KEYS and isinstance(item, PublicIdentifier)
+                else "[REDACTED]"
+                if normalized in _SENSITIVE_KEYS
+                else _public_value(item)
+            )
         return public
     if isinstance(value, (list, tuple)):
         return [_public_value(item) for item in value]

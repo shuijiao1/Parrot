@@ -110,6 +110,8 @@ class NotificationEvents:
     oauthRefreshFailed: bool
     noChannels: bool
     openaiStoreSaveFailed: bool
+    statusAlert: bool
+    appUpdate: bool
     networkMonitor: bool
 
 

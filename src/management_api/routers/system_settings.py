@@ -70,7 +70,7 @@ _CCH = {"mode": "disabled", "revision": "rev_example"}
 _CONCURRENCY = {"enabled": True, "queueWaitSeconds": 30, "defaultMaxConcurrent": 0, "revision": "rev_example"}
 _AK_CONCURRENCY = {"enabled": True, "defaultMaxConcurrent": 5, "defaultMaxQueue": 50, "defaultQueueWaitSeconds": 1800, "revision": "rev_example"}
 _QUOTA = {"enabled": False, "intervalSeconds": 60, "thresholdPercent": 95, "revision": "rev_example"}
-_NOTIFICATIONS = {"enabled": True, "events": {"channelPermanent": True, "channelRecovered": True, "quotaDisabled": True, "quotaResumed": True, "quotaCooldown": True, "oauthRefreshed": True, "oauthRefreshFailed": True, "noChannels": True, "openaiStoreSaveFailed": True, "networkMonitor": True}, "revision": "rev_example"}
+_NOTIFICATIONS = {"enabled": True, "events": {"channelPermanent": True, "channelRecovered": True, "quotaDisabled": True, "quotaResumed": True, "quotaCooldown": True, "oauthRefreshed": True, "oauthRefreshFailed": True, "noChannels": True, "openaiStoreSaveFailed": True, "statusAlert": True, "appUpdate": True, "networkMonitor": True}, "revision": "rev_example"}
 _WS = {"responsesUpstreamWsForOAuth": False, "revision": "rev_example"}
 
 

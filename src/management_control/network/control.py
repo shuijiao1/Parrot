@@ -21,7 +21,11 @@ from src.management_control.context import AuditSink, ManagementContext
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
 from src.management_control.models.common import DomainControl, stable_revision
 from src.management_control.observability.common import sanitize_credentials
-from src.management_control.operations import ManagementOperation, OperationStore
+from src.management_control.operations import (
+    ManagementOperation,
+    OperationStore,
+    PublicIdentifier,
+)
 
 from .gateway import DEFAULT_NETWORK_GATEWAY, NetworkGateway
 from .models import (
@@ -38,6 +42,10 @@ from .models import (
     ProxySummary,
     Socks5Settings,
 )
+
+
+_MONITOR_CATEGORIES = frozenset({"dns", "socks5", "channel", "core"})
+_MONITOR_PUBLIC_IDENTIFIERS = frozenset({"key", "category"})
 
 
 class PlanState(str, Enum):
@@ -130,14 +138,27 @@ class NetworkControl(DomainControl):
     def _thread_worker(worker: Callable[[], None]) -> None:
         threading.Thread(target=worker, daemon=True, name="network-operation").start()
 
-    def _channels(self) -> list[Any]:
+    @staticmethod
+    def _dependency(callable_):
+        """Translate a dependency failure without retaining its raw exception chain."""
+        failed = False
         try:
-            return list(self.gateway.channels())
-        except Exception as exc:
-            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True) from exc
+            value = callable_()
+        except ManagementError:
+            raise
+        except Exception:
+            failed = True
+        if failed:
+            raise ManagementError(
+                ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
+            )
+        return value
+
+    def _channels(self) -> list[Any]:
+        return self._dependency(lambda: list(self.gateway.channels()))
 
     def _api_channel_ids(self) -> tuple[str, ...]:
-        cfg = self.gateway.config_get()
+        cfg = self._dependency(self.gateway.config_get)
         values = []
         for entry in cfg.get("channels") or []:
             if not isinstance(entry, Mapping):
@@ -148,7 +169,7 @@ class NetworkControl(DomainControl):
         return tuple(values)
 
     def _network(self, cfg: Mapping[str, Any] | None = None) -> NetworkSettings:
-        cfg = self.gateway.config_get() if cfg is None else cfg
+        cfg = self._dependency(self.gateway.config_get) if cfg is None else cfg
         net = cfg.get("network") if isinstance(cfg.get("network"), Mapping) else {}
         dns = net.get("dns") if isinstance(net.get("dns"), Mapping) else {}
         socks = net.get("socks5") if isinstance(net.get("socks5"), Mapping) else {}
@@ -191,12 +212,7 @@ class NetworkControl(DomainControl):
 
     def get_settings(self, context: ManagementContext | None) -> NetworkSettings:
         self._read(context)
-        try:
-            return self._network()
-        except ManagementError:
-            raise
-        except Exception as exc:
-            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True) from exc
+        return self._dependency(self._network)
 
     @staticmethod
     def _fingerprint(value: Any) -> str:
@@ -245,6 +261,28 @@ class NetworkControl(DomainControl):
             clean.pop("displayUrl", None)
         return clean
 
+    @staticmethod
+    def _public_monitor_result(value: Mapping[str, Any]) -> dict[str, Any]:
+        """Sanitize untrusted fields without treating public DTO names as secrets."""
+        clean: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            if key == "key":
+                clean[key] = PublicIdentifier(str(item or ""))
+            elif key in _MONITOR_PUBLIC_IDENTIFIERS:
+                clean[key] = copy.deepcopy(item)
+            else:
+                # Preserve shape while applying key-name and text credential
+                # rules to every untrusted value/detail/error field.
+                clean[key] = sanitize_credentials({key: copy.deepcopy(item)})[key]
+        category = str(clean.get("category") or "")
+        if category not in _MONITOR_CATEGORIES:
+            raise NetworkControl._validation(
+                "category", "unsupported_value", "Unsupported monitor category",
+            )
+        clean["category"] = category
+        return clean
+
     def _public_plan(self, plan: _Plan) -> NetworkTestPlan:
         tested = (
             {"servers": tuple(_safe_dns_server(item) for item in plan.value)}
@@ -287,15 +325,27 @@ class NetworkControl(DomainControl):
         self, context: ManagementContext | None, servers: list[str], *, operations: OperationStore | None = None,
     ) -> ManagementOperation:
         actual = self._write(context, Capability.WRITE)
+        invalid = False
         try:
             normalized = self.gateway.normalize_dns(list(servers))
-        except Exception as exc:
+        except Exception:
+            invalid = True
+        if invalid:
+            # Raise outside the handler so raw URL credentials cannot survive in
+            # ManagementError.__cause__ or __context__.
             self._audit(actual, "network.dns.test", "dns", "failed")
-            raise self._validation("servers", "invalid_dns", "DNS server list is invalid") from exc
-        with self.gateway.serialized_updates():
-            cfg = self.gateway.config_get()
-            revision = self._network(cfg).revision
-            authority_fingerprint = self._network_authority_fingerprint(cfg)
+            raise self._validation(
+                "servers", "invalid_dns", "DNS server list is invalid",
+            )
+        def authority_snapshot():
+            with self.gateway.serialized_updates():
+                cfg = self.gateway.config_get()
+                return (
+                    self._network(cfg).revision,
+                    self._network_authority_fingerprint(cfg),
+                )
+
+        revision, authority_fingerprint = self._dependency(authority_snapshot)
         store = self._operations(operations)
         operation = store.create(actual, kind="network.dns.test", cancellable=False)
 
@@ -311,26 +361,40 @@ class NetworkControl(DomainControl):
                 except ManagementError:
                     pass
                 self._audit(actual, "network.dns.test", "dns", "failed")
+        launch_failed = False
         try:
             self._start_worker(worker)
-        except Exception as exc:
+        except Exception:
             store.fail(operation.id, code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE, message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value, retryable=True)
-            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True, operation_id=operation.id) from exc
+            self._audit(actual, "network.dns.test", "dns", "failed")
+            launch_failed = True
+        if launch_failed:
+            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True, operation_id=operation.id)
         return operation
 
     def start_socks5_test(
         self, context: ManagementContext | None, url: str, *, operations: OperationStore | None = None,
     ) -> ManagementOperation:
         actual = self._write(context, Capability.SECRETS_WRITE)
+        invalid = False
         try:
             normalized = self.gateway.normalize_socks5(url).url
-        except Exception as exc:
+        except Exception:
+            invalid = True
+        if invalid:
             self._audit(actual, "network.socks5.test", "socks5", "failed")
-            raise self._validation("url", "invalid_socks5", "SOCKS5 URL is invalid") from exc
-        with self.gateway.serialized_updates():
-            cfg = self.gateway.config_get()
-            revision = self._network(cfg).revision
-            authority_fingerprint = self._network_authority_fingerprint(cfg)
+            raise self._validation(
+                "url", "invalid_socks5", "SOCKS5 URL is invalid",
+            )
+        def authority_snapshot():
+            with self.gateway.serialized_updates():
+                cfg = self.gateway.config_get()
+                return (
+                    self._network(cfg).revision,
+                    self._network_authority_fingerprint(cfg),
+                )
+
+        revision, authority_fingerprint = self._dependency(authority_snapshot)
         store = self._operations(operations)
         operation = store.create(actual, kind="network.socks5.test", cancellable=False)
 
@@ -346,11 +410,15 @@ class NetworkControl(DomainControl):
                 except ManagementError:
                     pass
                 self._audit(actual, "network.socks5.test", "socks5", "failed")
+        launch_failed = False
         try:
             self._start_worker(worker)
-        except Exception as exc:
+        except Exception:
             store.fail(operation.id, code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE, message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value, retryable=True)
-            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True, operation_id=operation.id) from exc
+            self._audit(actual, "network.socks5.test", "socks5", "failed")
+            launch_failed = True
+        if launch_failed:
+            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True, operation_id=operation.id)
         return operation
 
     def _plan_result(self, plan: _Plan) -> dict[str, Any]:
@@ -388,11 +456,13 @@ class NetworkControl(DomainControl):
                         raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
                     self._check_revision(expected_revision, current.revision)
                     if kind == "dns":
-                        self.gateway.save_dns(list(plan.value))
+                        self._dependency(lambda: self.gateway.save_dns(list(plan.value)))
                     else:
-                        self.gateway.save_socks5(str(plan.value), enabled=True)
+                        self._dependency(
+                            lambda: self.gateway.save_socks5(str(plan.value), enabled=True),
+                        )
                 self._plans[plan.id] = replace(plan, state=PlanState.COMMITTED)
-            result = self._network()
+            result = self._dependency(self._network)
         except ManagementError:
             self._audit(actual, action, plan_id, "failed")
             raise
@@ -414,8 +484,8 @@ class NetworkControl(DomainControl):
             with self.gateway.serialized_updates():
                 current = self._network()
                 self._check_revision(expected_revision, current.revision)
-                self.gateway.sync_system_dns()
-            result = self._network()
+                self._dependency(self.gateway.sync_system_dns)
+            result = self._dependency(self._network)
         except ManagementError:
             self._audit(actual, "network.dns.sync", "dns", "failed")
             raise
@@ -427,10 +497,7 @@ class NetworkControl(DomainControl):
 
     def list_dns_cache(self, context, *, page: int, page_size: int) -> DnsCachePage:
         self._read(context)
-        try:
-            rows = list(self.gateway.dns_cache())
-        except Exception as exc:
-            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True) from exc
+        rows = self._dependency(lambda: list(self.gateway.dns_cache()))
         items = []
         for row in rows:
             expires = _utc(row.get("expires_at_epoch"))
@@ -451,10 +518,10 @@ class NetworkControl(DomainControl):
     def clear_dns_cache(self, context) -> None:
         actual = self._write(context, Capability.DESTRUCTIVE)
         try:
-            self.gateway.clear_dns_cache()
-        except Exception as exc:
+            self._dependency(self.gateway.clear_dns_cache)
+        except ManagementError:
             self._audit(actual, "network.dns.cache.clear", "dns-cache", "failed")
-            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True) from exc
+            raise
         self._audit(actual, "network.dns.cache.clear", "dns-cache", "succeeded")
 
     def update_socks5_state(self, context, enabled: bool, *, expected_revision=None) -> NetworkSettings:
@@ -469,8 +536,8 @@ class NetworkControl(DomainControl):
                 url = str((raw.get("socks5") or {}).get("url") or "").strip()
                 if enabled and not url:
                     raise self._validation("enabled", "socks5_not_configured", "Configure and test a SOCKS5 URL first")
-                self.gateway.set_socks5_enabled(enabled)
-            result = self._network()
+                self._dependency(lambda: self.gateway.set_socks5_enabled(enabled))
+            result = self._dependency(self._network)
         except ManagementError:
             self._audit(actual, "network.socks5.state.update", "socks5", "failed")
             raise
@@ -481,10 +548,7 @@ class NetworkControl(DomainControl):
         return result
 
     def _monitor(self) -> NetworkMonitorSettings:
-        try:
-            raw = self.gateway.monitor_config()
-        except Exception as exc:
-            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True) from exc
+        raw = self._dependency(self.gateway.monitor_config)
         core = raw.get("core") if isinstance(raw.get("core"), Mapping) else {}
         channels = raw.get("channels") if isinstance(raw.get("channels"), Mapping) else {}
         by_key = channels.get("byKey") if isinstance(channels.get("byKey"), Mapping) else {}
@@ -542,6 +606,13 @@ class NetworkControl(DomainControl):
                 unknown_ids = [str(key) for key in by_channel if str(key) not in known]
                 if unknown_ids: raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND, fields=tuple(ErrorField(f"channels.byChannel.{key}", "UNKNOWN_CHANNEL", "Unknown canonical channel ID") for key in unknown_ids))
                 if any(type(value) is not bool for value in by_channel.values()): raise self._validation("channels.byChannel", "bool_type", "Boolean channel values are required")
+        semantic_change = any(key in patch for key in ("enabled", "intervalSeconds", "dns", "socks5"))
+        semantic_change = semantic_change or bool(core_patch)
+        semantic_change = semantic_change or bool(channels_patch and (
+            "enabled" in channels_patch or bool(channels_patch.get("byChannel"))
+        ))
+        if not semantic_change:
+            raise self._validation("body", "empty_patch", "At least one field is required")
 
         def mutate(mon):
             for key in ("enabled", "intervalSeconds", "dns", "socks5"):
@@ -555,7 +626,7 @@ class NetworkControl(DomainControl):
             with self.gateway.monitor_transaction():
                 current = self._monitor()
                 self._check_revision(expected_revision, current.revision)
-                self.gateway.update_monitor(mutate)
+                self._dependency(lambda: self.gateway.update_monitor(mutate))
             result = self._monitor()
         except ManagementError:
             self._audit(actual, action, "monitor", "failed")
@@ -568,10 +639,7 @@ class NetworkControl(DomainControl):
 
     def list_checks(self, context, *, page: int, page_size: int) -> NetworkCheckPage:
         self._read(context)
-        try:
-            raw = self.gateway.checks()
-        except Exception as exc:
-            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True) from exc
+        raw = self._dependency(self.gateway.checks)
         items = []
         for row in raw:
             checked = row.get("checked_at")
@@ -579,9 +647,14 @@ class NetworkControl(DomainControl):
                 checked_at = _utc(float(checked) / 1000) if checked is not None else None
             except (TypeError, ValueError, OverflowError):
                 checked_at = None
+            category = str(row.get("category") or "")
+            if category not in _MONITOR_CATEGORIES:
+                raise self._validation(
+                    "category", "unsupported_value", "Unsupported monitor category",
+                )
             items.append(NetworkCheck(
                 key=str(row.get("key") or ""), label=str(sanitize_credentials(row.get("label") or "")),
-                category=str(row.get("category") or ""), ok=bool(row.get("ok")),
+                category=category, ok=bool(row.get("ok")),
                 detail=str(sanitize_credentials(row.get("detail") or "")),
                 latencyMilliseconds=(self._safe_int(row.get("latency_ms"), 0) if row.get("latency_ms") is not None else None),
                 checkedAt=checked_at,
@@ -598,18 +671,22 @@ class NetworkControl(DomainControl):
                 store.mark_running(operation.id)
                 raw = asyncio.run(self.gateway.run_monitor())
                 formatter = getattr(self.gateway, "format_monitor_result", lambda item: item)
-                result = [sanitize_credentials(formatter(item)) for item in raw]
+                result = [self._public_monitor_result(formatter(item)) for item in raw]
                 store.succeed(operation.id, {"checks": result})
                 self._audit(actual, "network.monitor.run", "monitor", "succeeded")
             except Exception:
                 try: store.fail(operation.id, code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE, message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value, retryable=True)
                 except ManagementError: pass
                 self._audit(actual, "network.monitor.run", "monitor", "failed")
+        launch_failed = False
         try:
             self._start_worker(worker)
-        except Exception as exc:
+        except Exception:
             store.fail(operation.id, code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE, message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value, retryable=True)
-            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True, operation_id=operation.id) from exc
+            self._audit(actual, "network.monitor.run", "monitor", "failed")
+            launch_failed = True
+        if launch_failed:
+            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True, operation_id=operation.id)
         return operation
 
     # Frozen Telegram compatibility methods. They share the same gateway and

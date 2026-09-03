@@ -1,161 +1,73 @@
-"""Compatibility adapter that drives frozen Telegram retention UI through P4 control."""
+"""Frozen Telegram retention commands over the authoritative log database."""
 
 from __future__ import annotations
 
-import copy
-import threading
-import time
 from typing import Any, Callable
 
 from src import config, log_db
+from src.management_auth import Capability
 from src.management_control.context import ManagementContext
-from src.management_control.errors import ManagementError
-from src.management_control.observability.retention import RetentionControl, RetentionMode
-from src.management_control.operations import OperationStore
-
-
-class _CapturingLogDb:
-    """Delegate to log_db while retaining data needed only by the frozen TG renderer."""
-
-    def __init__(self, module=log_db) -> None:
-        self.module = module
-        self.last_plan: dict[str, Any] | None = None
-        self.last_policy_result: dict[str, Any] | None = None
-        self.last_apply_result: dict[str, Any] | None = None
-        self.last_exception: Exception | None = None
-        self.progress: Callable[[dict[str, Any]], None] | None = None
-        self._lock = threading.RLock()
-
-    def __getattr__(self, name: str):
-        return getattr(self.module, name)
-
-    def plan_retention(self, days: int) -> dict[str, Any]:
-        try:
-            value = self.module.plan_retention(days)
-        except Exception as exc:
-            with self._lock:
-                self.last_exception = exc
-            raise
-        with self._lock:
-            self.last_plan = copy.deepcopy(value)
-        return value
-
-    def extend_retention_days(self, days: int) -> dict[str, Any]:
-        value = self.module.extend_retention_days(days)
-        with self._lock:
-            self.last_policy_result = copy.deepcopy(value)
-        return value
-
-    def set_retention_forever(self) -> dict[str, Any]:
-        value = self.module.set_retention_forever()
-        with self._lock:
-            self.last_policy_result = copy.deepcopy(value)
-        return value
-
-    def apply_retention_plan(self, plan, *, activate_policy=False, progress=None):
-        def combined(event):
-            callback = self.progress
-            if callback is not None:
-                callback(copy.deepcopy(event))
-            if progress is not None:
-                progress(event)
-        value = self.module.apply_retention_plan(
-            plan, activate_policy=activate_policy, progress=combined,
-        )
-        with self._lock:
-            self.last_apply_result = copy.deepcopy(value)
-        return value
+from src.management_control.observability.common import require
 
 
 class TelegramRetentionAdapter:
-    """Synchronous facade preserving TG call ordering over RetentionControl."""
+    """Thin synchronous facade preserving the v0.31.13 Telegram lifecycle.
 
-    def __init__(self) -> None:
-        self.gateway = _CapturingLogDb()
-        self.control = RetentionControl(
-            log_db=self.gateway,
-            config=config,
-            now=lambda: time.time(),
-            ttl_seconds=600,
-            start_worker=lambda worker: worker(),
-        )
-        self.operations = OperationStore(max_operations=64)
+    The Telegram menu already owns its actor-bound eight-character pending-plan
+    store and exact 600-second TTL.  This adapter must therefore never create a
+    second plan, TTL, capacity limit, or mutable progress capture.  Management API
+    retention continues to use the independent P4 ``RetentionControl``.
+    """
+
+    def __init__(self, *, module=log_db, config_module=config) -> None:
+        self.log_db = module
+        self.config = config_module
+
+    @staticmethod
+    def _write(context: ManagementContext, capability: Capability = Capability.WRITE) -> None:
+        require(context, capability)
 
     def settings(self, context: ManagementContext) -> dict[str, Any]:
-        return self.control.settings(context)
+        require(context, Capability.READ)
+        cfg = self.config.get()
+        policy = self.log_db.retention_policy(cfg)
+        return {
+            "mode": policy["mode"],
+            "days": policy.get("days"),
+            "logStoreBodies": cfg.get("logStoreBodies", True) is not False,
+        }
 
-    def set_log_store_bodies(self, context: ManagementContext, value: bool) -> dict[str, Any]:
-        return self.control.update_settings(
-            context,
-            mode=None,
-            days=None,
-            log_store_bodies=value,
-            expected_revision=None,
-        )
+    def set_log_store_bodies(self, context: ManagementContext, value: bool) -> None:
+        self._write(context)
+        # Exactly the baseline config.update call: raw storage exceptions escape.
+        self.config.update(lambda cfg: cfg.__setitem__("logStoreBodies", value))
 
     def extend_days(self, context: ManagementContext, days: int) -> dict[str, Any]:
-        self.gateway.last_policy_result = None
-        try:
-            self.control.update_settings(
-                context,
-                mode=RetentionMode.DAYS,
-                days=days,
-                log_store_bodies=None,
-                expected_revision=None,
-            )
-        except ManagementError:
-            pass
-        return copy.deepcopy(self.gateway.last_policy_result or {"ok": False})
+        self._write(context)
+        return self.log_db.extend_retention_days(days)
 
     def set_forever(self, context: ManagementContext) -> dict[str, Any]:
-        self.gateway.last_policy_result = None
-        try:
-            self.control.update_settings(
-                context,
-                mode=RetentionMode.FOREVER,
-                days=None,
-                log_store_bodies=None,
-                expected_revision=None,
-            )
-        except ManagementError:
-            pass
-        return copy.deepcopy(self.gateway.last_policy_result or {"ok": False})
+        self._write(context)
+        return self.log_db.set_retention_forever()
 
-    def create_plan(self, context: ManagementContext, days: int) -> tuple[dict[str, Any], str | None, str | None]:
-        self.gateway.last_plan = None
-        self.gateway.last_exception = None
-        public = None
-        try:
-            public = self.control.create_plan(context, days=days)
-        except ManagementError:
-            if self.gateway.last_exception is not None:
-                raise self.gateway.last_exception
-        raw = copy.deepcopy(self.gateway.last_plan or {})
-        return raw, (str(public["id"]) if public else None), (str(public["revision"]) if public else None)
+    def create_plan(self, context: ManagementContext, days: int) -> dict[str, Any]:
+        self._write(context)
+        # Keep the raw cutoff for the frozen renderer's "时间不可表示" fallback.
+        return self.log_db.plan_retention(days)
 
     def commit_plan(
         self,
         context: ManagementContext,
-        plan_id: str,
-        revision: str,
+        plan: dict[str, Any],
         *,
         progress: Callable[[dict[str, Any]], None],
     ) -> dict[str, Any]:
-        self.gateway.last_apply_result = None
-        self.gateway.progress = progress
-        try:
-            self.control.commit_plan(
-                context, plan_id, expected_revision=revision, operations=self.operations,
-            )
-        finally:
-            self.gateway.progress = None
-        return copy.deepcopy(self.gateway.last_apply_result or {"ok": False})
-
-    def cancel_plan(self, context: ManagementContext, plan_id: str) -> None:
-        try:
-            self.control.cancel_plan(context, plan_id)
-        except ManagementError:
-            pass
+        self._write(context, Capability.DESTRUCTIVE)
+        # The callback remains call-local, so concurrent chats cannot exchange
+        # progress events.  RuntimeError and all other authority errors propagate.
+        return self.log_db.apply_retention_plan(
+            plan, activate_policy=True, progress=progress,
+        )
 
 
 DEFAULT_TELEGRAM_RETENTION_ADAPTER = TelegramRetentionAdapter()

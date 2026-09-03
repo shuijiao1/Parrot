@@ -3,11 +3,26 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from enum import Enum
 
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from .base import ResponseMeta, StrictSchema
+
+
+class StrictRequestSchema(StrictSchema):
+    """P6 body base: OpenAPI JSON scalar types are never coerced."""
+
+    model_config = ConfigDict(
+        extra="forbid", populate_by_name=True, strict=True,
+    )
+
+
+class NetworkMonitorCategory(str, Enum):
+    DNS = "dns"
+    SOCKS5 = "socks5"
+    CHANNEL = "channel"
+    CORE = "core"
 
 
 class DnsSettingsData(StrictSchema):
@@ -36,20 +51,27 @@ class NetworkSettingsData(StrictSchema):
     revision: str
 
 
-class DnsTestRequest(StrictSchema):
-    servers: list[str] = Field(min_length=1, max_length=10)
+class DnsTestRequest(StrictRequestSchema):
+    servers: list[str] = Field(
+        min_length=1,
+        max_length=10,
+        json_schema_extra={
+            "writeOnly": True,
+            "examples": [["https://dns.example/dns-query"]],
+        },
+    )
 
 
-class Socks5TestRequest(StrictSchema):
+class Socks5TestRequest(StrictRequestSchema):
     url: str = Field(min_length=1, max_length=4096, json_schema_extra={"writeOnly": True})
 
 
-class NetworkCommitRequest(StrictSchema):
+class NetworkCommitRequest(StrictRequestSchema):
     planId: str = Field(min_length=1, max_length=128)
     force: bool = False
 
 
-class Socks5StatePatch(StrictSchema):
+class Socks5StatePatch(StrictRequestSchema):
     enabled: bool
 
 
@@ -100,18 +122,18 @@ class NetworkMonitorSettingsData(StrictSchema):
     revision: str
 
 
-class MonitorCorePatch(StrictSchema):
+class MonitorCorePatch(StrictRequestSchema):
     openai: bool | None = None
     claude: bool | None = None
     cloudflare: bool | None = None
 
 
-class MonitorChannelsPatch(StrictSchema):
+class MonitorChannelsPatch(StrictRequestSchema):
     enabled: bool | None = None
     byChannel: dict[str, bool] | None = None
 
 
-class NetworkMonitorSettingsPatch(StrictSchema):
+class NetworkMonitorSettingsPatch(StrictRequestSchema):
     enabled: bool | None = None
     intervalSeconds: int | None = Field(default=None, ge=5)
     dns: bool | None = None
@@ -123,7 +145,7 @@ class NetworkMonitorSettingsPatch(StrictSchema):
 class NetworkCheckData(StrictSchema):
     key: str
     label: str
-    category: Literal["dns", "socks5", "channel", "core"] | str
+    category: NetworkMonitorCategory
     ok: bool
     detail: str
     latencyMilliseconds: int | None

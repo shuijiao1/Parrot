@@ -744,7 +744,7 @@ def _scan_retention(chat_id: int, message_id: int, cb_id: str, code: str) -> Non
     ui.answer_cb(cb_id, "正在扫描…")
     ui.edit(chat_id, message_id, "🔎 <b>正在扫描所有月度请求日志…</b>\n\n不会读取或展示请求正文。")
     try:
-        plan, control_plan_id, control_revision = _retention_control.create_plan(
+        plan = _retention_control.create_plan(
             _control_context(chat_id), int(entry["days"]),
         )
     except Exception as exc:
@@ -756,10 +756,7 @@ def _scan_retention(chat_id: int, message_id: int, cb_id: str, code: str) -> Non
         ui.edit(chat_id, message_id, "❌ <b>扫描未完成，已拒绝生成删除计划</b>\n\n" + details,
                 reply_markup=ui.inline_kb([[ui.btn("◀ 返回数据留存", "sys:show:retention")]]))
         return
-    plan_code = _register_retention_pending(
-        chat_id, "plan", plan=plan,
-        control_plan_id=control_plan_id, control_revision=control_revision,
-    )
+    plan_code = _register_retention_pending(chat_id, "plan", plan=plan)
     _render_retention_plan(chat_id, message_id, plan_code, 0)
 
 
@@ -805,8 +802,7 @@ def _commit_retention(chat_id: int, message_id: int, cb_id: str, code: str) -> N
         ui.edit(chat_id, message_id, _retention_progress_text(days, event), reply_markup=busy_kb)
 
     result = _retention_control.commit_plan(
-        _control_context(chat_id), entry.get("control_plan_id"),
-        entry.get("control_revision"), progress=_progress,
+        _control_context(chat_id), plan, progress=_progress,
     )
     if result.get("ok"):
         text = (
@@ -852,11 +848,7 @@ def _set_retention_forever(chat_id: int, message_id: int, cb_id: str) -> None:
 def _cancel_retention(chat_id: int, message_id: int, cb_id: str, code: str | None = None) -> None:
     states.pop_state(chat_id)
     if code:
-        entry = _pop_retention_pending(code, chat_id)
-        if entry and entry.get("control_plan_id"):
-            _retention_control.cancel_plan(
-                _control_context(chat_id), entry["control_plan_id"],
-            )
+        _pop_retention_pending(code, chat_id)
     ui.answer_cb(cb_id, "已取消")
     text, kb = _retention_menu_text_kb()
     ui.edit(chat_id, message_id, text, reply_markup=kb)
@@ -1500,7 +1492,7 @@ def _on_bl_add_default_input(chat_id: int, text: str) -> None:
     if len(kw) > 200:
         ui.send(chat_id, "❌ 关键词过长（上限 200），请重新输入：")
         return
-    _blacklist_control.add_default(_control_context(chat_id), kw)
+    _blacklist_control.telegram_add_default(_control_context(chat_id), kw)
     states.pop_state(chat_id)
     ui.send_result(
         chat_id,
@@ -1530,7 +1522,7 @@ def _bl_del_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
         ui.answer_cb(cb_id, "短码已失效")
         return
     kw = full[5:]
-    _blacklist_control.delete_default(_control_context(chat_id), kw)
+    _blacklist_control.telegram_delete_default(_control_context(chat_id), kw)
     ui.answer_cb(cb_id, "已删除")
     _show_blacklist(chat_id, message_id, "-")
 

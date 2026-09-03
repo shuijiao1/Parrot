@@ -7,7 +7,7 @@ from dataclasses import asdict
 from typing import Any, Callable, Mapping
 
 from src import config as config_module
-from src.management_auth import Capability
+from src.management_auth import AuthMethod, Capability
 from src.management_control.context import AuditSink, ManagementContext
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
 from src.management_control.models.common import DomainControl, stable_revision
@@ -47,6 +47,8 @@ _NOTIFICATION_EVENTS = (
     ("oauthRefreshFailed", "oauth_refresh_failed"),
     ("noChannels", "no_channels"),
     ("openaiStoreSaveFailed", "openai_store_save_failed"),
+    ("statusAlert", "status_alert"),
+    ("appUpdate", "app_update"),
     ("networkMonitor", "network_monitor"),
 )
 
@@ -272,6 +274,12 @@ class SettingsControl(DomainControl):
         if not patch:
             self._audit(actual, action, resource, "failed")
             raise self._validation("body", "empty_patch", "At least one field is required")
+        if actual.actor.auth_method is AuthMethod.TELEGRAM_ADMIN:
+            # The frozen Telegram trace is exactly one authoritative config write.
+            # Preserve the original exception type/message and do not add a
+            # post-commit read, DTO conversion, or audit failure point.
+            self.config.update(mutator)
+            return None
         try:
             with self.config.serialized_updates():
                 current = getattr(self, self._READERS[resource])(self.config.get())
