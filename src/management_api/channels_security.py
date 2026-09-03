@@ -12,10 +12,14 @@ _URL_USERINFO = re.compile(
     re.IGNORECASE,
 )
 _CREDENTIAL_KEYS = (
-    r"(?:x[-_]?api[-_]?key|api[-_]?(?:token|key)|access[-_]?token|"
+    r"(?:"
+    r"(?i:x[-_]?api[-_]?key|api[-_]?(?:token|key)|access[-_]?token|"
     r"refresh[-_]?token|id[-_]?token|management[-_]?key|bot[-_]?token|"
-    r"github[-_]?token|client[-_]?secret|session(?:[-_]?token)?|password|"
-    r"passwd|set[-_]?cookie|cookie)"
+    r"github[-_]?token|client[-_]?secret|session(?:[-_]?(?:token|secret))?|"
+    r"password|passwd|set[-_]?cookie|cookie|credential|token|key|secret)"
+    r"|[A-Za-z][A-Za-z0-9_-]*(?:Token|Key|Secret)"
+    r"|[A-Za-z][A-Za-z0-9_-]*[-_](?i:token|key|secret)"
+    r")"
 )
 _AUTHORIZATION_KEYS = r"(?:proxy[-_]?authorization|authorization)"
 _QUOTED_VALUE = r"(?P<quote>\\*[\"'])(?P<quoted>.*?)(?P=quote)"
@@ -23,7 +27,6 @@ _BARE_VALUE = r"(?P<bare>(?!\[REDACTED\])[^\s\\\"',;&}\]]+)"
 _KEY_ASSIGNMENT = re.compile(
     rf"(?P<prefix>\b{_CREDENTIAL_KEYS}\b(?:\\*[\"'])?\s*(?:=|:)\s*)"
     rf"(?:{_QUOTED_VALUE}|{_BARE_VALUE})",
-    re.IGNORECASE,
 )
 _AUTHORIZATION = re.compile(
     rf"(?P<prefix>\b{_AUTHORIZATION_KEYS}\b(?:\\*[\"'])?\s*(?:=|:)\s*)"
