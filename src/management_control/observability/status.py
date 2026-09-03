@@ -214,11 +214,10 @@ class StatusControl:
                 "apiKeys": len(api_keys) if isinstance(api_keys, dict) else len(api_keys or []),
                 "quotaHot": quota_hot,
             },
-            "today": camelize(_plain(today or {})),
-            "lifetime": camelize(_plain(lifetime or {})),
+            "today": camelize(sanitize_credentials(_plain(today or {}))),
+            "lifetime": camelize(sanitize_credentials(_plain(lifetime or {}))),
             "activeAlerts": camelize(sanitize_credentials(_plain(self.status_monitor.snapshot_active()))),
         }
-        data = sanitize_credentials(data)
         data["revision"] = revision_for(data)
         return data
 
@@ -287,9 +286,8 @@ class StatusControl:
                 "server": int(self.affinity.count()),
                 "client": int(self.affinity.client_count()),
             },
-            "database": camelize(self._database_status()),
+            "database": camelize(sanitize_credentials(self._database_status())),
         }
-        data = sanitize_credentials(data)
         data["revision"] = revision_for(data)
         return data
 

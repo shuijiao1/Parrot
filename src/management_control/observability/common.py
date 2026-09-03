@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import copy
 import hashlib
 import json
@@ -132,6 +134,7 @@ def page_slice(items: Iterable[T], *, page: int, page_size: int) -> PageResult[T
     return PageResult(values[start:start + page_size], page, page_size, len(values))
 
 
+_SECRET_KEY_TERMS = frozenset({"token", "key", "secret", "credential"})
 _SECRET_KEYS = {
     "authorization", "proxy-authorization", "x-api-key", "api-key", "apikey",
     "api_token", "access_token", "refresh_token", "id_token", "credential",
@@ -144,28 +147,31 @@ _SECRET_KEYS_COMPACT = {
     key.lower().replace(" ", "").replace("-", "").replace("_", "")
     for key in _SECRET_KEYS
 }
+_SPACED_SECRET_KEY_PATTERN = (
+    r"proxy[ \t]+authorization|x[ \t]+api[ \t]+key|"
+    r"(?:api|management|bot|github)[ \t]+(?:key|token)|"
+    r"(?:access|refresh|id)[ \t]+token|"
+    r"(?:client|exchange|challenge)[ \t]+secret|"
+    r"session[ \t]+(?:token|secret)|set[ \t]+cookie"
+)
 _SECRET_VALUE_PATTERN = (
-    r'\\"(?:\\.|[^"\\])*\\"'
-    r"|\\'(?:\\.|[^'\\])*\\'"
-    r'|"[^"]*"'
-    r"|'[^']*'"
+    r'\\+"(?:\\.|[^"\\])*\\+"'
+    r"|\\+'(?:\\.|[^'\\])*\\+'"
+    r'|"(?:\\.|[^"\\])*"'
+    r"|'(?:\\.|[^'\\])*'"
     r'|[^\s,;&}\]"\']+'
 )
 _SECRET_ASSIGNMENT_RE = re.compile(
-    r"\b(?P<key>proxy[\s_-]?authorization|authorization|x[\s_-]?api[\s_-]?key|"
-    r"api[\s_-]?(?:key|token)|(?:access|refresh|id)[\s_-]?token|"
-    r"(?:management|bot|github)[\s_-]?(?:key|token)|"
-    r"(?:client|exchange|challenge)[\s_-]?secret|"
-    r"session(?:[\s_-]?(?:token|secret))?|password|passwd|credential|"
-    r"set[\s_-]?cookie|cookie)"
-    r"(?P<key_quote>\\[\"']|[\"']?)(?P<separator>\s*[:=]\s*)"
-    r"(?:bearer\s+|basic\s+)?"
+    rf"(?<![\w-])(?P<key>(?:{_SPACED_SECRET_KEY_PATTERN})|[A-Za-z][A-Za-z0-9_-]*)"
+    r"(?P<key_quote>(?:\\+[\"']|[\"'])?)(?P<separator>\s*[:=]\s*)"
+    r"(?P<auth_prefix>(?:bearer\s+|basic\s+))?"
     rf"(?P<value>{_SECRET_VALUE_PATTERN})",
     re.IGNORECASE,
 )
 _STANDALONE_AUTH_RE = re.compile(
     r"(?<![\w-])(?P<scheme>Bearer|Basic)(?P<separator>[ \t]+)"
-    r"(?P<value>[A-Za-z0-9._~+/=-]+)"
+    r"(?P<value>[A-Za-z0-9._~+/=-]+)",
+    re.IGNORECASE,
 )
 _URL_USERINFO_RE = re.compile(
     r"(?P<scheme>\b[a-z][a-z0-9+.-]*://)[^/?#\s]+@",
@@ -173,21 +179,94 @@ _URL_USERINFO_RE = re.compile(
 )
 
 
+def _is_secret_key(raw_key: str) -> bool:
+    """Classify credential fields by a visible word boundary, not a suffix substring."""
+    key = raw_key.strip()
+    folded = key.casefold()
+    compact = re.sub(r"[\s_-]+", "", folded)
+    if folded in _SECRET_KEY_TERMS or compact in _SECRET_KEYS_COMPACT:
+        return True
+
+    parts = [part for part in re.split(r"[\s_-]+", key) if part]
+    if len(parts) > 1 and parts[-1].casefold() in _SECRET_KEY_TERMS:
+        return any(any(char.isalnum() for char in part) for part in parts[:-1])
+
+    for term in _SECRET_KEY_TERMS:
+        if len(key) <= len(term) or not folded.endswith(term):
+            continue
+        boundary = len(key) - len(term)
+        suffix = key[boundary:]
+        prefix = key[:boundary]
+        if not suffix[0].isupper():
+            continue
+        if key[boundary - 1].islower() or key[boundary - 1].isdigit():
+            return True
+        if suffix == term.title() and prefix.isupper():
+            return True
+    return False
+
+
 def _redacted_value(raw_value: str) -> str:
-    for quote in ('\\"', "\\'", '"', "'"):
-        if raw_value.startswith(quote) and raw_value.endswith(quote):
-            return quote + "<redacted>" + quote
+    for quote in ('"', "'"):
+        if not raw_value.endswith(quote):
+            continue
+        opening_quote = raw_value.find(quote)
+        if opening_quote < 0 or raw_value[:opening_quote].strip("\\"):
+            continue
+        closing_start = len(raw_value) - 1
+        while closing_start > opening_quote and raw_value[closing_start - 1] == "\\":
+            closing_start -= 1
+        return raw_value[:opening_quote + 1] + "<redacted>" + raw_value[closing_start:]
     return "<redacted>"
 
 
 def _redact_secret_assignment(match: re.Match[str]) -> str:
+    if not _is_secret_key(match.group("key")):
+        auth_prefix = match.group("auth_prefix") or ""
+        raw_value = auth_prefix + match.group("value")
+        clean_value = sanitize_credentials(raw_value)
+        if clean_value == raw_value:
+            return match.group(0)
+        value_start = "auth_prefix" if auth_prefix else "value"
+        value_offset = match.start(value_start) - match.start()
+        return match.group(0)[:value_offset] + clean_value
     return (
         match.group("key") + match.group("key_quote") + match.group("separator")
         + _redacted_value(match.group("value"))
     )
 
 
+def _looks_like_opaque_token(value: str) -> bool:
+    if len(value) < 8:
+        return False
+    if not value.isalpha():
+        return True
+    if any(char.isupper() for char in value[1:]) and len(value) >= 12:
+        return True
+    return len(value) >= 24
+
+
+def _is_auth_credential(scheme: str, value: str) -> bool:
+    if "marker" in value.casefold():
+        return True
+    if scheme.casefold() == "basic":
+        if re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", value) is not None:
+            try:
+                decoded = base64.b64decode(value + "=" * (-len(value) % 4), validate=True)
+            except (binascii.Error, ValueError):
+                decoded = b""
+            if b":" in decoded:
+                return True
+        return _looks_like_opaque_token(value)
+
+    if len(value) >= 8 and value.count(".") >= 2 and all(value.split(".")):
+        return True
+    return _looks_like_opaque_token(value)
+
+
 def _redact_standalone_auth(match: re.Match[str]) -> str:
+    if not _is_auth_credential(match.group("scheme"), match.group("value")):
+        return match.group(0)
     return match.group("scheme") + match.group("separator") + "<redacted>"
 
 
@@ -212,9 +291,7 @@ def sanitize_credentials(value: Any) -> Any:
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for key, item in value.items():
-            normalized = str(key).lower().replace(" ", "").replace("-", "_")
-            compact = normalized.replace("_", "")
-            if normalized in _SECRET_KEYS or compact in _SECRET_KEYS_COMPACT:
+            if _is_secret_key(str(key)):
                 out[str(key)] = "<redacted>"
             else:
                 out[str(key)] = sanitize_credentials(item)
@@ -228,7 +305,7 @@ def sanitize_credentials(value: Any) -> Any:
             parsed = json.loads(value)
         except (TypeError, ValueError):
             parsed = None
-        if isinstance(parsed, (dict, list)):
+        if isinstance(parsed, (dict, list, str)):
             clean = sanitize_credentials(parsed)
             if clean != parsed:
                 return json.dumps(clean, ensure_ascii=False, separators=(",", ":"))

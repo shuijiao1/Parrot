@@ -251,7 +251,7 @@ class LogsControl:
             "apiKeyName": clean.get("api_key_name"),
             "requestedModel": clean.get("requested_model"),
             "finalModel": clean.get("final_model"),
-            "channelId": clean.get("final_channel_key"),
+            "channelId": sanitize_credentials(row.get("final_channel_key")),
             "protocol": clean.get("protocol") or clean.get("ingress_protocol"),
             "transport": clean.get("upstream_transport"),
             "retryCount": int(clean.get("retry_count") or clean.get("total_retries") or 0),
@@ -310,7 +310,7 @@ class LogsControl:
         if not raw or not raw.get("log"):
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         detail = raw.get("detail") or {}
-        log = sanitize_credentials(raw.get("log") or {})
+        log = raw.get("log") or {}
         result = {
             "id": log_id,
             "log": self._list_record(log),

@@ -91,6 +91,27 @@ def test_each_p4_operation_requires_session_and_capability(operation_id, tmp_pat
     assert denied.json()["error"]["code"] == "CAPABILITY_DENIED"
 
 
+def test_all_p4_get_and_patch_routes_reject_unknown_query_before_control(tmp_path):
+    client, _, controls, auth = build_client(tmp_path)
+    for operation_id, operation in P4_OPERATIONS.items():
+        method, path, options = operation
+        if method not in {"GET", "PATCH"}:
+            continue
+        separator = "&" if "?" in path else "?"
+        response = _request(
+            client,
+            (method, f"{path}{separator}unexpected=true", options),
+            auth,
+        )
+        assert response.status_code == 422, (operation_id, response.text)
+        assert response.json()["error"]["fields"][0]["path"] == "unexpected"
+
+    for control in (
+        controls.status, controls.stats, controls.logs, controls.media, controls.retention,
+    ):
+        assert control.mock_calls == []
+
+
 def test_overview_and_runtime_happy_schema_control_once_and_pagination(tmp_path):
     client, _, controls, auth = build_client(tmp_path)
     cases = [

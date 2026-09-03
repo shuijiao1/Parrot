@@ -271,6 +271,94 @@ def test_sanitize_credentials_covers_aliases_json_nesting_and_escaped_fragments(
     assert sanitize_credentials(ordinary) == ordinary
 
 
+def test_sanitize_credentials_generic_key_family_across_recursive_and_encoded_forms():
+    marker = "P4_GENERIC_SECRET_MARKER"
+    secret_keys = (
+        "token", "KEY", "Secret", "Credential",
+        "upstreamToken", "upstream_key", "signing-key", "ProviderSecret",
+        "SERVICE_CREDENTIAL",
+    )
+    ordinary = {
+        "monkey": "banana",
+        "MONKEY": "ape",
+        "keyboard": "layout",
+        "token count": 42,
+        "key count": 7,
+        "secret sauce": "recipe",
+        "credential count": 1,
+    }
+
+    clean_dict = sanitize_credentials({
+        **{key: f"{marker}_{index}" for index, key in enumerate(secret_keys)},
+        **ordinary,
+        "payload": [
+            {"anotherToken": marker},
+            ({"private_key": marker}, {"monkey": "banana"}),
+        ],
+    })
+    assert all(clean_dict[key] == "<redacted>" for key in secret_keys)
+    assert {key: clean_dict[key] for key in ordinary} == ordinary
+    assert clean_dict["payload"] == [
+        {"anotherToken": "<redacted>"},
+        ({"private_key": "<redacted>"}, {"monkey": "banana"}),
+    ]
+
+    plain = (
+        f"token={marker}; key: {marker}; secret={marker}; "
+        f"upstreamSecret: {marker}; provider-credential={marker}; "
+        "monkey=banana; token count=42; key count: 7"
+    )
+    assert sanitize_credentials(plain) == (
+        "token=<redacted>; key: <redacted>; secret=<redacted>; "
+        "upstreamSecret: <redacted>; provider-credential=<redacted>; "
+        "monkey=banana; token count=42; key count: 7"
+    )
+
+    regular_json = sanitize_credentials(json.dumps({
+        "Secret": marker, "upstreamCredential": marker, **ordinary,
+    }))
+    assert json.loads(regular_json) == {
+        "Secret": "<redacted>", "upstreamCredential": "<redacted>", **ordinary,
+    }
+
+    double_encoded = json.dumps(json.dumps({
+        "SERVICE_TOKEN": marker,
+        "payload": json.dumps({"privateKey": marker, "monkey": "banana"}),
+    }))
+    clean_double = json.loads(json.loads(sanitize_credentials(double_encoded)))
+    assert clean_double["SERVICE_TOKEN"] == "<redacted>"
+    assert json.loads(clean_double["payload"]) == {
+        "privateKey": "<redacted>", "monkey": "banana",
+    }
+
+    escaped = rf'prefix {{\"UPSTREAM_SECRET\":\"{marker}\"}} suffix'
+    assert sanitize_credentials(escaped) == (
+        r'prefix {\"UPSTREAM_SECRET\":\"<redacted>\"} suffix'
+    )
+
+
+@pytest.mark.parametrize("text", [
+    "Basic routing mode",
+    "Bearer support is enabled",
+    "The Basic tier is active",
+    "mode: Basic routing mode",
+])
+def test_sanitize_credentials_preserves_non_auth_scheme_business_text_exactly(text):
+    assert sanitize_credentials(text) == text
+
+
+def test_sanitize_credentials_redacts_realistic_standalone_auth_credentials():
+    jwt = ".".join(("eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxIn0", "signature"))
+    source = (
+        f"message: Bearer {jwt}; Basic YWxpY2U6czNjcjN0; "
+        "Basic P4_SECRET_SENTINEL; bearer ghp_1234567890abcdef"
+    )
+    assert sanitize_credentials(source) == (
+        "message: Bearer <redacted>; Basic <redacted>; Basic <redacted>; "
+        "bearer <redacted>"
+    )
+
+
 def test_logs_control_filter_sort_page_total_detail_and_secret_safe_body():
     control = LogsControl(log_db=FakeLogDb(), config=FakeConfig(), oauth_manager=FakeOAuth())
     ctx = context()
@@ -281,9 +369,11 @@ def test_logs_control_filter_sort_page_total_detail_and_secret_safe_body():
     ))
     assert result.total == 1
     assert result.items[0]["id"] == "r3"
+    assert result.items[0]["channelId"] == "api:b"
 
     detail = control.detail(ctx, "r3")
     assert detail["requestBodyAvailable"] is True
+    assert detail["log"]["channelId"] == "api:b"
     assert "secret" not in json.dumps(detail, default=str)
     body = control.body_items(
         ctx, "r3", kind=LogBodyKind.REQUEST, query=None,
@@ -409,6 +499,7 @@ def test_logs_control_and_http_structure_sanitized_json_response_body(tmp_path):
             }],
             "usage": {"prompt_tokens": 2, "completion_tokens": 3},
             "github_token": marker,
+            "upstreamSecret": marker,
         })
         return value
 
@@ -443,7 +534,7 @@ def test_logs_list_uses_authoritative_transport_and_page_billing_only(tmp_path):
     db.rows[0]["upstream_transport"] = "websocket"
     db.rows[0]["transport"] = "not-authoritative"
     db.rows[0]["error_message"] = (
-        "botToken=P4_SECRET_MARKER; ordinary upstream failure"
+        "upstreamSecret=P4_SECRET_MARKER; ordinary upstream failure"
     )
     control = LogsControl(log_db=db, config=FakeConfig(), oauth_manager=FakeOAuth())
 
@@ -474,7 +565,9 @@ def test_logs_list_uses_authoritative_transport_and_page_billing_only(tmp_path):
     )
     assert response.status_code == 200, response.text
     assert db.cost_calls == ["r3", "r2"]
+    assert "P4_SECRET_MARKER" not in response.text
     assert response.json()["data"][0]["billing"]["actualCostTicks"] == 300
+    assert response.json()["data"][0]["channelId"] == "api:b"
 
 
 def test_logs_cost_sort_is_rejected_and_model_options_match_or_filter_semantics(tmp_path):
@@ -558,7 +651,8 @@ def test_logs_non_json_raw_body_reuses_common_secret_sanitizer():
         "detail": {
             "response_body": (
                 f"managementKey={marker}; botToken: {marker}; "
-                f"github_token={marker}; ordinary business text"
+                f"github_token={marker}; upstreamSecret={marker}; "
+                f"token={marker}; ordinary business text"
             ),
         },
     }
@@ -568,4 +662,4 @@ def test_logs_non_json_raw_body_reuses_common_secret_sanitizer():
 
     assert marker not in raw["body"]
     assert "ordinary business text" in raw["body"]
-    assert raw["body"].count("<redacted>") == 3
+    assert raw["body"].count("<redacted>") == 5

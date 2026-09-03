@@ -244,11 +244,12 @@ def test_media_error_text_is_sanitized_without_changing_business_text(tmp_path):
 def test_media_detail_direct_and_http_sanitize_raw_text_without_mutating_tg_row(tmp_path):
     marker = "P4_MEDIA_DETAIL_MARKER"
     aliases = (
-        "apiToken", "api_key", "x-api-key", "accessToken", "refresh_token",
-        "id-token", "managementKey", "management_token", "botToken", "bot_key",
-        "githubToken", "github_key", "clientSecret", "exchange_secret",
-        "challengeSecret", "sessionSecret", "sessionToken", "password", "passwd",
-        "cookie", "set-cookie", "credential",
+        "token", "key", "secret", "credential", "upstreamToken", "private_key",
+        "provider-secret", "SERVICE_CREDENTIAL", "apiToken", "api_key", "x-api-key",
+        "accessToken", "refresh_token", "id-token", "managementKey",
+        "management_token", "botToken", "bot_key", "githubToken", "github_key",
+        "clientSecret", "exchange_secret", "challengeSecret", "sessionSecret",
+        "sessionToken", "password", "passwd", "cookie", "set-cookie",
     )
     alias_text = "; ".join(
         f"{key}={marker}_alias_{index}" for index, key in enumerate(aliases)
@@ -256,7 +257,7 @@ def test_media_detail_direct_and_http_sanitize_raw_text_without_mutating_tg_row(
     escaped_fragment = rf'prefix {{\"apiToken\":\"{marker}_escaped\"}} suffix'
     json_fragment = f'prefix {{"api_token":"{marker}_json"}} suffix'
     nested_json = json.dumps({
-        "payload": json.dumps({"sessionToken": f"{marker}_nested"}),
+        "payload": json.dumps({"upstreamSecret": f"{marker}_nested"}),
     })
     prompt_preview = " | ".join((
         "ordinary prompt remains",

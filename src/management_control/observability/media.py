@@ -237,7 +237,10 @@ class MediaControl:
         paths = self._paths(row)
         result = self._record(clean)
         result.update({
-            "accountId": str(clean.get("account_key") or "") or None,
+            # ``account_key`` is the media DB's account identifier, not a credential;
+            # sanitize its free-text value without treating the storage column name
+            # as an untrusted public payload key.
+            "accountId": str(sanitize_credentials(row.get("account_key")) or "") or None,
             "accountLabel": str(clean.get("account_email") or "") or None,
             "upstreamRequestId": str(clean.get("upstream_request_id") or "") or None,
             "upstreamStatus": str(clean.get("upstream_status") or "") or None,
