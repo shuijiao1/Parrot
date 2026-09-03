@@ -19,7 +19,10 @@ if str(_ROOT) not in sys.path:
 from src.tests import _isolation
 _isolation.isolate()
 
-from src import affinity, config, cooldown, load_balancing, model_metadata, oauth_manager, state_db
+from src import (
+    affinity, config, cooldown, load_balancing, model_metadata, oauth_manager,
+    state_db, status_monitor, update_checker,
+)
 from src.oauth import antigravity as antigravity_provider
 from src.oauth import cursor as cursor_provider
 from src.oauth import openai as openai_provider
@@ -128,7 +131,8 @@ class FakeEnv:
         mp.setattr(affinity, "delete_by_channel", lambda key: self.events.append(["affinity_server_delete", key]))
         mp.setattr(affinity, "client_delete_by_channel", lambda key: self.events.append(["affinity_client_delete", key]))
         mp.setattr(load_balancing, "is_initialized", lambda: False)
-        mp.setattr(om, "_maybe_suffix_status_banner", lambda text: text)
+        mp.setattr(status_monitor, "get_active_summary", lambda: None)
+        mp.setattr(update_checker, "get_update_banner", lambda: None)
         mp.setattr(om, "_converge_cached_quota_state", lambda: None)
         mp.setattr(om, "_list_snapshot_ready", lambda: True)
         mp.setattr(om, "_render_cached_list", lambda page, filt: om._list_text_and_kb(

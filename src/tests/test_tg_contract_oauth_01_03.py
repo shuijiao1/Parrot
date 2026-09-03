@@ -16,17 +16,7 @@ from src.tests.test_tg_contract_oauth_support import (
 CASES = cases_for("TG-OA-01", "TG-OA-02", "TG-OA-03")
 
 
-def _simple_detail(key, **kwargs):
-    return (
-        f"🔎 <b>Fake OAuth detail</b>\n账户: <code>{ui.escape_html(key)}</code>\n"
-        f"page={kwargs.get('page', 1)} filter={kwargs.get('filter_key', 'all')}",
-        ui.inline_kb([[ui.btn("◀ 返回", "menu:oauth")]]),
-    )
-
-
 def _patch_actions(env, monkeypatch):
-    monkeypatch.setattr(om, "_detail_text_and_kb", _simple_detail)
-
     def set_enabled(key, enabled, reason=None):
         account = oauth_manager.get_account(key)
         account["enabled"] = enabled
