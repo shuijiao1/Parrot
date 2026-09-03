@@ -40,14 +40,33 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from ... import (
-    affinity, config, cooldown, load_balancing, log_db,
-    notifier, oauth_errors, oauth_manager, state_db,
+from ...management_control.oauth import CchMode, OAuthUsageDisplayMode
+from ...management_control.oauth.menu_bridge import (
+    OpenAIImportParseError,
+    account_key as _account_key,
+    affinity,
+    antigravity_provider,
+    config,
+    control as oauth_control,
+    cooldown,
+    cursor_model_catalog,
+    cursor_provider,
+    load_balancing,
+    log_db,
+    notifier,
+    oauth_errors,
+    oauth_manager,
+    openai_account_identity_parts as _openai_identity_parts,
+    openai_provider,
+    openai_workspace_id as _openai_workspace_id,
+    parse_openai_import_payload,
+    split_account_key as _split_ak,
+    state_db,
+    status_monitor,
+    telegram_context as _management_context,
+    update_checker,
+    xai_provider,
 )
-from ...cursor_bridge import catalog as cursor_model_catalog
-from ...oauth_ids import account_key as _account_key, openai_account_identity_parts as _openai_identity_parts, openai_workspace_id as _openai_workspace_id, split_account_key as _split_ak
-from ...oauth import antigravity as antigravity_provider, cursor as cursor_provider, openai as openai_provider, xai as xai_provider
-from ...oauth.openai_import import OpenAIImportParseError, parse_openai_import_payload
 from .. import menu_cache, states, ui
 from . import main as main_menu
 
@@ -62,15 +81,7 @@ def _resolve_to_account_key(resolved):
     纯 email 时回查 config 自动补 provider。"""
     if resolved is None:
         return None
-    if ":" in resolved:
-        try:
-            return oauth_manager.resolve_account_key(resolved)
-        except oauth_manager.AmbiguousOAuthAccountKey:
-            return None
-    try:
-        return oauth_manager.resolve_account_key(resolved)
-    except oauth_manager.AmbiguousOAuthAccountKey:
-        return None
+    return oauth_control.resolve_account_id_or_none(resolved)
 
 
 def _account_key_from_short(short: str) -> str | None:
@@ -81,16 +92,16 @@ def _account_key_from_short(short: str) -> str | None:
     account keys instead of falsely reporting that the account was deleted.
     """
     account_key = _resolve_to_account_key(ui.resolve_code(str(short or "")))
-    if account_key and oauth_manager.get_account(account_key) is not None:
+    if account_key and oauth_control.account_snapshot(account_key) is not None:
         return account_key
     wanted = str(short or "")
-    for account in oauth_manager.list_accounts():
-        candidate = oauth_manager.get_account_key(account)
+    for account in oauth_control.account_entries_snapshot():
+        candidate = oauth_control.account_id_from_entry(account)
         if ui.register_code(candidate) == wanted:
             return candidate
         email = str(account.get("email") or "")
         if email and ui.register_code(email) == wanted:
-            return oauth_manager.get_account_key(account)
+            return oauth_control.account_id_from_entry(account)
     return None
 
 
@@ -99,20 +110,20 @@ def _account_display(acc: dict) -> str:
 
 
 def _account_email(account_key: str) -> str:
-    acc = oauth_manager.get_account(account_key)
+    acc = oauth_control.account_snapshot(account_key)
     if acc is not None:
         return str(acc.get("email") or "")
-    return oauth_manager.account_key_to_email(account_key)
+    return oauth_control.account_email_snapshot(account_key)
 
 
 def _openai_same_email_count(acc: dict) -> int:
     """OpenAI 同邮箱 workspace 数；只用于决定 UI 是否需要消歧标签。"""
-    if oauth_manager.provider_of(acc) != "openai":
+    if oauth_control.provider_of_snapshot(acc) != "openai":
         return 0
     email = str(acc.get("email") or "")
     return sum(
-        1 for item in oauth_manager.list_accounts()
-        if oauth_manager.provider_of(item) == "openai"
+        1 for item in oauth_control.account_entries_snapshot()
+        if oauth_control.provider_of_snapshot(item) == "openai"
         and str(item.get("email") or "") == email
     )
 
@@ -122,7 +133,7 @@ def _openai_workspace_label(acc: dict, *, html: bool = True, force: bool = False
 
     只在同邮箱多个 workspace 时补一个极短标签。默认不展示内部 workspace id。
     """
-    if oauth_manager.provider_of(acc) != "openai":
+    if oauth_control.provider_of_snapshot(acc) != "openai":
         return ""
     if not force and _openai_same_email_count(acc) <= 1:
         return ""
@@ -176,19 +187,19 @@ def _foreground_account_model_sync(
     else:
         ui.edit(chat_id, progress_id, progress)
 
-    selection_before = oauth_manager.account_model_selection(account_key)
-    future = oauth_manager.start_account_model_refresh(account_key)
+    selection_before = oauth_control.account_model_selection_snapshot(account_key)
+    future = oauth_control.start_account_model_refresh(account_key)
 
     def finish() -> None:
         try:
-            result = future.result(timeout=oauth_manager.OAUTH_MODEL_SYNC_FOREGROUND_TIMEOUT_SECONDS)
+            result = future.result(timeout=oauth_control.model_sync_foreground_timeout_seconds())
         except concurrent.futures.TimeoutError:
             result = {"action": "foreground_timeout", "account_key": account_key}
         except Exception as exc:
             result = {"action": "error", "account_key": account_key, "error": str(exc)}
 
         try:
-            selection = oauth_manager.account_model_selection(account_key)
+            selection = oauth_control.account_model_selection_snapshot(account_key)
         except ValueError:
             # The user may remove the account while discovery is in flight.
             return
@@ -224,7 +235,7 @@ def _foreground_account_model_sync(
 
 
 def _overwrite_summary(entry: dict) -> str:
-    provider = oauth_manager.provider_of(entry)
+    provider = oauth_control.provider_of_snapshot(entry)
     label = str(entry.get("label") or entry.get("email") or "?")
     lines = [
         "检测到相同身份的 OAuth 账户。是否用本次登录结果覆盖凭据和最新资料？",
@@ -252,22 +263,22 @@ def _persist_new_or_stage_overwrite(
     message_id: int | None = None,
 ) -> str:
     """Add a new identity immediately, or stage an exact-identity overwrite."""
-    provider = oauth_manager.provider_of(entry)
+    provider = oauth_control.provider_of_snapshot(entry)
     email = str(entry.get("email") or "")
-    configured = oauth_manager.list_accounts()
+    configured = oauth_control.account_entries_snapshot()
     if provider == "openai" and not _openai_workspace_id(entry):
         raise ValueError("OpenAI token 缺少 workspace identity，无法安全判断账户")
     if provider in ("xai", "cursor"):
         incoming_subject = str(entry.get("subject") or entry.get("sub") or "")
         for account in configured:
-            if oauth_manager.provider_of(account) != provider or str(account.get("email") or "") != email:
+            if oauth_control.provider_of_snapshot(account) != provider or str(account.get("email") or "") != email:
                 continue
             old_subject = str(account.get("subject") or account.get("sub") or "")
             if bool(old_subject) != bool(incoming_subject):
                 raise ValueError(f"{provider} legacy email fallback 会改变 canonical identity，请先移除或迁移旧账户")
-    duplicate = oauth_manager.find_exact_identity(entry)
+    duplicate = oauth_control.find_exact_identity_snapshot(entry)
     if duplicate is None:
-        added = oauth_manager.add_account_if_identity_absent(entry)
+        added = oauth_control.add_account_entry(_management_context(chat_id), entry)
         if added.get("status") != "added":
             raise RuntimeError("账户在保存前已并发出现，请重新登录确认")
         key = _account_key(entry)
@@ -282,7 +293,7 @@ def _persist_new_or_stage_overwrite(
     states.set_state(chat_id, "oa_oauth_overwrite_confirm", {
         "nonce": nonce,
         "target_key": target_key,
-        "provider": oauth_manager.provider_of(entry),
+        "provider": oauth_control.provider_of_snapshot(entry),
         "entry": entry,
         "source": source,
         "usage": usage,
@@ -333,14 +344,16 @@ def on_oauth_overwrite_confirm(chat_id: int, message_id: int, cb_id: str, nonce:
         return
     entry = data.get("entry") or {}
     target_key = str(data.get("target_key") or "")
-    result = oauth_manager.replace_exact_identity(target_key, entry)
+    result = oauth_control.replace_account_entry(
+        _management_context(chat_id), target_key, entry,
+    )
     if result.get("status") != "replaced":
         ui.answer_cb(cb_id, "账户已变化，请重新登录", show_alert=True)
         ui.edit(chat_id, message_id, "❌ 目标账户已消失或身份发生变化；未写入本次登录结果。",
                 reply_markup=ui.inline_kb([[ui.btn("◀ 重新登录", "oa:add")]]))
         return
 
-    provider = str(data.get("provider") or oauth_manager.provider_of(entry))
+    provider = str(data.get("provider") or oauth_control.provider_of_snapshot(entry))
     _foreground_account_model_sync(
         chat_id, target_key, provider=provider,
         label=str(entry.get("label") or entry.get("email") or target_key),
@@ -387,9 +400,8 @@ def _replace_last_with_oauth_error(
 
 def _save_usage_to_quota_cache(ak: str, usage: dict, *, email: str | None = None):
     try:
-        usage = oauth_manager.preserve_antigravity_cached_summary(ak, usage)
-        state_db.quota_save(
-            ak, oauth_manager.flatten_usage(usage),
+        oauth_control.save_usage_snapshot(
+            _management_context(0), ak, usage,
             email=email if email is not None else _account_email(ak),
         )
     except Exception as exc:
@@ -404,7 +416,7 @@ def _fetch_and_save_usage_result_sync(ak: str, *, email: str | None = None, on_s
       - usage_start / usage_done
       - reset_start / reset_done / reset_error
     """
-    provider = oauth_manager.provider_of(ak)
+    provider = oauth_control.provider_of_snapshot(ak)
     details = None
     detail_error = None
 
@@ -417,7 +429,7 @@ def _fetch_and_save_usage_result_sync(ak: str, *, email: str | None = None, on_s
             pass
 
     _stage("usage_start")
-    usage = _run_sync(oauth_manager.fetch_usage(ak))
+    usage = _run_sync(oauth_control.fetch_usage_raw(ak))
     if isinstance(usage, Exception):
         return {"error": usage}
     save_err = _save_usage_to_quota_cache(ak, usage, email=email)
@@ -429,10 +441,10 @@ def _fetch_and_save_usage_result_sync(ak: str, *, email: str | None = None, on_s
         count = _openai_reset_credit_count_from_usage(usage)
         if count is None or count > 0:
             _stage("reset_start", usage)
-        enriched = _run_sync(oauth_manager.enrich_openai_reset_credit_details(ak, usage))
+        enriched = _run_sync(oauth_control.enrich_openai_reset_credit_details_raw(ak, usage))
         if isinstance(enriched, Exception):
             detail_error = enriched
-            usage = oauth_manager.preserve_openai_reset_credit_details(ak, usage)
+            usage = oauth_control.preserve_openai_reset_credit_details_raw(ak, usage)
             details = _openai_reset_credit_details_from_usage(usage)
             save_err = _save_usage_to_quota_cache(ak, usage, email=email)
             if save_err is not None:
@@ -457,7 +469,7 @@ def _fetch_and_save_usage_sync(ak: str, *, email: str | None = None):
 
 def _evaluate_quota_action(ak: str, usage: dict) -> dict | None:
     try:
-        return oauth_manager.evaluate_and_toggle_by_usage(ak, usage)
+        return oauth_control.evaluate_usage(_management_context(0), ak, usage)
     except Exception as exc:
         print(f"[oauth_menu] quota evaluate failed for {ak}: {exc}")
         return None
@@ -536,7 +548,7 @@ def _fetch_openai_reset_credit_details_for_ui(account_key: str,
     """Fetch reset-card details for detail page; skip known-zero accounts."""
     if cached_count is not None and cached_count <= 0:
         return None
-    return _run_sync(oauth_manager.fetch_openai_rate_limit_reset_credits(account_key))
+    return _run_sync(oauth_control.fetch_openai_reset_credits_raw(account_key))
 
 
 def _reset_credit_type_label(reset_type: str | None) -> str:
@@ -639,7 +651,7 @@ _METADATA_REFRESH_INFLIGHT: set[str] = set()
 
 
 def _access_refresh_throttle_seconds_for_ui() -> int:
-    qm = config.get().get("quotaMonitor") or {}
+    qm = oauth_control.config_snapshot().get("quotaMonitor") or {}
     try:
         return int(qm.get("accessRefreshThrottleSeconds", 180))
     except Exception:
@@ -647,7 +659,7 @@ def _access_refresh_throttle_seconds_for_ui() -> int:
 
 
 def _quota_monitor_enabled_for_ui() -> bool:
-    qm = config.get().get("quotaMonitor") or {}
+    qm = oauth_control.config_snapshot().get("quotaMonitor") or {}
     return bool(qm.get("enabled", False))
 
 
@@ -660,7 +672,7 @@ def _quota_cache_is_stale_for_ui(row: dict | None) -> bool:
         fetched_at_ms = 0
     if fetched_at_ms <= 0:
         return True
-    age_s = (state_db.now_ms() - fetched_at_ms) / 1000.0
+    age_s = (oauth_control.now_ms() - fetched_at_ms) / 1000.0
     return age_s >= _access_refresh_throttle_seconds_for_ui()
 
 
@@ -673,7 +685,7 @@ def _quota_cache_has_usage_signal(row: dict | None) -> bool:
     ):
         if row.get(key) is not None:
             return True
-    if oauth_manager.fable_display_from_quota_row(row)[0] is not None:
+    if oauth_control.fable_display_from_quota_row(row)[0] is not None:
         return True
     try:
         raw = json.loads(row.get("raw_data") or "{}")
@@ -703,13 +715,13 @@ def _needs_initial_oauth_cache_sync_for_ui(account_key: str, *, include_details:
     # 窗口数据时，即使 OpenAI reset-card 明细缺失，也不能同步覆盖旧快照；
     # 否则会把响应头实时采样的 85%/98% 等配额状态改写成 mock/新 usage，
     # 影响禁用判断。缺失的 reset-card 明细交给后台刷新或手动刷新按钮。
-    row = state_db.quota_load(account_key)
+    row = oauth_control.quota_snapshot(account_key)
     return not _quota_cache_has_usage_signal(row)
 
 
 def _needs_oauth_cache_refresh_for_ui(account_key: str) -> bool:
-    row = state_db.quota_load(account_key)
-    prov = oauth_manager.provider_of(account_key)
+    row = oauth_control.quota_snapshot(account_key)
+    prov = oauth_control.provider_of_snapshot(account_key)
     if row is None:
         return True
 
@@ -740,7 +752,7 @@ def _schedule_openai_metadata_for_ui(account_keys: list[str] | str, *, force: bo
         keys = [account_keys]
     else:
         keys = list(account_keys or [])
-    keys = [k for k in keys if k and oauth_manager.provider_of(k) == "openai"]
+    keys = [k for k in keys if k and oauth_control.provider_of_snapshot(k) == "openai"]
     if not keys:
         return
     with _METADATA_REFRESH_LOCK:
@@ -752,7 +764,7 @@ def _schedule_openai_metadata_for_ui(account_keys: list[str] | str, *, force: bo
 
     def _worker() -> None:
         try:
-            oauth_manager.ensure_openai_metadata_fresh_sync(
+            oauth_control.ensure_openai_metadata_fresh_sync_raw(
                 pending, force=force, min_interval_seconds=3600, timeout_s=5.0,
             )
         except Exception as exc:
@@ -931,12 +943,12 @@ def _oauth_local_period(account: dict | str, *, row: dict | None = None,
     """
     if isinstance(account, str):
         account_key = account
-        acc = oauth_manager.get_account(account_key) or {}
+        acc = oauth_control.account_snapshot(account_key) or {}
     else:
         acc = account if isinstance(account, dict) else {}
         account_key = _account_key(acc) if acc else ""
-    provider = oauth_manager.provider_of(acc or account_key)
-    row = state_db.quota_load(account_key) if row is None and account_key else row
+    provider = oauth_control.provider_of_snapshot(acc or account_key)
+    row = oauth_control.quota_snapshot(account_key) if row is None and account_key else row
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
     def parse_time(value) -> datetime | None:
@@ -1008,7 +1020,7 @@ _USAGE_DISPLAY_REMAINING = "remaining"
 
 def _usage_display_mode() -> str:
     """OAuth 用量展示口径。配置只影响 UI 展示，不改变 quota cache 存储。"""
-    mode = str(config.get().get("oauthUsageDisplayMode") or _USAGE_DISPLAY_USED).strip().lower()
+    mode = str(oauth_control.config_snapshot().get("oauthUsageDisplayMode") or _USAGE_DISPLAY_USED).strip().lower()
     return _USAGE_DISPLAY_REMAINING if mode == _USAGE_DISPLAY_REMAINING else _USAGE_DISPLAY_USED
 
 
@@ -1130,9 +1142,9 @@ def _weekly_quota_projection(account_key: str, row: dict | None = None) -> dict 
     percentage.  The numerator is the matching ``WINDOW_STATS`` 7d snapshot;
     monthly totals and 5h/30d percentages must never enter this calculation.
     """
-    if oauth_manager.provider_of(account_key) not in {"claude", "openai", "xai"}:
+    if oauth_control.provider_of_snapshot(account_key) not in {"claude", "openai", "xai"}:
         return None
-    row = state_db.quota_load(account_key) if row is None else row
+    row = oauth_control.quota_snapshot(account_key) if row is None else row
     if not isinstance(row, dict):
         return None
     try:
@@ -1164,7 +1176,7 @@ def _weekly_quota_projection(account_key: str, row: dict | None = None) -> dict 
     )
     result = {"tokens": projected_tokens, "cost_text": None}
 
-    pricing_cfg = config.get().get("pricing", {})
+    pricing_cfg = oauth_control.config_snapshot().get("pricing", {})
     pricing_enabled = not isinstance(pricing_cfg, dict) or bool(
         pricing_cfg.get("enabled", True)
     )
@@ -1208,7 +1220,7 @@ def _antigravity_raw_from_row(row: dict | None) -> dict:
 
 
 def _antigravity_raw(account_key: str) -> dict:
-    return _antigravity_raw_from_row(state_db.quota_load(account_key))
+    return _antigravity_raw_from_row(oauth_control.quota_snapshot(account_key))
 
 
 _WINDOW_LABELS = {"5h": "5小时", "weekly": "每周", "daily": "每日", "monthly": "每月"}
@@ -1324,7 +1336,7 @@ def _format_antigravity_quota_groups(account_key: str, *, detail: bool) -> list[
 
 def _format_antigravity_credits_block(account_key: str, *, detail: bool = False) -> str:
     """Credits line + quota window groups. Never invent percent windows or currency."""
-    row = state_db.quota_load(account_key)
+    row = oauth_control.quota_snapshot(account_key)
     block = _antigravity_raw_from_row(row)
     lines = []
     groups_lines = _format_antigravity_quota_groups(account_key, detail=detail)
@@ -1360,7 +1372,7 @@ def _xai_raw_from_row(row: dict | None) -> dict:
 
 
 def _xai_raw(account_key: str) -> dict:
-    return _xai_raw_from_row(state_db.quota_load(account_key))
+    return _xai_raw_from_row(oauth_control.quota_snapshot(account_key))
 
 
 def _xai_tier_label(xai: dict) -> str:
@@ -1435,7 +1447,7 @@ def _xai_used_remaining_percent(xai: dict, billing: dict) -> tuple[object, objec
 
 
 def _format_xai_official_block(account_key: str, *, detail: bool = False) -> str:
-    row = state_db.quota_load(account_key)
+    row = oauth_control.quota_snapshot(account_key)
     xai = _xai_raw_from_row(row)
     if not xai or xai.get("source") == "unsupported":
         return "📊 官方额度: <i>尚未获取</i>" if not detail else "<b>📊 官方账单</b>\n尚未获取（点「刷新账单」拉取）"
@@ -1513,9 +1525,9 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False,
                             period: dict | None = None,
                             stats_loading: bool = False) -> str:
     """Grok/xAI OAuth 本地花费块，严格跟随官方当前 usage period。"""
-    row = state_db.quota_load(account_key)
+    row = oauth_control.quota_snapshot(account_key)
     period = period or _oauth_local_period(account_key, row=row)
-    pricing_cfg = config.get().get("pricing", {})
+    pricing_cfg = oauth_control.config_snapshot().get("pricing", {})
     pricing_enabled = not isinstance(pricing_cfg, dict) or bool(
         pricing_cfg.get("enabled", True)
     )
@@ -1589,7 +1601,7 @@ def _cursor_raw_from_row(row: dict | None) -> dict:
 
 
 def _format_cursor_usage_block(account_key: str, *, detail: bool = False) -> str:
-    row = state_db.quota_load(account_key)
+    row = oauth_control.quota_snapshot(account_key)
     cursor = _cursor_raw_from_row(row)
     if not cursor:
         return "📊 Cursor 额度: <i>尚未获取</i>"
@@ -1739,7 +1751,7 @@ def _window_usage_detail(account_key: str, since_ts: float, indent: str,
         parts.append(ui.fmt_cache_phrase(s["cache_read"], prompt))
     if s.get("avg_tps") is not None:
         parts.append(f"均 {ui.fmt_tps(s.get('avg_tps'))}")
-    if oauth_manager.provider_of(account_key) in {"claude", "openai", "xai"}:
+    if oauth_control.provider_of_snapshot(account_key) in {"claude", "openai", "xai"}:
         parts.append(ui.fmt_cost(s, decimal_places=3))
     return indent + " · ".join(parts)
 
@@ -1751,7 +1763,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
     ak = _account_key(acc)
     icon = _status_icon(acc)
     reason = acc.get("disabled_reason")
-    prov = oauth_manager.provider_of(acc)
+    prov = oauth_control.provider_of_snapshot(acc)
 
     # 状态 tag
     tag = ""
@@ -1766,7 +1778,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
     # 第一行：icon + email + provider
     prov_tag = " " + _provider_tag(prov) if prov else ""
     lines = [f"{icon} <code>{ui.escape_html(email)}</code>{prov_tag}{tag}"]
-    row = state_db.quota_load(ak)
+    row = oauth_control.quota_snapshot(ak)
     local_period = _oauth_local_period(acc, row=row)
     period_stats = _account_period_stats(
         ak, local_period, month_snapshot=month_snapshot,
@@ -1789,7 +1801,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         if sub_exp:
             lines.append(f"📅 套餐到期: <code>{_fmt_time_full(sub_exp)}</code>")
     elif prov == "claude":
-        cl_label = oauth_manager.claude_plan_label(acc)
+        cl_label = oauth_control.claude_plan_label(acc)
         if cl_label:
             lines.append(f"🏷️ 套餐: <code>{ui.escape_html(cl_label)}</code>")
     elif prov == "xai":
@@ -1866,7 +1878,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
             line = _format_usage_line_html("📊 30d", td_util, reset)
             if line:
                 lines.append(line)
-        fable_util, fable_reset = oauth_manager.fable_display_from_quota_row(row)
+        fable_util, fable_reset = oauth_control.fable_display_from_quota_row(row)
         if prov == "claude" and fable_util is not None:
             line = _format_usage_line_html("📊 Fable 7d", fable_util, fable_reset)
             if line:
@@ -1931,9 +1943,11 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
             ))
 
     # 冷却状态
-    from ... import cooldown as _cd
     ck = f"oauth:{ak}"
-    cds = [e for e in _cd.active_entries() if e.get("channel_key") == ck]
+    cds = [
+        e for e in oauth_control.cooldown_entries_snapshot()
+        if e.get("channel_key") == ck
+    ]
     if cds:
         perm_n = sum(1 for e in cds if e.get("cooldown_until") == -1)
         cool_n = len(cds) - perm_n
@@ -1949,9 +1963,9 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
 
 def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
                         stats_loading: bool = False) -> str:
-    provider = oauth_manager.provider_of(account_key)
-    row = state_db.quota_load(account_key)
-    account = oauth_manager.get_account(account_key) or account_key
+    provider = oauth_control.provider_of_snapshot(account_key)
+    row = oauth_control.quota_snapshot(account_key)
+    account = oauth_control.account_snapshot(account_key) or account_key
     local_period = _oauth_local_period(account, row=row)
     period_stats = _account_period_stats(
         account_key, local_period, month_snapshot=month_snapshot,
@@ -1982,7 +1996,7 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
         ("🧠 Opus 7d", row.get("opus_util"), row.get("opus_reset"), None),
     ]
     if provider == "claude":
-        fable_util, fable_reset = oauth_manager.fable_display_from_quota_row(row)
+        fable_util, fable_reset = oauth_control.fable_display_from_quota_row(row)
         usage_rows.append(("📖 Fable 7d", fable_util, fable_reset, None))
     for label, util, reset, util_k in usage_rows:
         line = _format_usage_line_text(label, util, reset)
@@ -2041,7 +2055,7 @@ _FILTER_LABELS = {
 
 
 def _default_models_for_settings(family: str) -> list[str]:
-    cfg = config.get()
+    cfg = oauth_control.config_snapshot()
     if family == "openai":
         raw = (cfg.get("openaiOAuth") or {}).get("defaultModels") or []
     elif family == "xai":
@@ -2056,7 +2070,7 @@ def _default_models_for_settings(family: str) -> list[str]:
 
 
 def _antigravity_image_models_for_settings() -> list[str]:
-    cfg = config.get().get("antigravityOAuth")
+    cfg = oauth_control.config_snapshot().get("antigravityOAuth")
     raw = cfg.get("imageModels") if isinstance(cfg, dict) else None
     if not isinstance(raw, list):
         return []
@@ -2077,7 +2091,7 @@ def _antigravity_catalog_counts(acc: dict) -> tuple[int, int]:
 
 
 def _quota_monitor_values() -> tuple[bool, int, float]:
-    qm = config.get().get("quotaMonitor") or {}
+    qm = oauth_control.config_snapshot().get("quotaMonitor") or {}
     enabled = bool(qm.get("enabled", False))
     interval = int(qm.get("intervalSeconds", 60) or 60)
     threshold = float(qm.get("disableThresholdPercent", 95) or 95)
@@ -2086,7 +2100,7 @@ def _quota_monitor_values() -> tuple[bool, int, float]:
 
 def _cch_enabled() -> bool:
     # 新 UI 只保留 disabled / dynamic；历史 static 不再作为可选模式展示。
-    return str(config.get().get("cchMode", "disabled")) == "dynamic"
+    return str(oauth_control.config_snapshot().get("cchMode", "disabled")) == "dynamic"
 
 
 def _cch_status_label() -> str:
@@ -2103,10 +2117,10 @@ def _settings_text_and_kb() -> tuple[str, dict]:
     openai_models = _default_models_for_settings("openai")
     xai_models = _default_models_for_settings("xai")
     antigravity_models = _default_models_for_settings("antigravity")
-    cfg = config.get()
+    cfg = oauth_control.config_snapshot()
     cursor_accounts = [
         acc for acc in cfg.get("oauthAccounts", [])
-        if oauth_manager.provider_of(acc) == "cursor"
+        if oauth_control.provider_of_snapshot(acc) == "cursor"
     ]
     xai_cfg = cfg.get("xaiOAuth") if isinstance(cfg.get("xaiOAuth"), dict) else {}
     xai_image_models = xai_cfg.get("imageModels") if isinstance(xai_cfg.get("imageModels"), list) else []
@@ -2176,10 +2190,10 @@ def on_toggle_usage_display_mode(chat_id: int, message_id: int, cb_id: str) -> N
     old_mode = _usage_display_mode()
     new_mode = _USAGE_DISPLAY_REMAINING if old_mode == _USAGE_DISPLAY_USED else _USAGE_DISPLAY_USED
 
-    def _mutate(cfg: dict) -> None:
-        cfg["oauthUsageDisplayMode"] = new_mode
-
-    config.update(_mutate)
+    oauth_control.update_telegram_preferences(
+        _management_context(chat_id),
+        usage_display_mode=OAuthUsageDisplayMode(new_mode),
+    )
     ui.answer_cb(cb_id, f"已切换为{_usage_display_label(new_mode)}")
     text, kb = _settings_text_and_kb()
     ui.edit(chat_id, message_id, text, reply_markup=kb)
@@ -2187,7 +2201,9 @@ def on_toggle_usage_display_mode(chat_id: int, message_id: int, cb_id: str) -> N
 
 def on_toggle_cch_mode(chat_id: int, message_id: int, cb_id: str) -> None:
     new_mode = "disabled" if _cch_enabled() else "dynamic"
-    config.update(lambda c: c.__setitem__("cchMode", new_mode))
+    oauth_control.update_settings(
+        _management_context(chat_id), cch_mode=CchMode(new_mode),
+    )
     ui.answer_cb(cb_id, "CCH 已开启" if new_mode == "dynamic" else "CCH 已关闭")
     text, kb = _settings_text_and_kb()
     ui.edit(chat_id, message_id, text, reply_markup=kb)
@@ -2195,7 +2211,9 @@ def on_toggle_cch_mode(chat_id: int, message_id: int, cb_id: str) -> None:
 
 def on_toggle_quota_progress_bar(chat_id: int, message_id: int, cb_id: str) -> None:
     new_value = not ui.quota_progress_enabled()
-    config.update(lambda c: c.__setitem__("quotaProgressBar", new_value))
+    oauth_control.update_telegram_preferences(
+        _management_context(chat_id), quota_progress_bar=new_value,
+    )
     ui.answer_cb(cb_id, "黑白进度条已开启" if new_value else "黑白进度条已关闭")
     text, kb = _settings_text_and_kb()
     ui.edit(chat_id, message_id, text, reply_markup=kb)
@@ -2237,9 +2255,11 @@ def on_quota_menu(chat_id: int, message_id: int, cb_id: Optional[str] = None) ->
 
 
 def on_quota_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
-    cur = bool((config.get().get("quotaMonitor") or {}).get("enabled", False))
+    cur = bool((oauth_control.config_snapshot().get("quotaMonitor") or {}).get("enabled", False))
     new_val = not cur
-    config.update(lambda c: c.setdefault("quotaMonitor", {}).__setitem__("enabled", new_val))
+    oauth_control.update_settings(
+        _management_context(chat_id), quota_enabled=new_val,
+    )
     ui.answer_cb(cb_id, "已启用" if new_val else "已停用")
     text, kb = _quota_menu_text_and_kb()
     ui.edit(chat_id, message_id, text, reply_markup=kb)
@@ -2267,7 +2287,9 @@ def on_quota_interval_input(chat_id: int, text: str) -> None:
     if v > 86400:
         ui.send(chat_id, "❌ 间隔不能超过 86400 秒（1 天），请重新输入：")
         return
-    config.update(lambda c: c.setdefault("quotaMonitor", {}).__setitem__("intervalSeconds", v))
+    oauth_control.update_settings(
+        _management_context(chat_id), interval_seconds=v,
+    )
     states.pop_state(chat_id)
     ui.send(
         chat_id, f"✅ 配额监控间隔已更新为 <code>{v}s</code>",
@@ -2296,12 +2318,9 @@ def on_quota_threshold_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, "❌ 阈值需在 1-100 之间，请重新输入：")
         return
 
-    def _mutate(cfg: dict) -> None:
-        qm = cfg.setdefault("quotaMonitor", {})
-        qm["disableThresholdPercent"] = v
-        qm["resumeThresholdPercent"] = v
-
-    config.update(_mutate)
+    oauth_control.update_settings(
+        _management_context(chat_id), threshold_percent=v,
+    )
     states.pop_state(chat_id)
     ui.send(
         chat_id, f"✅ 配额禁用阈值已更新为 <code>{v:.0f}%</code>",
@@ -2451,14 +2470,12 @@ def _maybe_suffix_status_banner(text: str) -> str:
     """在文本底部追加 banner：上游故障 + 新版本可用（任一存在即拼到末尾）。"""
     extras: list[str] = []
     try:
-        from ... import status_monitor
         line = status_monitor.get_active_summary()
         if line:
             extras.append(line)
     except Exception:
         pass
     try:
-        from ... import update_checker
         line = update_checker.get_update_banner()
         if line:
             extras.append(line)
@@ -2472,18 +2489,18 @@ def _maybe_suffix_status_banner(text: str) -> str:
 def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL, *,
                       month_snapshot: dict | None = None,
                       stats_loading: bool = False) -> tuple[str, dict]:
-    accounts_all = oauth_manager.list_accounts()
+    accounts_all = oauth_control.account_entries_snapshot()
     filter_key = _normalize_filter(filter_key)
     # 常用列表只读取本地状态与主动维护的月度快照。保留既有的本地配额
     # 阈值收敛（不访问网络）；远端用量仍只由显式刷新操作负责。
     account_keys = _refreshable_account_keys_for_ui(accounts_all)
     for account_key in account_keys:
         try:
-            oauth_manager.evaluate_and_toggle_by_cached_quota(account_key)
+            oauth_control.evaluate_cached_quota_raw(account_key)
         except Exception as exc:
             print(f"[oauth_menu] cached quota evaluate failed for {account_key}: {exc}")
     if account_keys:
-        accounts_all = oauth_manager.list_accounts()
+        accounts_all = oauth_control.account_entries_snapshot()
     total_all = len(accounts_all)
     normal = sum(1 for a in accounts_all if a.get("enabled", True) and not a.get("disabled_reason"))
     quota_disabled = sum(1 for a in accounts_all if a.get("disabled_reason") == "quota")
@@ -2499,10 +2516,9 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL, *,
     total = len(accounts)
 
     # 冷却统计：按 oauth:email 聚合；一个账号只要有任何模型处于冷却，就计数一次
-    from ... import cooldown as _cd
     cd_keys_any: set[str] = set()
     cd_keys_perm: set[str] = set()
-    for e in _cd.active_entries():
+    for e in oauth_control.cooldown_entries_snapshot():
         ck = e.get("channel_key", "")
         if not ck.startswith("oauth:"):
             continue
@@ -2563,7 +2579,7 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL, *,
             email = _account_display(acc)
             ak = _account_key(acc)
             short = ui.register_code(ak)
-            provider = oauth_manager.provider_of(acc)
+            provider = oauth_control.provider_of_snapshot(acc)
             num = start + offset + 1
             row_btns.append(ui.provider_button(
                 f"{num}. {email}",
@@ -2608,8 +2624,8 @@ def _oauth_window_specs(accounts: list[dict]) -> list[tuple[tuple, str, float]]:
     now_ts = time.time()
     for account in accounts:
         account_key = _account_key(account)
-        provider = oauth_manager.provider_of(account_key)
-        row = state_db.quota_load(account_key)
+        provider = oauth_control.provider_of_snapshot(account_key)
+        row = oauth_control.quota_snapshot(account_key)
         local_period = _oauth_local_period(account, row=row)
         if local_period.get("stats_window") == "account-period":
             specs.append((
@@ -2636,7 +2652,7 @@ def _oauth_window_specs(accounts: list[dict]) -> list[tuple[tuple, str, float]]:
                 _window_stats_cache_key(account_key, window_name), account_key, since,
             ))
         if provider == "claude":
-            fable_util, fable_reset = oauth_manager.fable_display_from_quota_row(row)
+            fable_util, fable_reset = oauth_control.fable_display_from_quota_row(row)
             if fable_util is not None:
                 since = _quota_window_since_ts(fable_reset, 7 * 86400, now_ts=now_ts)
                 specs.append((
@@ -2647,17 +2663,17 @@ def _oauth_window_specs(accounts: list[dict]) -> list[tuple[tuple, str, float]]:
 
 def _load_oauth_window_stats(account_key: str, since: float, window_name: str) -> dict:
     if window_name == "fable-7d":
-        account = oauth_manager.get_account(account_key) or {}
-        return log_db.tokens_for_channel_models(
-            f"oauth:{account_key}", oauth_manager.claude_fable_models(account), since,
+        account = oauth_control.account_snapshot(account_key) or {}
+        return oauth_control.tokens_for_channel_models_snapshot(
+            f"oauth:{account_key}", oauth_control.claude_fable_models(account), since,
         )
-    return log_db.tokens_for_channel(f"oauth:{account_key}", since_ts=since)
+    return oauth_control.tokens_for_channel_snapshot(f"oauth:{account_key}", since_ts=since)
 
 
 def refresh_window_snapshots_now() -> bool:
     """由唯一统计调度线程刷新 OAuth quota 窗口与账户周期累计。"""
     ok = True
-    for key, account_key, since in _oauth_window_specs(oauth_manager.list_accounts()):
+    for key, account_key, since in _oauth_window_specs(oauth_control.account_entries_snapshot()):
         ok = menu_cache.WINDOW_STATS.refresh_now(
             key,
             lambda target=account_key, start=since, window=str(key[-1]): _load_oauth_window_stats(
@@ -2698,15 +2714,15 @@ def _list_snapshot_ready() -> bool:
         return False
     # 5h/7d、Fable 7d 与账户本期 Token、缓存、TPS、金额都是页面必需内容，
     # 不能因为快照尚未预热就静默删行。
-    return _request_window_snapshots(oauth_manager.list_accounts())
+    return _request_window_snapshots(oauth_control.account_entries_snapshot())
 
 
 def _converge_cached_quota_state() -> None:
     """保留旧列表进入时基于本地配额缓存立即收敛账号状态的行为。"""
-    accounts = oauth_manager.list_accounts()
+    accounts = oauth_control.account_entries_snapshot()
     for account_key in _refreshable_account_keys_for_ui(accounts):
         try:
-            oauth_manager.evaluate_and_toggle_by_cached_quota(account_key)
+            oauth_control.evaluate_cached_quota_raw(account_key)
         except Exception as exc:
             print(f"[oauth_menu] cached quota evaluate failed for {account_key}: {exc}")
 
@@ -2738,7 +2754,7 @@ def send_new(chat_id: int, page: int = 1, filter_key: str = _FILTER_ALL) -> None
 # ─── 账户排序 ─────────────────────────────────────────────────────
 
 def _all_account_keys() -> list[str]:
-    return [_account_key(acc) for acc in oauth_manager.list_accounts()]
+    return [_account_key(acc) for acc in oauth_control.account_entries_snapshot()]
 
 
 def _split_number_rows(n: int, max_cols: int = 6) -> list[list[int]]:
@@ -2779,11 +2795,11 @@ def _set_sort_state(chat_id: int, draft: list[str], *, page: int = 1,
 
 
 def _sort_item_line(idx: int, account_key: str) -> str:
-    acc = oauth_manager.get_account(account_key)
+    acc = oauth_control.account_snapshot(account_key)
     if acc is None:
         return f"{idx}. <code>{ui.escape_html(account_key)}</code> ⚠ 已不存在"
-    email = str(acc.get("email") or oauth_manager.account_key_to_email(account_key) or "?")
-    prov = oauth_manager.provider_of(acc)
+    email = str(acc.get("email") or oauth_control.account_email_snapshot(account_key) or "?")
+    prov = oauth_control.provider_of_snapshot(acc)
     tag = _provider_tag(prov)
     status = "enabled" if acc.get("enabled", True) and not acc.get("disabled_reason") else (acc.get("disabled_reason") or "disabled")
     suffix = _openai_workspace_label(acc, force=True) if prov == "openai" else ""
@@ -2968,17 +2984,10 @@ def on_sort_reset(chat_id: int, message_id: int, cb_id: str) -> None:
     _show_sort(chat_id, message_id)
 
 
-def _save_account_order(draft: list[str]) -> None:
-    order = {ak: i for i, ak in enumerate(draft)}
-
-    def _mutate(cfg):
-        accounts = list(cfg.get("oauthAccounts") or [])
-        ordered = [a for a in accounts if _account_key(a) in order]
-        ordered.sort(key=lambda a: order.get(_account_key(a), 10**9))
-        rest = [a for a in accounts if _account_key(a) not in order]
-        cfg["oauthAccounts"] = ordered + rest
-
-    config.update(_mutate)
+def _save_account_order(chat_id: int, draft: list[str]) -> None:
+    oauth_control.reorder_accounts_preserving_unlisted(
+        _management_context(chat_id), draft,
+    )
 
 
 def on_sort_save(chat_id: int, message_id: int, cb_id: str) -> None:
@@ -2990,7 +2999,7 @@ def on_sort_save(chat_id: int, message_id: int, cb_id: str) -> None:
     draft = list(data.get("draft") or [])
     page = max(1, int(data.get("page") or 1))
     filter_key = _normalize_filter(data.get("filter_key") or _FILTER_ALL)
-    _save_account_order(draft)
+    _save_account_order(chat_id, draft)
     states.pop_state(chat_id)
     ui.answer_cb(cb_id, "已保存")
     ui.edit(
@@ -3018,8 +3027,8 @@ def _format_month_stats_block(account_key: str, *,
                               by_model: list[dict] | None = None,
                               stats_loading: bool = False) -> str:
     """账户周期使用统计：总体与按模型明细必须使用同一个起点。"""
-    account = oauth_manager.get_account(account_key) or account_key
-    row = state_db.quota_load(account_key)
+    account = oauth_control.account_snapshot(account_key) or account_key
+    row = oauth_control.quota_snapshot(account_key)
     local_period = _oauth_local_period(account, row=row)
     since_ts = float(local_period["since"])
     if month_snapshot is None and not local_period.get("stats_window"):
@@ -3030,10 +3039,10 @@ def _format_month_stats_block(account_key: str, *,
         account_key, local_period, month_snapshot=month_snapshot,
     )
     if not _has_local_usage_or_billing(overall):
-        if oauth_manager.provider_of(account_key) == "antigravity":
+        if oauth_control.provider_of_snapshot(account_key) == "antigravity":
             return f"\n<b>⚡ {local_period['detail_title']}</b>\n<i>暂无本地请求</i>"
         return ""
-    is_cursor = oauth_manager.provider_of(account_key) == "cursor"
+    is_cursor = oauth_control.provider_of_snapshot(account_key) == "cursor"
     model_loading = False
     if by_model is None:
         cached_models = menu_cache.DETAIL_STATS.peek(
@@ -3097,27 +3106,27 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
                         month_snapshot: dict | None = None,
                         model_stats: list[dict] | None = None,
                         stats_loading: bool = False) -> tuple[Optional[str], Optional[dict]]:
-    acc = oauth_manager.get_account(account_key)
+    acc = oauth_control.account_snapshot(account_key)
     if acc is None:
         return None, None
     email = _account_display(acc)
 
     if refresh_quota and _should_refresh_account_for_ui(acc):
         try:
-            oauth_manager.evaluate_and_toggle_by_cached_quota(account_key)
+            oauth_control.evaluate_cached_quota_raw(account_key)
         except Exception as exc:
             print(f"[oauth_menu] cached quota evaluate failed for {account_key}: {exc}")
-        acc = oauth_manager.get_account(account_key) or acc
+        acc = oauth_control.account_snapshot(account_key) or acc
         if _should_refresh_account_for_ui(acc):
             _schedule_oauth_cache_refresh_for_ui(account_key)
-    if oauth_manager.provider_of(acc) == "openai":
+    if oauth_control.provider_of_snapshot(acc) == "openai":
         _schedule_openai_metadata_for_ui(account_key)
-        acc = oauth_manager.get_account(account_key) or acc
+        acc = oauth_control.account_snapshot(account_key) or acc
 
     icon = _status_icon(acc)
     reason = acc.get("disabled_reason") or "—"
-    prov = oauth_manager.provider_of(acc)
-    quota_row = state_db.quota_load(account_key)
+    prov = oauth_control.provider_of_snapshot(acc)
+    quota_row = oauth_control.quota_snapshot(account_key)
     reset_credit_cached_count = _openai_reset_credit_count_from_row(quota_row) if prov == "openai" else None
     reset_credit_effective_count = (
         reset_credit_count_override
@@ -3142,7 +3151,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         if sub_exp:
             provider_line += f"📅 到期: <code>{_fmt_time_full(sub_exp)}</code>\n"
     elif prov == "claude":
-        cl_label = oauth_manager.claude_plan_label(acc)
+        cl_label = oauth_control.claude_plan_label(acc)
         provider_line = f"🏷️ 套餐: <code>{ui.escape_html(cl_label or '?')}</code>\n"
         sub_status = acc.get("subscription_status") or ""
         billing = acc.get("billing_type") or ""
@@ -3175,7 +3184,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
             cursor_model_ids = {
                 str(model) for model in acc.get("models") or [] if str(model)
             }
-        cursor_disabled = oauth_manager.cursor_disabled_models(acc) & cursor_model_ids
+        cursor_disabled = oauth_control.cursor_disabled_models_snapshot(acc) & cursor_model_ids
         cursor_available = max(0, len(cursor_model_ids) - len(cursor_disabled))
         disabled_suffix = f" · 禁用 {len(cursor_disabled)}" if cursor_disabled else ""
         provider_line = (
@@ -3221,7 +3230,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
 
     # 显示当前模型的冷却状态
     ck = f"oauth:{account_key}"
-    cd_models = [e for e in cooldown.active_entries() if e["channel_key"] == ck]
+    cd_models = [e for e in oauth_control.cooldown_entries_snapshot() if e["channel_key"] == ck]
     if cd_models:
         text += "\n\n<b>⚠ 冷却中的模型：</b>\n"
         now_ms = int(__import__('time').time() * 1000)
@@ -3265,8 +3274,8 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
 
 def _render_cached_detail(account_key: str, page: int, filter_key: str,
                           *, refresh_quota: bool = False) -> tuple[Optional[str], Optional[dict]]:
-    account = oauth_manager.get_account(account_key) or account_key
-    row = state_db.quota_load(account_key)
+    account = oauth_control.account_snapshot(account_key) or account_key
+    row = oauth_control.quota_snapshot(account_key)
     local_period = _oauth_local_period(account, row=row)
     since = float(local_period["since"])
     natural = menu_cache.PERIOD_STATS.peek(("period", int(_this_month_start_ts())))
@@ -3285,10 +3294,10 @@ def _render_cached_detail(account_key: str, page: int, filter_key: str,
 
 def _queue_oauth_detail_stats(account_key: str) -> bool:
     """把账户周期总体/按模型统计排入中央队列；返回快照是否完整。"""
-    account = oauth_manager.get_account(account_key)
+    account = oauth_control.account_snapshot(account_key)
     if account is None:
         return False
-    row = state_db.quota_load(account_key)
+    row = oauth_control.quota_snapshot(account_key)
     local_period = _oauth_local_period(account, row=row)
     since = float(local_period["since"])
 
@@ -3334,7 +3343,7 @@ def _queue_oauth_detail_stats(account_key: str) -> bool:
     ):
         menu_cache.DETAIL_STATS.request(
             model_key,
-            lambda start=since: log_db.channel_model_stats(
+            lambda start=since: oauth_control.channel_model_stats_snapshot(
                 f"oauth:{account_key}", since_ts=start,
             ),
             # 修复旧进程/早点击留下的新鲜空缓存；有总体调用时 [] 不可能是完整模型结果。
@@ -3345,7 +3354,7 @@ def _queue_oauth_detail_stats(account_key: str) -> bool:
 
 def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ak = _account_key_from_short(short)
-    if ak is None or oauth_manager.get_account(ak) is None:
+    if ak is None or oauth_control.account_snapshot(ak) is None:
         ui.answer_cb(cb_id, "账户已不存在，请返回重试")
         return
     # 详情中的账户周期总体、按模型统计及 5h/7d 本地明细必须同时就绪；
@@ -3369,8 +3378,8 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
         return
     ui.answer_cb(cb_id, "刷新中...")
 
-    provider = oauth_manager.provider_of(ak)
-    result = _run_sync(oauth_manager.force_refresh(ak))
+    provider = oauth_control.provider_of_snapshot(ak)
+    result = _run_sync(oauth_control.force_refresh_raw(ak))
     if isinstance(result, Exception):
         ui.send(chat_id, _oauth_error_html(
             result, provider=provider, operation="refresh_token",
@@ -3386,7 +3395,7 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
 
     model_sync_note = ""
     if provider == "cursor":
-        sync_result = _run_sync(oauth_manager.refresh_cursor_models(
+        sync_result = _run_sync(oauth_control.refresh_cursor_models_raw(
             ak, force=True, min_interval_seconds=0, timeout_s=30.0,
         ))
         if isinstance(sync_result, dict) and sync_result.get("action") == "updated":
@@ -3411,7 +3420,7 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         ui.answer_cb(cb_id, "短码已失效")
         return
     email = _account_email(ak)
-    provider = oauth_manager.provider_of(ak)
+    provider = oauth_control.provider_of_snapshot(ak)
     if provider == "openai":
         ui.answer_cb(cb_id, "拉取 OpenAI 用量/重置卡...")
     elif provider == "xai":
@@ -3437,11 +3446,11 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
     quota_action = _evaluate_quota_action(ak, usage_result)
     metadata_action = None
     if provider == "openai":
-        metadata_action = _run_sync(oauth_manager.ensure_openai_metadata_fresh(
+        metadata_action = _run_sync(oauth_control.ensure_openai_metadata_fresh_raw(
             ak, force=True, min_interval_seconds=0, timeout_s=5.0,
         ))
     elif provider == "cursor":
-        metadata_action = _run_sync(oauth_manager.refresh_cursor_models(
+        metadata_action = _run_sync(oauth_control.refresh_cursor_models_raw(
             ak, force=True, min_interval_seconds=0, timeout_s=30.0,
         ))
 
@@ -3534,8 +3543,8 @@ _CURSOR_DISABLE_ACTION = "oa_cursor_disable"
 def _cursor_model_records(acc: dict) -> list[dict]:
     # catalog_records re-derives variant/effort metadata from legacy_slugs so
     # persisted catalogs written by an older parser are corrected immediately.
-    records = cursor_model_catalog.catalog_records(acc)
-    disabled = oauth_manager.cursor_disabled_models(acc)
+    records = oauth_control.cursor_catalog_records_snapshot(acc)
+    disabled = oauth_control.cursor_disabled_models_snapshot(acc)
     records.sort(key=lambda item: str(item.get("name") or item.get("id") or "").casefold())
     records.sort(key=lambda item: str(item.get("id") or "") in disabled)
     return records
@@ -3553,10 +3562,10 @@ def _resolve_cursor_model_ref(ref: str) -> tuple[str, dict, dict] | None:
     if _CURSOR_MODEL_REF_SEP not in raw:
         # Model detail buttons from an older process still carry a deterministic
         # hash. Rebuild the reverse mapping from the live Cursor catalogs.
-        for account in oauth_manager.list_accounts():
-            if oauth_manager.provider_of(account) != "cursor":
+        for account in oauth_control.account_entries_snapshot():
+            if oauth_control.provider_of_snapshot(account) != "cursor":
                 continue
-            account_key = oauth_manager.get_account_key(account)
+            account_key = oauth_control.account_id_from_entry(account)
             for item in _cursor_model_records(account):
                 model_id = str(item.get("id") or "")
                 if _cursor_model_ref(account_key, model_id) == wanted:
@@ -3568,8 +3577,8 @@ def _resolve_cursor_model_ref(ref: str) -> tuple[str, dict, dict] | None:
         return None
     account_key, model_id = raw.split(_CURSOR_MODEL_REF_SEP, 1)
     account_key = _resolve_to_account_key(account_key) or ""
-    acc = oauth_manager.get_account(account_key) if account_key else None
-    if acc is None or oauth_manager.provider_of(acc) != "cursor":
+    acc = oauth_control.account_snapshot(account_key) if account_key else None
+    if acc is None or oauth_control.provider_of_snapshot(acc) != "cursor":
         return None
     record = next((
         item for item in _cursor_model_records(acc)
@@ -3624,8 +3633,8 @@ def _load_cursor_disable_state(chat_id: int, short: str) -> dict | None:
     disabled-model set instead of treating the page as dead.
     """
     account_key = _account_key_from_short(short)
-    acc = oauth_manager.get_account(account_key) if account_key else None
-    if acc is None or oauth_manager.provider_of(acc) != "cursor":
+    acc = oauth_control.account_snapshot(account_key) if account_key else None
+    if acc is None or oauth_control.provider_of_snapshot(acc) != "cursor":
         return None
     existing = _cursor_disable_state(chat_id)
     existing_key = _resolve_to_account_key((existing or {}).get("account_key"))
@@ -3633,7 +3642,7 @@ def _load_cursor_disable_state(chat_id: int, short: str) -> dict | None:
         return existing
     models = [str(item.get("id") or "") for item in _cursor_model_records(acc)]
     available = set(models)
-    selected = oauth_manager.cursor_disabled_models(acc) & available
+    selected = oauth_control.cursor_disabled_models_snapshot(acc) & available
     _set_cursor_disable_state(
         chat_id,
         account_key,
@@ -3662,8 +3671,8 @@ def _set_cursor_disable_state(
 
 def _cursor_disable_text_and_kb(data: dict) -> tuple[str, dict] | None:
     account_key = _resolve_to_account_key(data.get("account_key"))
-    acc = oauth_manager.get_account(account_key) if account_key else None
-    if acc is None or oauth_manager.provider_of(acc) != "cursor":
+    acc = oauth_control.account_snapshot(account_key) if account_key else None
+    if acc is None or oauth_control.provider_of_snapshot(acc) != "cursor":
         return None
     models = [str(model) for model in data.get("models") or [] if str(model)]
     available = set(models)
@@ -3722,13 +3731,13 @@ def on_cursor_disable_start(
 ) -> None:
     short, page = _cursor_model_page_payload(payload)
     account_key = _account_key_from_short(short)
-    acc = oauth_manager.get_account(account_key) if account_key else None
-    if acc is None or oauth_manager.provider_of(acc) != "cursor":
+    acc = oauth_control.account_snapshot(account_key) if account_key else None
+    if acc is None or oauth_control.provider_of_snapshot(acc) != "cursor":
         ui.answer_cb(cb_id, "Cursor 账户或短码已失效", show_alert=True)
         return
     models = [str(item.get("id") or "") for item in _cursor_model_records(acc)]
     available = set(models)
-    selected = oauth_manager.cursor_disabled_models(acc) & available
+    selected = oauth_control.cursor_disabled_models_snapshot(acc) & available
     _set_cursor_disable_state(
         chat_id, account_key, page=page, selected=selected, models=models,
     )
@@ -3779,8 +3788,8 @@ def on_cursor_disable_set_all(
         ui.answer_cb(cb_id, "会话已失效，请重新进入 Cursor 模型目录", show_alert=True)
         return
     account_key = _resolve_to_account_key(data.get("account_key"))
-    acc = oauth_manager.get_account(account_key) if account_key else None
-    if acc is None or oauth_manager.provider_of(acc) != "cursor":
+    acc = oauth_control.account_snapshot(account_key) if account_key else None
+    if acc is None or oauth_control.provider_of_snapshot(acc) != "cursor":
         ui.answer_cb(cb_id, "Cursor 账户已不存在", show_alert=True)
         return
     models = [str(model) for model in data.get("models") or [] if str(model)]
@@ -3803,8 +3812,8 @@ def on_cursor_disable_save(
     account_key = _resolve_to_account_key(data.get("account_key"))
     page = max(1, int(data.get("page") or 1))
     try:
-        saved = oauth_manager.set_cursor_disabled_models(
-            account_key or "", data.get("selected") or [],
+        saved = oauth_control.set_cursor_disabled_models_raw(
+            _management_context(chat_id), account_key or "", data.get("selected") or [],
             visible_models=data.get("models") or [],
         )
     except ValueError as exc:
@@ -3835,12 +3844,12 @@ def on_cursor_disable_cancel(
 def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
     short, page = _cursor_model_page_payload(payload)
     account_key = _account_key_from_short(short)
-    acc = oauth_manager.get_account(account_key) if account_key else None
-    if acc is None or oauth_manager.provider_of(acc) != "cursor":
+    acc = oauth_control.account_snapshot(account_key) if account_key else None
+    if acc is None or oauth_control.provider_of_snapshot(acc) != "cursor":
         ui.answer_cb(cb_id, "Cursor 账户或短码已失效")
         return
     records = _cursor_model_records(acc)
-    disabled_models = oauth_manager.cursor_disabled_models(acc)
+    disabled_models = oauth_control.cursor_disabled_models_snapshot(acc)
     disabled_count = sum(
         1 for item in records if str(item.get("id") or "") in disabled_models
     )
@@ -3860,7 +3869,7 @@ def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) ->
         max_context = int(item.get("context_window_max_mode") or context)
         default_max = (
             max_context > context > 0
-            and oauth_manager.cursor_max_context_default(acc, model_id)
+            and oauth_control.cursor_max_context_default_snapshot(acc, model_id)
         )
         effective_context = max_context if default_max else context
         context_suffix = "（Max Context 默认）" if default_max else ""
@@ -3915,12 +3924,12 @@ def on_cursor_model_detail(chat_id: int, message_id: int, cb_id: str, payload: s
     account_key, acc, item = resolved
     model_id = str(item.get("id") or "")
     name = str(item.get("name") or model_id)
-    model_disabled = model_id in oauth_manager.cursor_disabled_models(acc)
+    model_disabled = model_id in oauth_control.cursor_disabled_models_snapshot(acc)
     context = int(item.get("context_window") or 0)
     max_context = int(item.get("context_window_max_mode") or context)
     max_output = int(item.get("max_tokens") or 0)
     has_separate_max = max_context > context > 0
-    default_max = oauth_manager.cursor_max_context_default(acc, model_id)
+    default_max = oauth_control.cursor_max_context_default_snapshot(acc, model_id)
     variants = [value for value in item.get("variants") or [] if isinstance(value, dict)]
     supports_fast = any(bool(value.get("fast")) for value in variants)
     supports_thinking = any(bool(value.get("thinking")) for value in variants)
@@ -3985,10 +3994,10 @@ def on_cursor_max_context_toggle(chat_id: int, message_id: int, cb_id: str, payl
         return
     account_key, acc, item = resolved
     model_id = str(item.get("id") or "")
-    current = oauth_manager.cursor_max_context_default(acc, model_id)
+    current = oauth_control.cursor_max_context_default_snapshot(acc, model_id)
     try:
-        saved = oauth_manager.set_cursor_max_context_default(
-            account_key, model_id, not current,
+        saved = oauth_control.set_cursor_max_context_default_raw(
+            _management_context(chat_id), account_key, model_id, not current,
         )
     except ValueError as exc:
         ui.answer_cb(cb_id, str(exc), show_alert=True)
@@ -4004,7 +4013,7 @@ def on_clear_errors(chat_id: int, message_id: int, cb_id: str, short: str, page:
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    cooldown.clear(f"oauth:{ak}", model=None)
+    oauth_control.clear_errors(_management_context(chat_id), ak)
     ui.answer_cb(cb_id, "已清除该账号的所有模型冷却")
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if text:
@@ -4017,7 +4026,7 @@ def on_reset_quota_ask(chat_id: int, message_id: int, cb_id: str, short: str,
     if ak is None:
         ui.answer_cb(cb_id)
         return
-    if oauth_manager.provider_of(ak) != "openai":
+    if oauth_control.provider_of_snapshot(ak) != "openai":
         ui.answer_cb(cb_id)
         return
 
@@ -4075,7 +4084,7 @@ def on_reset_quota_confirm(chat_id: int, message_id: int, cb_id: str, short: str
     if ak is None or not reset_idem or stage != "confirm":
         ui.answer_cb(cb_id, "确认信息已失效，请重新进入")
         return
-    if oauth_manager.provider_of(ak) != "openai":
+    if oauth_control.provider_of_snapshot(ak) != "openai":
         ui.answer_cb(cb_id, "仅 OpenAI 有官方重置次数")
         return
 
@@ -4084,7 +4093,7 @@ def on_reset_quota_confirm(chat_id: int, message_id: int, cb_id: str, short: str
     final_short = ui.register_code(f"{ak}|{reset_idem}|execute")
     final_payload = _callback_payload(final_short, page, filter_key)
     cancel_payload = _callback_payload(ui.register_code(ak), page, filter_key)
-    reset_label = _openai_reset_credit_label_from_row(state_db.quota_load(ak), show_zero=True)
+    reset_label = _openai_reset_credit_label_from_row(oauth_control.quota_snapshot(ak), show_zero=True)
     body = (
         f"🚨 {ui.provider_custom_emoji_html('openai')} <b>最终确认：消耗 1 次 OpenAI 官方重置</b>\n\n"
         f"账号: <code>{ui.escape_html(email or ak)}</code>\n"
@@ -4115,7 +4124,7 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         ui.answer_cb(cb_id, "短码已失效")
         return
 
-    provider = oauth_manager.provider_of(ak)
+    provider = oauth_control.provider_of_snapshot(ak)
     if provider == "openai":
         if not reset_idem or reset_stage != "execute":
             ui.answer_cb(cb_id, "需要先完成二次确认")
@@ -4126,7 +4135,12 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
                         reply_markup=kb)
             return
         ui.answer_cb(cb_id, "正在调用 OpenAI 官方重置...")
-        result = _run_sync(oauth_manager.redeem_openai_rate_limit_reset_credit(ak, idempotency_key=reset_idem))
+        try:
+            result = oauth_control.redeem_openai_reset_credit_now(
+                _management_context(chat_id), ak, reset_idem,
+            )
+        except Exception as exc:
+            result = exc
         if isinstance(result, Exception):
             ui.send(chat_id, _oauth_error_html(
                 result, provider="openai", operation="rate_limit_reset_credit",
@@ -4183,7 +4197,7 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
                     reply_markup=kb)
         return
 
-    result = oauth_manager.reset_quota(ak)
+    result = oauth_control.reset_quota_now(_management_context(chat_id), ak)
     action = result.get("action")
     if action == "reset":
         ui.answer_cb(cb_id, "已清本地配额禁用")
@@ -4232,9 +4246,7 @@ def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str, pag
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    ch_key = f"oauth:{ak}"
-    affinity.delete_by_channel(ch_key)
-    affinity.client_delete_by_channel(ch_key)
+    oauth_control.clear_affinity(_management_context(chat_id), ak)
     ui.answer_cb(cb_id, "已清亲和")
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if text:
@@ -4248,7 +4260,7 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int =
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    acc = oauth_manager.get_account(ak)
+    acc = oauth_control.account_snapshot(ak)
     if acc is None:
         ui.answer_cb(cb_id, "账户不存在")
         show(chat_id, message_id, page=page, filter_key=filter_key)
@@ -4256,10 +4268,12 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int =
 
     enabled = acc.get("enabled", True) and not acc.get("disabled_reason")
     if enabled:
-        oauth_manager.set_enabled(ak, False, reason="user")
+        oauth_control.set_account_enabled(
+            _management_context(chat_id), ak, False, reason="user",
+        )
         ui.answer_cb(cb_id, "已禁用")
     else:
-        oauth_manager.set_enabled(ak, True)
+        oauth_control.set_account_enabled(_management_context(chat_id), ak, True)
         ui.answer_cb(cb_id, "已启用")
 
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
@@ -4274,9 +4288,9 @@ def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str, page: i
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    acc = oauth_manager.get_account(ak)
+    acc = oauth_control.account_snapshot(ak)
     email = (acc or {}).get("email") or _account_email(ak)
-    prov = oauth_manager.provider_of(ak)
+    prov = oauth_control.provider_of_snapshot(ak)
     prov_tag = _provider_tag(prov)
     ui.answer_cb(cb_id)
     ui.edit(
@@ -4298,14 +4312,14 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         return
     email = _account_email(ak)
     try:
-        oauth_manager.delete_account(ak)
+        oauth_control.delete_account(_management_context(chat_id), ak)
     except Exception as exc:
         ui.answer_cb(cb_id, "删除失败")
         ui.send(chat_id, f"❌ 删除失败: <code>{ui.escape_html(str(exc))}</code>")
         return
     ui.answer_cb(cb_id, "已删除")
     extra = ""
-    if load_balancing.is_initialized():
+    if oauth_control.load_balancing_initialized():
         extra = "\n已从负载均衡优先级队列中移除。"
     ui.edit(chat_id, message_id, f"✅ 已删除 <code>{ui.escape_html(email)}</code>{extra}")
     show(chat_id, message_id, page=page, filter_key=filter_key)
@@ -4319,13 +4333,13 @@ def _initial_update_keys_for_ui(accounts: list[dict]) -> list[str]:
         ak = _account_key(acc)
         # 当前卡死问题来自 OpenAI 的 wham/reset-card 慢接口；只有完全没有
         # OpenAI usage cache 时才切进度面板。已有缓存则直接显示旧值、后台刷新。
-        if oauth_manager.provider_of(acc) == "openai" and _needs_initial_oauth_cache_sync_for_ui(ak):
+        if oauth_control.provider_of_snapshot(acc) == "openai" and _needs_initial_oauth_cache_sync_for_ui(ak):
             keys.append(ak)
     return keys
 
 
 def _progress_account_block(account_key: str, idx: int, status_line: str | None = None) -> str:
-    acc = oauth_manager.get_account(account_key) or {"email": _account_email(account_key)}
+    acc = oauth_control.account_snapshot(account_key) or {"email": _account_email(account_key)}
     block = _format_account_block(acc)
     first, _, rest = block.partition("\n")
     lines = [f"{idx}. {first}"]
@@ -4389,7 +4403,7 @@ def _run_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: list[
 
     _flush()
     for idx0, ak in enumerate(account_keys):
-        provider = oauth_manager.provider_of(ak)
+        provider = oauth_control.provider_of_snapshot(ak)
         acquired = False
         with _BACKGROUND_REFRESH_LOCK:
             if ak not in _BACKGROUND_REFRESH_INFLIGHT:
@@ -4404,7 +4418,7 @@ def _run_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: list[
                 if not busy:
                     break
                 time.sleep(0.5)
-            if _quota_cache_has_usage_signal(state_db.quota_load(ak)):
+            if _quota_cache_has_usage_signal(oauth_control.quota_snapshot(ak)):
                 success_count += 1
                 _set_item(idx0, ak, "  ✅ 刷新成功")
             else:
@@ -4544,7 +4558,7 @@ def _refresh_all_usage_summary(usage: dict | None, *, provider: str,
                                reset_credit_error=None) -> str:
     if not isinstance(usage, dict):
         return "无数据"
-    utils = oauth_manager.extract_utils_percent(usage)
+    utils = oauth_control.extract_utils_percent(usage)
     tags = ["5h", "7d", "30d", "sonnet", "opus", "fable"]
     parts = []
     for tag, util in zip(tags, utils):
@@ -4583,7 +4597,7 @@ def _run_refresh_all_legacy_panel(chat_id: int, progress_mid: int, account_keys:
 
     _flush()
     for idx, ak in enumerate([k for k in account_keys if k], 1):
-        provider = oauth_manager.provider_of(ak)
+        provider = oauth_control.provider_of_snapshot(ak)
         email = _account_email(ak)
         prov_tag = _provider_tag(provider)
         ek = ui.escape_html(email or ak)
@@ -4612,12 +4626,12 @@ def _run_refresh_all_legacy_panel(chat_id: int, progress_mid: int, account_keys:
                 if not busy:
                     break
                 time.sleep(0.5)
-            row = state_db.quota_load(ak)
+            row = oauth_control.quota_snapshot(ak)
             if _quota_cache_has_usage_signal(row):
                 success_count += 1
                 usage = None
                 try:
-                    usage = oauth_manager.usage_from_quota_row(row) if row else None
+                    usage = oauth_control.usage_from_quota_row(row) if row else None
                 except Exception:
                     usage = None
                 lines[-1] = f"  ✅ 刷新成功: {_refresh_all_usage_summary(usage, provider=provider)}"
@@ -4723,7 +4737,7 @@ def _run_refresh_all_legacy_panel(chat_id: int, progress_mid: int, account_keys:
 
 def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ui.answer_cb(cb_id, "开始刷新用量/重置卡...")
-    accounts = oauth_manager.list_accounts()
+    accounts = oauth_control.account_entries_snapshot()
     account_keys = _refreshable_account_keys_for_ui(accounts)
     if not account_keys:
         ui.send(chat_id, "❌ 当前无可刷新的 OAuth 账户")
@@ -4826,9 +4840,9 @@ def on_add_openai(chat_id: int, message_id: int, cb_id: str) -> None:
 
 def on_login_start(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    code_verifier, code_challenge = oauth_manager.pkce_generate()
+    code_verifier, code_challenge = oauth_control.claude_pkce_generate()
     state = secrets.token_urlsafe(32)
-    url = oauth_manager.build_login_url(code_challenge, state)
+    url = oauth_control.claude_build_login_url(code_challenge, state)
 
     states.set_state(chat_id, "oa_login_code", {
         "code_verifier": code_verifier, "state": state,
@@ -4865,7 +4879,7 @@ def on_login_code_input(chat_id: int, text: str) -> None:
         return
 
     try:
-        tok_resp = oauth_manager.exchange_code(
+        tok_resp = oauth_control.claude_exchange_code(
             code_part, data.get("code_verifier", ""), data.get("state", ""),
         )
     except Exception as exc:
@@ -4878,10 +4892,10 @@ def on_login_code_input(chat_id: int, text: str) -> None:
     email = ""
     claude_plan_info = {}
     try:
-        profile = _run_sync(oauth_manager.fetch_profile(tok_resp.get("access_token", "")))
+        profile = _run_sync(oauth_control.claude_fetch_profile(tok_resp.get("access_token", "")))
         if isinstance(profile, dict):
             email = (profile.get("account") or {}).get("email", "") or ""
-            claude_plan_info = oauth_manager.extract_claude_plan_info(profile)
+            claude_plan_info = oauth_control.claude_extract_plan(profile)
     except Exception:
         pass
 
@@ -4920,9 +4934,9 @@ def on_login_code_input(chat_id: int, text: str) -> None:
 
     lb_hint = (
         "\n\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
-        if load_balancing.is_initialized() else ""
+        if oauth_control.load_balancing_initialized() else ""
     )
-    _cl_plan = oauth_manager.claude_plan_label(entry)
+    _cl_plan = oauth_control.claude_plan_label(entry)
     _cl_sub_parts = []
     if claude_plan_info.get("subscription_status"):
         _cl_sub_parts.append(claude_plan_info["subscription_status"])
@@ -5002,7 +5016,7 @@ def on_set_json_input(chat_id: int, text: str) -> None:
 
     lb_hint = (
         "\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
-        if load_balancing.is_initialized() else ""
+        if oauth_control.load_balancing_initialized() else ""
     )
     ui.send_result(chat_id, f"✅ 已添加 <code>{ui.escape_html(data['email'])}</code>{lb_hint}", **nav)
 
@@ -5016,7 +5030,7 @@ _OA_NAV_CURSOR = {"back_label": "◀ 返回新增账户", "back_callback": "oa:a
 def on_login_cursor_start(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     try:
-        params = cursor_provider.generate_login()
+        params = oauth_control.cursor_generate_login()
     except Exception as exc:
         ui.send_result(
             chat_id,
@@ -5067,14 +5081,14 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
         return
 
     try:
-        tokens = cursor_provider.poll_login_once(
+        tokens = oauth_control.cursor_poll_login(
             str(data.get("uuid") or ""),
             str(data.get("verifier") or ""),
         )
-    except cursor_provider.CursorAuthPending:
-        ui.answer_cb(cb_id, "Cursor 尚未确认登录，请完成浏览器登录后再点", show_alert=True)
-        return
     except Exception as exc:
+        if oauth_control.is_cursor_auth_pending(exc):
+            ui.answer_cb(cb_id, "Cursor 尚未确认登录，请完成浏览器登录后再点", show_alert=True)
+            return
         ui.answer_cb(cb_id, "获取 Cursor Token 失败", show_alert=True)
         ui.edit(
             chat_id,
@@ -5086,7 +5100,7 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
 
     ui.answer_cb(cb_id, "登录成功，正在保存账户...")
     try:
-        subject = cursor_provider.subject_from_access_token(tokens.access_token)
+        subject = oauth_control.cursor_subject(tokens.access_token)
         if not subject:
             raise ValueError("Cursor access token 缺少稳定 subject")
     except Exception as exc:
@@ -5105,7 +5119,7 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
     profile: dict = {}
     profile_error: Exception | None = None
     try:
-        profile = cursor_provider.fetch_profile_sync(
+        profile = oauth_control.cursor_profile(
             tokens.access_token, account_key=f"cursor:{subject}",
         )
     except Exception as exc:
@@ -5116,14 +5130,14 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
     usage: dict | None = None
     usage_error: Exception | None = None
     try:
-        usage = cursor_provider.fetch_usage_sync(tokens.access_token)
+        usage = oauth_control.cursor_usage(tokens.access_token)
     except Exception as exc:
         usage_error = exc
 
     cursor_usage = (usage or {}).get("cursor") if isinstance(usage, dict) else {}
     cursor_usage = cursor_usage if isinstance(cursor_usage, dict) else {}
     profile_email = str(profile.get("email") or "").strip()
-    email = profile_email or cursor_provider.account_label(subject)
+    email = profile_email or oauth_control.cursor_label(subject)
     plan = str(cursor_usage.get("plan_name") or cursor_usage.get("individual_membership_type") or "Cursor")
     short_subject = hashlib.sha256(subject.encode("utf-8")).hexdigest()[:8]
     label = email if profile_email else (
@@ -5221,9 +5235,9 @@ def _build_openai_login_text_and_kb(url: str) -> tuple[str, dict]:
 
 def on_login_openai_start(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    verifier, challenge = openai_provider.pkce_generate()
+    verifier, challenge = oauth_control.openai_pkce_generate()
     state = secrets.token_urlsafe(32)
-    url = openai_provider.build_login_url(challenge, state)
+    url = oauth_control.openai_build_login_url(challenge, state)
 
     states.set_state(chat_id, "oa_openai_code", {
         "code_verifier": verifier, "state": state,
@@ -5300,7 +5314,7 @@ def on_login_openai_code_input(chat_id: int, text: str) -> None:
 
     verifier = data.get("code_verifier", "")
     try:
-        tok = openai_provider.exchange_code_sync(code, verifier)
+        tok = oauth_control.openai_exchange_code(code, verifier)
     except Exception as exc:
         ui.send_result(
             chat_id,
@@ -5335,7 +5349,7 @@ def on_set_rt_openai_input(chat_id: int, text: str) -> None:
                        **_OA_NAV_OPENAI)
         return
     try:
-        tok = openai_provider.refresh_sync(rt_clean)
+        tok = oauth_control.openai_refresh(rt_clean)
     except Exception as exc:
         ui.send_result(
             chat_id,
@@ -5356,11 +5370,11 @@ def _openai_token_to_entry(tok: dict, *, fallback_email: str = "") -> tuple[dict
     if not id_token:
         raise ValueError("token 响应缺少 id_token，无法识别账户")
     try:
-        claims = openai_provider.decode_id_token(id_token)
+        claims = oauth_control.openai_decode_id_token(id_token)
     except Exception as exc:
         raise ValueError(f"id_token 解码失败: {exc}") from exc
 
-    info = openai_provider.extract_user_info(claims)
+    info = oauth_control.openai_extract_user_info(claims)
     email = info.get("email") or tok.get("email") or fallback_email or ""
     if not email:
         email = f"unnamed-openai-{int(datetime.now().timestamp())}@local"
@@ -5416,7 +5430,7 @@ def _refresh_openai_rt_to_entry(refresh_token: str, *, email_hint: str = "",
             kwargs["workspace_id"] = workspace_id
         if org_id:
             kwargs["org_id"] = org_id
-        tok = openai_provider.refresh_sync(refresh_token, **kwargs)
+        tok = oauth_control.openai_refresh(refresh_token, **kwargs)
         if not tok.get("refresh_token"):
             tok["refresh_token"] = refresh_token
         entry, meta = _openai_token_to_entry(tok, fallback_email=email_hint)
@@ -5430,8 +5444,8 @@ def _find_openai_account_by_email(email: str) -> dict | None:
     if not email:
         return None
     matches = [
-        acc for acc in oauth_manager.list_accounts()
-        if oauth_manager.provider_of(acc) == "openai" and acc.get("email") == email
+        acc for acc in oauth_control.account_entries_snapshot()
+        if oauth_control.provider_of_snapshot(acc) == "openai" and acc.get("email") == email
     ]
     return matches[0] if len(matches) == 1 else None
 
@@ -5441,8 +5455,8 @@ def _find_openai_account_by_identity(entry: dict) -> dict | None:
     email, workspace_id, chatgpt_account_id = _openai_identity_parts(entry)
     if not (workspace_id or chatgpt_account_id):
         return None
-    for acc in oauth_manager.list_accounts():
-        if oauth_manager.provider_of(acc) != "openai":
+    for acc in oauth_control.account_entries_snapshot():
+        if oauth_control.provider_of_snapshot(acc) != "openai":
             continue
         acc_email, acc_workspace_id, acc_chatgpt_account_id = _openai_identity_parts(acc)
         if (
@@ -5469,45 +5483,10 @@ def _find_openai_existing_for_entry(entry: dict) -> dict | None:
 
 def _upsert_openai_account_entry(entry: dict, *, preserve_existing_settings: bool = True) -> bool:
     """写入 OpenAI 账号。返回 True 表示替换既有账号，False 表示新增。"""
-    target = _find_openai_existing_for_entry(entry)
-    if target is None:
-        oauth_manager.add_account(entry)
-        return False
-    target_key = _account_key(target)
-    replaced = False
-    appended = False
-
-    def mutate(cfg):
-        nonlocal replaced, appended
-        accounts = cfg.setdefault("oauthAccounts", [])
-        for acc in accounts:
-            if _account_key(acc) != target_key:
-                continue
-            keep_models = acc.get("models")
-            keep_max = acc.get("maxConcurrent")
-            # 替换已有账号时，保留账号的手动启停/配额禁用状态；token/metadata 更新。
-            keep_enabled = acc.get("enabled")
-            keep_disabled_reason = acc.get("disabled_reason")
-            keep_disabled_until = acc.get("disabled_until")
-            acc.update(entry)
-            if preserve_existing_settings:
-                if keep_models is not None:
-                    acc["models"] = keep_models
-                if keep_max is not None:
-                    acc["maxConcurrent"] = keep_max
-                if keep_enabled is not None:
-                    acc["enabled"] = keep_enabled
-                acc["disabled_reason"] = keep_disabled_reason
-                acc["disabled_until"] = keep_disabled_until
-            replaced = True
-            return
-        accounts.append(entry)
-        appended = True
-
-    config.update(mutate)
-    if appended:
-        load_balancing.sync_channel_added(f"oauth:{_account_key(entry)}", "openai")
-    return replaced
+    # The authoritative identity writer already preserves account-local settings.
+    # This compatibility helper is retained for existing callers, but no longer
+    # edits oauthAccounts directly.
+    return oauth_control.upsert_openai_account_entry(_management_context(0), entry)
 
 
 def _save_openai_entry_with_duplicate_policy(entry: dict) -> tuple[str, str]:
@@ -5517,9 +5496,11 @@ def _save_openai_entry_with_duplicate_policy(entry: dict) -> tuple[str, str]:
     ``_persist_new_or_stage_overwrite``.  Keeping this helper fail-closed prevents
     old call sites/tests from reviving token-validity based skip/replace behavior.
     """
-    if oauth_manager.find_exact_identity(entry) is not None:
+    if oauth_control.find_exact_identity(_management_context(0), entry) is not None:
         return "duplicate", "需要用户确认覆盖"
-    oauth_manager.add_account(entry)
+    added = oauth_control.add_account_entry(_management_context(0), entry)
+    if added.get("status") != "added":
+        return "duplicate", "需要用户确认覆盖"
     return "added", "新增"
 
 
@@ -5552,7 +5533,7 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
         else:
             _evaluate_quota_action(saved_ak, usage_result)
             parts = []
-            for label, util in zip(("5h", "7d", "30d"), oauth_manager.extract_utils_percent(usage_result)[:3]):
+            for label, util in zip(("5h", "7d", "30d"), oauth_control.extract_utils_percent(usage_result)[:3]):
                 if util is not None:
                     parts.append(f"{label} {util:.0f}%")
             quota_note = "\n额度: <code>" + ui.escape_html(" / ".join(parts) or "已获取") + "</code>"
@@ -5569,7 +5550,7 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
     }.get(action, f"✅ {ui.provider_custom_emoji_html('openai')} <b>OpenAI OAuth 账户已处理</b>")
     lb_hint = (
         "\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
-        if action == "added" and load_balancing.is_initialized() else ""
+        if action == "added" and oauth_control.load_balancing_initialized() else ""
     )
     ui.send_result(
         chat_id,
@@ -5591,7 +5572,7 @@ _OA_NAV_XAI = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"
 
 
 def _build_xai_login_text_and_kb(url: str) -> tuple[str, dict]:
-    redirect = xai_provider.redirect_uri()
+    redirect = oauth_control.xai_redirect_uri()
     text = (
         f"请在浏览器打开以下链接登录 {_provider_tag('xai', full=True)} 账号：\n\n"
         f"<a href=\"{ui.escape_html(url)}\">📱 点此打开登录页</a>\n\n"
@@ -5611,13 +5592,13 @@ def _build_xai_login_text_and_kb(url: str) -> tuple[str, dict]:
 
 def on_login_xai_start(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    verifier, challenge = xai_provider.pkce_generate()
+    verifier, challenge = oauth_control.xai_pkce_generate()
     state = secrets.token_urlsafe(32)
     try:
-        discovery = xai_provider.discover_sync()
-        authorization_endpoint = discovery.get("authorization_endpoint") or xai_provider.authorization_url()
-        token_endpoint = discovery.get("token_endpoint") or xai_provider.token_url()
-        url = xai_provider.build_login_url(
+        discovery = oauth_control.xai_discover()
+        authorization_endpoint = discovery.get("authorization_endpoint") or oauth_control.xai_authorization_url()
+        token_endpoint = discovery.get("token_endpoint") or oauth_control.xai_token_url()
+        url = oauth_control.xai_build_login_url(
             challenge,
             state,
             authorization_endpoint=authorization_endpoint,
@@ -5634,7 +5615,7 @@ def on_login_xai_start(chat_id: int, message_id: int, cb_id: str) -> None:
         "code_verifier": verifier,
         "state": state,
         "token_endpoint": token_endpoint,
-        "redirect_uri": xai_provider.redirect_uri(),
+        "redirect_uri": oauth_control.xai_redirect_uri(),
     })
 
     text, kb = _build_xai_login_text_and_kb(url)
@@ -5666,11 +5647,11 @@ def on_login_xai_code_input(chat_id: int, text: str) -> None:
         )
         return
     try:
-        tok = xai_provider.exchange_code_sync(
+        tok = oauth_control.xai_exchange_code(
             code,
             data.get("code_verifier", ""),
-            redirect_uri=data.get("redirect_uri") or xai_provider.redirect_uri(),
-            token_endpoint=data.get("token_endpoint") or xai_provider.token_url(),
+            redirect_uri=data.get("redirect_uri") or oauth_control.xai_redirect_uri(),
+            token_endpoint=data.get("token_endpoint") or oauth_control.xai_token_url(),
         )
     except Exception as exc:
         ui.send_result(
@@ -5703,7 +5684,7 @@ def on_set_rt_xai_input(chat_id: int, text: str) -> None:
         ui.send_result(chat_id, "❌ refresh_token 过短或无法识别，请重新粘贴。", **_OA_NAV_XAI)
         return
     try:
-        tok = xai_provider.refresh_sync(rt_clean)
+        tok = oauth_control.xai_refresh(rt_clean)
     except Exception as exc:
         ui.send_result(
             chat_id,
@@ -5721,7 +5702,7 @@ def _xai_token_to_entry(tok: dict, *, fallback_email: str = "") -> tuple[dict, d
     info: dict = {}
     if id_token:
         try:
-            info = xai_provider.extract_user_info(xai_provider.decode_id_token(id_token))
+            info = oauth_control.xai_extract_user_info(oauth_control.xai_decode_id_token(id_token))
         except Exception as exc:
             raise ValueError(f"id_token 解码失败: {exc}") from exc
 
@@ -5749,9 +5730,9 @@ def _xai_token_to_entry(tok: dict, *, fallback_email: str = "") -> tuple[dict, d
         "id_token": id_token,
         "subject": subject,
         "sub": subject,
-        "base_url": tok.get("base_url") or tok.get("baseUrl") or xai_provider.api_base_url(),
-        "token_endpoint": tok.get("token_endpoint") or xai_provider.token_url(),
-        "redirect_uri": tok.get("redirect_uri") or xai_provider.redirect_uri(),
+        "base_url": tok.get("base_url") or tok.get("baseUrl") or oauth_control.xai_api_base_url(),
+        "token_endpoint": tok.get("token_endpoint") or oauth_control.xai_token_url(),
+        "redirect_uri": tok.get("redirect_uri") or oauth_control.xai_redirect_uri(),
     }
     meta = {"email": email, "subject": subject, "expired": new_expired}
     return entry, meta
@@ -5779,7 +5760,7 @@ def _finish_xai_add(chat_id: int, tok: dict, *, source: str) -> None:
              else f"✅ {ui.provider_custom_emoji_html('xai')} <b>Grok OAuth 账户已添加</b>")
     lb_hint = (
         "\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
-        if not existed and load_balancing.is_initialized() else ""
+        if not existed and oauth_control.load_balancing_initialized() else ""
     )
     subject_line = f"Subject: <code>{ui.escape_html(meta.get('subject') or '')}</code>\n" if meta.get("subject") else ""
     ui.send_result(
@@ -5800,7 +5781,7 @@ _OA_NAV_ANTIGRAVITY = {"back_label": "◀ 返回新增账户", "back_callback": 
 
 
 def _build_antigravity_login_text_and_kb(url: str) -> tuple[str, dict]:
-    redirect = antigravity_provider.redirect_uri()
+    redirect = oauth_control.antigravity_redirect_uri()
     text = (
         f"请在浏览器打开以下链接登录 {_provider_tag('antigravity', full=True)} 账号：\n\n"
         f"<a href=\"{ui.escape_html(url)}\">📱 点此打开登录页</a>\n\n"
@@ -5821,11 +5802,11 @@ def _build_antigravity_login_text_and_kb(url: str) -> tuple[str, dict]:
 def on_login_antigravity_start(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     state = secrets.token_urlsafe(32)
-    url = antigravity_provider.build_login_url(state)
+    url = oauth_control.antigravity_build_login_url(state)
     states.set_state(chat_id, "oa_antigravity_code", {
         "state": state,
-        "token_endpoint": antigravity_provider.token_url(),
-        "redirect_uri": antigravity_provider.redirect_uri(),
+        "token_endpoint": oauth_control.antigravity_token_url(),
+        "redirect_uri": oauth_control.antigravity_redirect_uri(),
     })
     text, kb = _build_antigravity_login_text_and_kb(url)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
@@ -5842,7 +5823,7 @@ def on_login_antigravity_code_input(chat_id: int, text: str) -> None:
         return
     data = state.get("data") or {}
     try:
-        parsed = antigravity_provider.parse_callback_url(text)
+        parsed = oauth_control.antigravity_parse_callback(text)
     except Exception as exc:
         ui.send_result(
             chat_id,
@@ -5863,10 +5844,10 @@ def on_login_antigravity_code_input(chat_id: int, text: str) -> None:
         )
         return
     try:
-        tok = antigravity_provider.complete_login_sync(
+        tok = oauth_control.antigravity_complete_login(
             code,
-            redirect_uri=data.get("redirect_uri") or antigravity_provider.redirect_uri(),
-            token_endpoint=data.get("token_endpoint") or antigravity_provider.token_url(),
+            redirect_uri=data.get("redirect_uri") or oauth_control.antigravity_redirect_uri(),
+            token_endpoint=data.get("token_endpoint") or oauth_control.antigravity_token_url(),
         )
     except Exception as exc:
         ui.send_result(
@@ -5902,9 +5883,9 @@ def _antigravity_token_to_entry(tok: dict) -> tuple[dict, dict]:
         "disabled_until": None,
         "models": [],
         "project_id": project_id,
-        "base_url": tok.get("base_url") or tok.get("baseUrl") or antigravity_provider.api_base_url(),
-        "token_endpoint": tok.get("token_endpoint") or antigravity_provider.token_url(),
-        "redirect_uri": tok.get("redirect_uri") or antigravity_provider.redirect_uri(),
+        "base_url": tok.get("base_url") or tok.get("baseUrl") or oauth_control.antigravity_api_base_url(),
+        "token_endpoint": tok.get("token_endpoint") or oauth_control.antigravity_token_url(),
+        "redirect_uri": tok.get("redirect_uri") or oauth_control.antigravity_redirect_uri(),
     }
     meta = {"email": email, "project_id": project_id, "expired": new_expired}
     return entry, meta
@@ -5934,7 +5915,7 @@ def _finish_antigravity_add(chat_id: int, tok: dict, *, source: str) -> None:
     )
     lb_hint = (
         "\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
-        if not existed and load_balancing.is_initialized() else ""
+        if not existed and oauth_control.load_balancing_initialized() else ""
     )
     ui.send_result(
         chat_id,
@@ -6091,15 +6072,16 @@ def _stage_openai_import_candidates(items: list[dict]) -> dict:
             staged["failed"].append((entry.get("email") or hint or "?", "同批 canonical identity 重复，已去重")); continue
         seen.add(key)
         record = {"account_key": key, "entry": entry, "meta": meta}
-        staged["duplicate" if oauth_manager.find_exact_identity(entry) else "new"].append(record)
+        staged["duplicate" if oauth_control.find_exact_identity_snapshot(entry) else "new"].append(record)
     return staged
 
 
-def _commit_staged_openai_import(staged: dict) -> dict:
+def _commit_staged_openai_import(staged: dict, *, chat_id: int = 0) -> dict:
+    context = _management_context(chat_id)
     result = {"added": [], "replaced": [], "failed": list(staged.get("failed") or []), "model_sync_keys": []}
     for record in staged.get("new") or []:
         entry = record["entry"]
-        added = oauth_manager.add_account_if_identity_absent(entry)
+        added = oauth_control.add_account_entry(context, entry)
         if added.get("status") != "added":
             result["failed"].append((entry.get("email") or "?", "账户已并发出现，请重新导入确认")); continue
         result["added"].append(entry.get("email") or "?")
@@ -6109,7 +6091,9 @@ def _commit_staged_openai_import(staged: dict) -> dict:
             _evaluate_quota_action(record["account_key"], usage)
     for record in staged.get("duplicate") or []:
         entry = record["entry"]
-        replacement = oauth_manager.replace_exact_identity(record["account_key"], entry)
+        replacement = oauth_control.replace_account_entry(
+            context, record["account_key"], entry,
+        )
         if replacement.get("status") != "replaced":
             result["failed"].append((entry.get("email") or "?", "目标账户已变化，请重新导入确认")); continue
         result["replaced"].append(entry.get("email") or "?")
@@ -6130,9 +6114,9 @@ def _wait_import_model_sync(chat_id: int, message_id: int, result: dict) -> None
         f"🔄 <b>正在同步模型，请稍候…</b>\n\n类型: <code>OpenAI</code>\n"
         f"进度: <code>0 / {len(keys)}</code>（最多并发 3）",
     )
-    futures = [oauth_manager.start_account_model_refresh(key) for key in keys]
+    futures = [oauth_control.start_account_model_refresh(key) for key in keys]
     done, pending = concurrent.futures.wait(
-        futures, timeout=oauth_manager.OAUTH_MODEL_SYNC_FOREGROUND_TIMEOUT_SECONDS,
+        futures, timeout=oauth_control.model_sync_foreground_timeout_seconds(),
     )
     success = failed = 0
     for future in done:
@@ -6193,7 +6177,10 @@ def on_import_openai_exec(chat_id: int, message_id: int, cb_id: str) -> None:
                 f"<b>{label} 导入二次确认</b>\n\n新增 <b>{len(staged['new'])}</b>、覆盖 <b>{len(staged['duplicate'])}</b>、失败 <b>{len(staged['failed'])}</b>。\n取消将整批零写入。是否提交？",
                 reply_markup=ui.inline_kb([[ui.btn("✅ 提交", f"oa:import_overwrite:confirm:{nonce}"), ui.btn("❌ 取消", f"oa:import_overwrite:cancel:{nonce}")]]))
         return
-    _render_openai_import_result(chat_id, message_id, label, _commit_staged_openai_import(staged))
+    _render_openai_import_result(
+        chat_id, message_id, label,
+        _commit_staged_openai_import(staged, chat_id=chat_id),
+    )
 
 
 def on_import_openai_overwrite(chat_id: int, message_id: int, cb_id: str, nonce: str, *, confirm: bool) -> None:
@@ -6205,7 +6192,9 @@ def on_import_openai_overwrite(chat_id: int, message_id: int, cb_id: str, nonce:
     if not confirm:
         ui.answer_cb(cb_id, "已取消，整批未写入")
         ui.edit(chat_id, message_id, "✅ 已取消导入，所有候选均未写入。", reply_markup=ui.inline_kb([[ui.btn("◀ 返回新增账户", "oa:add")]])); return
-    result = _commit_staged_openai_import(data.get("staged") or {})
+    result = _commit_staged_openai_import(
+        data.get("staged") or {}, chat_id=chat_id,
+    )
     label = _OPENAI_IMPORT_LABELS.get(data.get("kind", ""), str(data.get("kind") or "").upper())
     ui.answer_cb(cb_id, "导入完成")
     _render_openai_import_result(chat_id, message_id, label, result)
@@ -6215,7 +6204,7 @@ def on_import_openai_overwrite(chat_id: int, message_id: int, cb_id: str, nonce:
 
 def _invalid_accounts() -> list[dict]:
     return [
-        a for a in oauth_manager.list_accounts()
+        a for a in oauth_control.account_entries_snapshot()
         if a.get("email") and a.get("disabled_reason") == "auth_error"
     ]
 
@@ -6287,14 +6276,15 @@ def on_invalid_remove_toggle(chat_id: int, message_id: int, cb_id: str, short: s
     _render_invalid_remove(chat_id, message_id, selected=selected)
 
 
-def _delete_accounts_by_keys(keys: list[str]) -> tuple[int, list[str]]:
+def _delete_accounts_by_keys(keys: list[str], *, chat_id: int = 0) -> tuple[int, list[str]]:
+    context = _management_context(chat_id)
     deleted = 0
     failed: list[str] = []
     for ak in keys:
-        acc = oauth_manager.get_account(ak)
+        acc = oauth_control.account_snapshot(ak)
         email = (acc or {}).get("email") or _split_ak(ak)[1]
         try:
-            oauth_manager.delete_account(ak)
+            oauth_control.delete_account(context, ak)
             deleted += 1
         except Exception as exc:
             failed.append(f"{email}: {exc}")
@@ -6316,7 +6306,7 @@ def on_invalid_remove_exec(chat_id: int, message_id: int, cb_id: str, *, all_ite
         return
 
     ui.answer_cb(cb_id, "正在移除…")
-    deleted, failed = _delete_accounts_by_keys(targets)
+    deleted, failed = _delete_accounts_by_keys(targets, chat_id=chat_id)
     states.pop_state(chat_id)
 
     lines = ["<b>移除失效账户完成</b>", "", f"✅ 已移除 {deleted} 个"]
@@ -6339,15 +6329,7 @@ def on_invalid_remove_exec(chat_id: int, message_id: int, cb_id: str, *, all_ite
 
 def on_clear_all_errors(chat_id: int, message_id: int, cb_id: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     """清除所有 OAuth 账户的模型冷却（按 oauth: 前缀批量 clear）。"""
-    from ... import cooldown as _cd
-    cd_keys = sorted({
-        e["channel_key"] for e in _cd.active_entries()
-        if e.get("channel_key", "").startswith("oauth:")
-    })
-    cleared = 0
-    for ck in cd_keys:
-        _cd.clear(ck, model=None)
-        cleared += 1
+    cleared = oauth_control.clear_all_errors(_management_context(chat_id))
     ui.answer_cb(cb_id, f"已清除 {cleared} 个账户的冷却")
     show(chat_id, message_id, page=page, filter_key=filter_key)
 
@@ -6662,7 +6644,7 @@ def on_edit_max_concurrent_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, "❌ 需要非负整数，请重新输入：")
         return
     try:
-        oauth_manager.update_max_concurrent(ak, v)
+        oauth_control.set_account_max_concurrent(_management_context(chat_id), ak, v)
     except Exception as exc:
         ui.send(chat_id, f"❌ 失败: <code>{ui.escape_html(str(exc))}</code>")
         return

@@ -7,8 +7,14 @@ import threading
 import time
 from typing import Optional
 
-from ... import cooldown, model_metadata, oauth_manager
-from ...cursor_bridge import catalog as cursor_model_catalog
+from ...management_control.oauth.menu_bridge import (
+    control as oauth_control,
+    cooldown,
+    cursor_model_catalog,
+    model_metadata,
+    oauth_manager,
+    telegram_context as _management_context,
+)
 from .. import menu_cache, states, ui
 
 _PAGE_SIZE = 6
@@ -37,7 +43,7 @@ def _cb(short: str, model_page: int, account_page: int, filter_key: str) -> str:
 def _status(account_key: str, model: str, disabled: set[str]) -> tuple[str, str, bool]:
     if model in disabled:
         return "🚫", "已停用", False
-    state = cooldown.get_state(f"oauth:{account_key}", model) or {}
+    state = oauth_control.cooldown_state_snapshot(account_key, model) or {}
     until = state.get("cooldown_until")
     if until == -1:
         return "🔴", "已冻结", True
@@ -183,10 +189,10 @@ def _pagination(
 
 def render(account_key: str, *, model_page: int = 1, account_page: int = 1,
            filter_key: str = "all") -> tuple[str, dict]:
-    account = oauth_manager.get_account(account_key)
+    account = oauth_control.account_snapshot(account_key)
     if not account:
         return "⚠️ OAuth 账户已不存在", ui.inline_kb([[ui.btn("◀ 返回列表", "menu:oauth")]])
-    selection = oauth_manager.account_model_selection(account)
+    selection = oauth_control.account_model_selection_snapshot(account)
     disabled = selection["disabled_models"]
     entries = _sorted_status_entries(account_key, selection["models"], disabled)
     models = [model for model, _status_info in entries]
@@ -203,7 +209,7 @@ def render(account_key: str, *, model_page: int = 1, account_page: int = 1,
         f"目录来源: <code>{ui.escape_html(_source_label(selection))}</code>",
         f"同步时间: <code>{ui.escape_html(selection.get('synced_at') or '尚未成功同步')}</code>",
     ]
-    provider = oauth_manager.provider_of(account)
+    provider = oauth_control.provider_of_snapshot(account)
     error = str(selection.get("error") or "").strip()
     if selection["fallback"]:
         if provider == "cursor":
@@ -234,7 +240,7 @@ def render(account_key: str, *, model_page: int = 1, account_page: int = 1,
         lines.append(f"{global_index}. {icon} <code>{ui.escape_html(model)}</code> - {text}")
         use_max_context = bool(
             provider == "cursor"
-            and oauth_manager.cursor_max_context_default(account, model)
+            and oauth_control.cursor_max_context_default_snapshot(account, model)
         )
         lines.extend(_summary_lines(
             dict(bindings[model].metadata) if model in bindings else None,
@@ -252,7 +258,7 @@ def render(account_key: str, *, model_page: int = 1, account_page: int = 1,
     if models:
         bulk_callback = (
             f"oa:cursor_disable:{short}:{model_page}"
-            if oauth_manager.provider_of(account) == "cursor"
+            if oauth_control.provider_of_snapshot(account) == "cursor"
             else f"oam:bulk:{short}:{model_page}:{account_page}:{filter_key}"
         )
         rows.append([ui.btn("🚫 批量禁用", bulk_callback)])
@@ -275,7 +281,7 @@ def show(chat_id: int, message_id: int, cb_id: Optional[str], account_key: str,
         return
     token = menu_cache.begin_view(chat_id, message_id)
     def worker():
-        asyncio.run(oauth_manager.refresh_account_models(account_key))
+        asyncio.run(oauth_control.refresh_account_models_raw(account_key))
         if not menu_cache.is_current_view(chat_id, message_id, token):
             return
         text2, kb2 = render(account_key, model_page=model_page, account_page=account_page, filter_key=filter_key)
@@ -293,15 +299,15 @@ def _bulk_state(chat_id: int) -> dict | None:
 def _new_bulk_state(
     account_key: str, *, model_page: int, account_page: int, filter_key: str,
 ) -> dict | None:
-    account = oauth_manager.get_account(account_key)
-    if not account or oauth_manager.provider_of(account) == "cursor":
+    account = oauth_control.account_snapshot(account_key)
+    if not account or oauth_control.provider_of_snapshot(account) == "cursor":
         return None
     models = sorted(
-        oauth_manager.account_model_selection(account)["models"],
+        oauth_control.account_model_selection_snapshot(account)["models"],
         key=str.casefold,
     )
     visible = set(models)
-    selected = oauth_manager.account_disabled_models(account) & visible
+    selected = oauth_control.account_disabled_models_snapshot(account) & visible
     models.sort(key=lambda model: model in selected)
     return {
         "account_key": account_key,
@@ -331,8 +337,8 @@ def _load_bulk_state(
 
 def _bulk_render(data: dict) -> tuple[str, dict] | None:
     account_key = str(data.get("account_key") or "")
-    account = oauth_manager.get_account(account_key)
-    if not account or oauth_manager.provider_of(account) == "cursor":
+    account = oauth_control.account_snapshot(account_key)
+    if not account or oauth_control.provider_of_snapshot(account) == "cursor":
         return None
     models = [str(model) for model in data.get("models") or [] if str(model)]
     visible = set(models)
@@ -346,7 +352,7 @@ def _bulk_render(data: dict) -> tuple[str, dict] | None:
     account_page = max(1, int(data.get("account_page") or 1))
     filter_key = str(data.get("filter_key") or "all")
     label = str(account.get("label") or account.get("email") or account_key)
-    hidden_count = len(oauth_manager.account_disabled_models(account) - visible)
+    hidden_count = len(oauth_control.account_disabled_models_snapshot(account) - visible)
     lines = [
         f"🚫 <b>{ui.escape_html(label)} · 批量禁用模型</b>",
         f"共 <b>{len(models)}</b> 个模型 · 将停用 <b>{len(selected)}</b> 个",
@@ -463,8 +469,9 @@ def _handle_bulk_callback(
         selected = set(models) - selected
     elif kind == "bsave":
         try:
-            oauth_manager.set_account_disabled_models(
-                account_key, selected, visible_models=models,
+            oauth_control.set_account_disabled_models_raw(
+                _management_context(chat_id), account_key, selected,
+                visible_models=models,
             )
         except ValueError as exc:
             ui.answer_cb(cb_id, str(exc), show_alert=True)
@@ -496,10 +503,10 @@ def _handle_bulk_callback(
 
 def _detail_render(account_key: str, model: str, *, model_page: int,
                    account_page: int, filter_key: str) -> tuple[str, dict]:
-    account = oauth_manager.get_account(account_key)
+    account = oauth_control.account_snapshot(account_key)
     if not account:
         return "⚠️ OAuth 账户已不存在", ui.inline_kb([[ui.btn("◀ 返回列表", "menu:oauth")]])
-    selection = oauth_manager.account_model_selection(account)
+    selection = oauth_control.account_model_selection_snapshot(account)
     if model not in selection["models"]:
         return "⚠️ 模型已不在当前账户目录", ui.inline_kb([[
             ui.btn("◀ 返回模型列表", _cb(ui.register_code(account_key), model_page, account_page, filter_key))
@@ -508,7 +515,7 @@ def _detail_render(account_key: str, model: str, *, model_page: int,
     binding = _effective_binding(account_key, model)
     record = dict(binding.metadata) if binding else {}
     icon, status, fault = _status(account_key, model, disabled)
-    state = cooldown.get_state(f"oauth:{account_key}", model) or {}
+    state = oauth_control.cooldown_state_snapshot(account_key, model) or {}
     lines = [f"🧬 <b>模型详情</b>", "", f"完整 ID: <code>{ui.escape_html(model)}</code>"]
     detail_fields = [
         ("显示名称", record.get("name")), ("描述", record.get("description") or record.get("tagline")),
@@ -538,14 +545,14 @@ def _detail_render(account_key: str, model: str, *, model_page: int,
     context = f"{short}:{model_ref}:{model_page}:{account_page}:{filter_key}"
     rows = [[ui.btn("✅ 启用模型" if model in disabled else "🚫 停用模型", f"oam:toggle:{context}")]]
     cursor_record = (
-        cursor_model_catalog.find_record(account, model)
-        if oauth_manager.provider_of(account) == "cursor" else None
+        oauth_control.cursor_catalog_record_snapshot(account, model)
+        if oauth_control.provider_of_snapshot(account) == "cursor" else None
     )
     if cursor_record:
         normal_context = int(cursor_record.get("context_window") or 0)
         max_context = int(cursor_record.get("context_window_max_mode") or normal_context or 0)
         if max_context > normal_context > 0:
-            max_on = oauth_manager.cursor_max_context_default(account_key, model)
+            max_on = oauth_control.cursor_max_context_default_snapshot(account_key, model)
             rows.append([ui.btn("关闭 Max Context" if max_on else "开启 Max Context", f"oam:maxctx:{context}")])
     if fault:
         rows.append([ui.btn("🧹 清除此模型故障", f"oam:clear:{context}")])
@@ -595,15 +602,21 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if kind == "detail":
         ui.answer_cb(cb_id)
     elif kind == "toggle":
-        current = model in oauth_manager.account_disabled_models(account_key)
-        oauth_manager.set_account_model_disabled(account_key, model, not current)
+        current = model in oauth_control.account_disabled_models_snapshot(account_key)
+        oauth_control.set_account_model_disabled_raw(
+            _management_context(chat_id), account_key, model, not current,
+        )
         ui.answer_cb(cb_id, "模型已启用" if current else "模型已停用")
     elif kind == "clear":
-        cooldown.clear(f"oauth:{account_key}", model=model)
+        oauth_control.clear_model_error(
+            _management_context(chat_id), account_key, model,
+        )
         ui.answer_cb(cb_id, "模型故障已清除")
     elif kind == "maxctx":
-        current = oauth_manager.cursor_max_context_default(account_key, model)
-        oauth_manager.set_cursor_max_context_default(account_key, model, not current)
+        current = oauth_control.cursor_max_context_default_snapshot(account_key, model)
+        oauth_control.set_cursor_max_context_default_raw(
+            _management_context(chat_id), account_key, model, not current,
+        )
         ui.answer_cb(cb_id, "Max Context 已关闭" if current else "Max Context 已开启")
     else:
         return False

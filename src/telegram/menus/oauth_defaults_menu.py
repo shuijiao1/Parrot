@@ -38,9 +38,16 @@ import math
 import threading
 import time
 
-from ... import config
-from ...models_discovery import ModelsDiscoveryError, discover_models
-from ...oauth_ids import account_key as _account_key
+from ...management_control.oauth import OAuthFamily
+from ...management_control.oauth.menu_bridge import (
+    ModelsDiscoveryError,
+    account_key as _account_key,
+    config,
+    control as oauth_control,
+    discover_models,
+    oauth_manager,
+    telegram_context as _management_context,
+)
 from .. import states, ui
 
 
@@ -81,29 +88,18 @@ def _ingress_body_label(ingress: str) -> str:
 # ─── 读写底层 ────────────────────────────────────────────────────
 
 def _read_list(family: str) -> list[str]:
-    cfg = config.get()
-    if family == "anthropic":
-        raw = cfg.get("oauthDefaultModels") or []
-    elif family == "xai":
-        raw = (cfg.get("xaiOAuth") or {}).get("defaultModels") or []
-    elif family == "antigravity":
-        raw = (cfg.get("antigravityOAuth") or {}).get("defaultModels") or []
-    else:
-        raw = (cfg.get("openaiOAuth") or {}).get("defaultModels") or []
-    return [str(x) for x in raw if isinstance(x, str) and x.strip()]
+    return oauth_control.default_models_snapshot(OAuthFamily(family))
 
 
 def _write_list(family: str, models: list[str]) -> None:
-    def _mutate(cfg: dict) -> None:
-        if family == "anthropic":
-            cfg["oauthDefaultModels"] = list(models)
-        elif family == "xai":
-            cfg.setdefault("xaiOAuth", {})["defaultModels"] = list(models)
-        elif family == "antigravity":
-            cfg.setdefault("antigravityOAuth", {})["defaultModels"] = list(models)
-        else:
-            cfg.setdefault("openaiOAuth", {})["defaultModels"] = list(models)
-    config.update(_mutate)
+    old_models = oauth_control.default_models_snapshot(OAuthFamily(family))
+    oauth_control.replace_default_models_raw(
+        _management_context(0),
+        OAuthFamily(family),
+        models,
+        set(old_models) - set(models),
+        cleanup_references=False,
+    )
 
 
 def _parse_input(text: str) -> list[str]:
@@ -135,78 +131,9 @@ def _parse_input(text: str) -> list[str]:
 # ─── 引用扫描 ────────────────────────────────────────────────────
 
 def _scan_references(family: str, removed: set[str]) -> dict:
-    """扫描被删模型在配置中的引用。
-
-    只关心与 `family` 相关的入口:
-      anthropic → ingressDefaultModel["anthropic"] + modelMapping["anthropic"]
-      openai/xai/antigravity → ingressDefaultModel["openai-chat"/"openai-responses"]
-                + modelMapping["openai-chat"/"openai-responses"]
-    API Key 白名单本身无家族概念 — OpenAI/Grok/Cursor 家族模型可能和 Anthropic 模型
-    同名吗? 实践上不会(Claude vs GPT 名字不会碰撞), 但为求精确, 只在白名单里
-    按 "模型名是否在 removed 集合内" 做命中, 不分家族。
-
-    返回:
-      {
-        "apiKeys":  [{"name": "default-key", "hits": ["gpt-5.2-codex"]}, ...],
-        "mappings": [{"ingress": "openai-chat", "alias": "gpt-5.5",
-                      "real": "gpt-5.4"}, ...],
-        "defaults": [{"ingress": "openai-chat", "value": "gpt-5.4"}, ...],
-        "would_empty_keys": ["trial", ...]  # API Key 清理后会清空的名单
-      }
-    """
-    cfg = config.get()
-    # family -> 相关 ingress 集合
-    fam_ingress = {
-        "anthropic": {"anthropic"},
-        "openai":    {"openai-chat", "openai-responses"},
-        "xai":       {"openai-chat", "openai-responses"},
-        "antigravity": {"openai-chat", "openai-responses"},
-    }
-    ingresses = fam_ingress.get(family, set())
-
-    # 1) API Key 白名单
-    api_key_hits: list[dict] = []
-    would_empty: list[str] = []
-    keys = cfg.get("apiKeys") or {}
-    for name, entry in keys.items():
-        if not isinstance(entry, dict):
-            continue
-        allowed = entry.get("allowedModels") or []
-        if not isinstance(allowed, list) or not allowed:
-            continue
-        hits = sorted(m for m in allowed if m in removed)
-        if hits:
-            api_key_hits.append({"name": name, "hits": hits})
-            # 清理后是否会清空?
-            remaining = [m for m in allowed if m not in removed]
-            if not remaining:
-                would_empty.append(name)
-
-    # 2) modelMapping value 侧
-    mapping_hits: list[dict] = []
-    mm = cfg.get("modelMapping") or {}
-    for line in ingresses:
-        line_map = mm.get(line) or {}
-        for alias, real in sorted(line_map.items()):
-            if isinstance(real, str) and real in removed:
-                mapping_hits.append({
-                    "ingress": line, "alias": alias, "real": real,
-                })
-
-    # 3) ingressDefaultModel
-    default_hits: list[dict] = []
-    idm = cfg.get("ingressDefaultModel") or {}
-    for line in ingresses:
-        v = idm.get(line)
-        if isinstance(v, str) and v in removed:
-            default_hits.append({"ingress": line, "value": v})
-
-    return {
-        "apiKeys":  api_key_hits,
-        "mappings": mapping_hits,
-        "defaults": default_hits,
-        "would_empty_keys": would_empty,
-    }
+    return oauth_control.scan_default_model_references(
+        _management_context(0), OAuthFamily(family), removed,
+    )
 
 
 def _has_any_refs(refs: dict) -> bool:
@@ -222,90 +149,13 @@ def _commit_save(
     family: str, new_models: list[str], removed: set[str],
     *, cleanup: bool,
 ) -> dict:
-    """一次 config.update 里原子完成: 写新 OAuth 默认 (+ 可选清理引用)。
-
-    返回清理摘要(用于结果页展示):
-      {
-        "keys_cleaned": [{"name": "...", "removed": [...]}],
-        "keys_skipped_empty": ["..."],
-        "mappings_removed": [{"ingress": "...", "alias": "..."}],
-        "defaults_cleared": ["..."],
-      }
-    """
-    summary = {
-        "keys_cleaned": [],
-        "keys_skipped_empty": [],
-        "mappings_removed": [],
-        "defaults_cleared": [],
-    }
-
-    fam_ingress = {
-        "anthropic": {"anthropic"},
-        "openai":    {"openai-chat", "openai-responses"},
-        "xai":       {"openai-chat", "openai-responses"},
-        "antigravity": {"openai-chat", "openai-responses"},
-    }
-    ingresses = fam_ingress.get(family, set())
-
-    def _mutate(cfg: dict) -> None:
-        # a) 先写 OAuth 默认
-        if family == "anthropic":
-            cfg["oauthDefaultModels"] = list(new_models)
-        elif family == "xai":
-            cfg.setdefault("xaiOAuth", {})["defaultModels"] = list(new_models)
-        elif family == "antigravity":
-            cfg.setdefault("antigravityOAuth", {})["defaultModels"] = list(new_models)
-        else:
-            cfg.setdefault("openaiOAuth", {})["defaultModels"] = list(new_models)
-
-        if not cleanup or not removed:
-            return
-
-        # b) 清理 API Key 白名单 (避免清空 → 语义变成无限制)
-        keys = cfg.get("apiKeys") or {}
-        for name, entry in keys.items():
-            if not isinstance(entry, dict):
-                continue
-            allowed = entry.get("allowedModels") or []
-            if not isinstance(allowed, list) or not allowed:
-                continue
-            remaining = [m for m in allowed if m not in removed]
-            cleaned_out = [m for m in allowed if m in removed]
-            if not cleaned_out:
-                continue
-            if not remaining:
-                # 清空会使白名单语义变成"无限制", 跳过
-                summary["keys_skipped_empty"].append(name)
-                continue
-            entry["allowedModels"] = remaining
-            summary["keys_cleaned"].append({
-                "name": name, "removed": cleaned_out,
-            })
-
-        # c) 清理 modelMapping (value 侧命中就删整条)
-        mm = cfg.get("modelMapping") or {}
-        for line in ingresses:
-            line_map = mm.get(line)
-            if not isinstance(line_map, dict):
-                continue
-            for alias in list(line_map.keys()):
-                real = line_map.get(alias)
-                if isinstance(real, str) and real in removed:
-                    del line_map[alias]
-                    summary["mappings_removed"].append({
-                        "ingress": line, "alias": alias,
-                    })
-
-        # d) 清理 ingressDefaultModel
-        idm = cfg.get("ingressDefaultModel") or {}
-        for line in ingresses:
-            v = idm.get(line)
-            if isinstance(v, str) and v in removed:
-                del idm[line]
-                summary["defaults_cleared"].append(line)
-
-    config.update(_mutate)
-    return summary
+    return oauth_control.replace_default_models_raw(
+        _management_context(0),
+        OAuthFamily(family),
+        new_models,
+        removed,
+        cleanup_references=cleanup,
+    )
 
 
 # ─── Level 1 总览 ─────────────────────────────────────────────────
@@ -345,24 +195,14 @@ def abandon_edit(chat_id: int) -> None:
 
 
 def _cursor_account_count() -> int:
-    from ... import oauth_manager
     return sum(
-        1 for acc in (config.get().get("oauthAccounts") or [])
-        if isinstance(acc, dict) and oauth_manager.provider_of(acc) == "cursor"
+        1 for acc in oauth_control.account_entries_snapshot()
+        if isinstance(acc, dict) and oauth_control.provider_of_snapshot(acc) == "cursor"
     )
 
 
 def _static_models(family: str) -> list[str]:
-    defaults = config.DEFAULT_CONFIG
-    if family == "anthropic":
-        raw = defaults.get("oauthDefaultModels") or []
-    elif family == "xai":
-        raw = (defaults.get("xaiOAuth") or {}).get("defaultModels") or []
-    elif family == "antigravity":
-        raw = (defaults.get("antigravityOAuth") or {}).get("defaultModels") or []
-    else:
-        raw = (defaults.get("openaiOAuth") or {}).get("defaultModels") or []
-    return [str(x) for x in raw if str(x).strip()]
+    return oauth_control.static_default_models_snapshot(OAuthFamily(family))
 
 
 def _has_live_endpoint(family: str) -> bool:
@@ -370,18 +210,14 @@ def _has_live_endpoint(family: str) -> bool:
 
 
 def _xai_models_url() -> str:
-    raw = config.get().get("xaiOAuth")
-    cfg = raw if isinstance(raw, dict) else {}
-    base = str(cfg.get("apiBaseUrl") or cfg.get("baseUrl") or "https://api.x.ai/v1").rstrip("/")
-    return base if base.endswith("/models") else base + "/models"
+    return oauth_control.xai_models_url_snapshot()
 
 
 def _first_enabled_account_key(provider: str) -> str | None:
-    from ... import oauth_manager
-    for acc in config.get().get("oauthAccounts") or []:
+    for acc in oauth_control.account_entries_snapshot():
         if not isinstance(acc, dict):
             continue
-        if oauth_manager.provider_of(acc) != provider:
+        if oauth_control.provider_of_snapshot(acc) != provider:
             continue
         if acc.get("enabled", True) and not acc.get("disabled_reason"):
             try:
@@ -595,12 +431,15 @@ async def _discover_family_models(family: str):
             account_key = _first_enabled_account_key("xai")
             if not account_key:
                 raise ModelsDiscoveryError("没有可用的 Grok 账户用于拉取模型")
-            from ... import oauth_manager
             try:
-                token = await oauth_manager.ensure_valid_token(account_key)
+                token = await oauth_control.ensure_valid_token(account_key)
             except Exception:
                 raise ModelsDiscoveryError("无法获取 Grok 访问令牌") from None
-            ids = _filter_xai_text_models(await discover_models(_xai_models_url(), token))
+            ids = _filter_xai_text_models(
+                await oauth_control.discover_models(
+                    _xai_models_url(), token, discoverer=discover_models,
+                )
+            )
             if not ids:
                 raise ModelsDiscoveryError("上游未返回可用文本模型")
         elif static:
