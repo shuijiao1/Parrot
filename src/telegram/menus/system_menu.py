@@ -16,6 +16,13 @@ from datetime import datetime, timedelta, timezone
 
 from ... import apikey_limiter, concurrency, config, load_balancing, log_db, network, network_monitor, state_db
 from ...channel import registry
+from ...management_control.network import DEFAULT_NETWORK_CONTROL
+from ...management_control.observability.common import telegram_context
+from ...management_control.system import (
+    DEFAULT_CONTENT_BLACKLIST_CONTROL,
+    DEFAULT_SETTINGS_CONTROL,
+    DEFAULT_TELEGRAM_RETENTION_ADAPTER,
+)
 from .. import states, ui
 
 
@@ -25,6 +32,14 @@ _retention_pending_lock = threading.Lock()
 # code → {chat_id, kind, expires_at, ...}; callback 本身只带 8 位短码，实际计划
 # 永远留在服务端，不接受客户端传来的路径、月份或删除范围。
 _retention_pending: dict[str, dict] = {}
+_settings_control = DEFAULT_SETTINGS_CONTROL
+_blacklist_control = DEFAULT_CONTENT_BLACKLIST_CONTROL
+_network_control = DEFAULT_NETWORK_CONTROL
+_retention_control = DEFAULT_TELEGRAM_RETENTION_ADAPTER
+
+
+def _control_context(chat_id: int):
+    return telegram_context(f"system:{chat_id}")
 
 
 def _merge_proxy_stats_for_system(names, stats_map: dict[str, dict]) -> dict:
@@ -301,8 +316,8 @@ def _show_retry(chat_id: int, message_id: int, cb_id: str) -> None:
 def _toggle_retry_transient(chat_id: int, message_id: int, cb_id: str) -> None:
     transient, _ = _retry_sections()
     new_value = not bool(transient.get("enabled", True))
-    config.update(
-        lambda c: c.setdefault("retry", {}).setdefault("transient", {}).__setitem__("enabled", new_value)
+    _settings_control.update_retry(
+        _control_context(chat_id), {"transient": {"enabled": new_value}},
     )
     ui.answer_cb(cb_id, "瞬时加试已开启" if new_value else "瞬时加试已关闭")
     _show_retry(chat_id, message_id, "-")
@@ -325,14 +340,11 @@ def _toggle_retry_item(chat_id: int, message_id: int, cb_id: str, *, group: str,
     )
     new_value = not current
 
-    def _mutate(c):
-        retry = c.setdefault("retry", {})
-        if group == "errors":
-            retry.setdefault("transient", {}).setdefault("errors", {})[key] = new_value
-        else:
-            retry.setdefault("recovery", {})[key] = new_value
-
-    config.update(_mutate)
+    patch = (
+        {"transient": {"errors": {key: new_value}}}
+        if group == "errors" else {"recovery": {key: new_value}}
+    )
+    _settings_control.update_retry(_control_context(chat_id), patch)
     ui.answer_cb(cb_id, "已开启" if new_value else "已关闭")
     _show_retry(chat_id, message_id, "-")
 
@@ -363,8 +375,8 @@ def _on_retry_attempts_input(chat_id: int, text: str) -> None:
     if value < 1 or value > 5:
         ui.send(chat_id, "❌ 额外机会需在 1–5 之间，请重新输入：")
         return
-    config.update(
-        lambda c: c.setdefault("retry", {}).setdefault("transient", {}).__setitem__("maxExtraAttempts", value)
+    _settings_control.update_retry(
+        _control_context(chat_id), {"transient": {"maxExtraAttempts": value}},
     )
     states.pop_state(chat_id)
     ui.send_result(
@@ -408,8 +420,8 @@ def _on_retry_backoff_input(chat_id: int, text: str) -> None:
     except (TypeError, ValueError):
         ui.send(chat_id, "❌ 每项必须是 0–60 之间的数字，请重新输入：")
         return
-    config.update(
-        lambda c: c.setdefault("retry", {}).setdefault("transient", {}).__setitem__("backoffSeconds", values)
+    _settings_control.update_retry(
+        _control_context(chat_id), {"transient": {"backoffSeconds": values}},
     )
     states.pop_state(chat_id)
     formatted = ",".join(_fmt_retry_delay(v) for v in values)
@@ -549,7 +561,7 @@ def _show_retention(chat_id: int, message_id: int, cb_id: str) -> None:
 def _toggle_log_store_bodies(chat_id: int, message_id: int, cb_id: str) -> None:
     current = config.get().get("logStoreBodies", True) is not False
     new_value = not current
-    config.update(lambda cfg: cfg.__setitem__("logStoreBodies", new_value))
+    _retention_control.set_log_store_bodies(_control_context(chat_id), new_value)
     ui.answer_cb(
         cb_id,
         "已开启完整请求保存" if new_value else "已关闭完整请求保存",
@@ -605,7 +617,7 @@ def _on_retention_days_input(chat_id: int, text: str) -> None:
             return
         if days > old_days:
             # 延长保留期不会扩大删除范围，因此直接保存，不走删除预览。
-            result = log_db.extend_retention_days(days)
+            result = _retention_control.extend_days(_control_context(chat_id), days)
             if result.get("ok"):
                 ui.send(
                     chat_id,
@@ -732,7 +744,9 @@ def _scan_retention(chat_id: int, message_id: int, cb_id: str, code: str) -> Non
     ui.answer_cb(cb_id, "正在扫描…")
     ui.edit(chat_id, message_id, "🔎 <b>正在扫描所有月度请求日志…</b>\n\n不会读取或展示请求正文。")
     try:
-        plan = log_db.plan_retention(int(entry["days"]))
+        plan, control_plan_id, control_revision = _retention_control.create_plan(
+            _control_context(chat_id), int(entry["days"]),
+        )
     except Exception as exc:
         ui.edit(chat_id, message_id, f"❌ 扫描失败：<code>{ui.escape_html(str(exc))}</code>",
                 reply_markup=ui.inline_kb([[ui.btn("◀ 返回数据留存", "sys:show:retention")]]))
@@ -742,7 +756,10 @@ def _scan_retention(chat_id: int, message_id: int, cb_id: str, code: str) -> Non
         ui.edit(chat_id, message_id, "❌ <b>扫描未完成，已拒绝生成删除计划</b>\n\n" + details,
                 reply_markup=ui.inline_kb([[ui.btn("◀ 返回数据留存", "sys:show:retention")]]))
         return
-    plan_code = _register_retention_pending(chat_id, "plan", plan=plan)
+    plan_code = _register_retention_pending(
+        chat_id, "plan", plan=plan,
+        control_plan_id=control_plan_id, control_revision=control_revision,
+    )
     _render_retention_plan(chat_id, message_id, plan_code, 0)
 
 
@@ -787,7 +804,10 @@ def _commit_retention(chat_id: int, message_id: int, cb_id: str, code: str) -> N
     def _progress(event: dict) -> None:
         ui.edit(chat_id, message_id, _retention_progress_text(days, event), reply_markup=busy_kb)
 
-    result = log_db.apply_retention_plan(plan, activate_policy=True, progress=_progress)
+    result = _retention_control.commit_plan(
+        _control_context(chat_id), entry.get("control_plan_id"),
+        entry.get("control_revision"), progress=_progress,
+    )
     if result.get("ok"):
         text = (
             "✅ <b>数据留存策略已生效</b>\n\n"
@@ -820,7 +840,7 @@ def _commit_retention(chat_id: int, message_id: int, cb_id: str, code: str) -> N
 
 def _set_retention_forever(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    result = log_db.set_retention_forever()
+    result = _retention_control.set_forever(_control_context(chat_id))
     if not result.get("ok"):
         ui.edit(chat_id, message_id, f"⚠️ {ui.escape_html(str(result.get('reason') or '切换失败'))}",
                 reply_markup=ui.inline_kb([[ui.btn("◀ 返回数据留存", "sys:show:retention")]]))
@@ -832,7 +852,11 @@ def _set_retention_forever(chat_id: int, message_id: int, cb_id: str) -> None:
 def _cancel_retention(chat_id: int, message_id: int, cb_id: str, code: str | None = None) -> None:
     states.pop_state(chat_id)
     if code:
-        _pop_retention_pending(code, chat_id)
+        entry = _pop_retention_pending(code, chat_id)
+        if entry and entry.get("control_plan_id"):
+            _retention_control.cancel_plan(
+                _control_context(chat_id), entry["control_plan_id"],
+            )
     ui.answer_cb(cb_id, "已取消")
     text, kb = _retention_menu_text_kb()
     ui.edit(chat_id, message_id, text, reply_markup=kb)
@@ -882,11 +906,10 @@ def _on_timeouts_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, "❌ 所有值必须为正整数，请重新输入：")
         return
 
-    def _m(cfg):
-        cfg.setdefault("timeouts", {}).update({
-            "connect": c, "firstByte": fb, "idle": idle, "total": total,
-        })
-    config.update(_m)
+    _settings_control.update_timeouts(
+        _control_context(chat_id),
+        {"connect": c, "firstByte": fb, "idle": idle, "total": total},
+    )
     states.pop_state(chat_id)
     ui.send_result(
         chat_id,
@@ -947,7 +970,9 @@ def _on_ladder_interval_input(chat_id: int, text: str) -> None:
     if v < 0 or v > 3600:
         ui.send(chat_id, "❌ 范围 0-3600，请重新输入：")
         return
-    config.update(lambda c: c.__setitem__("cooldownLadderMinIntervalSeconds", v))
+    _settings_control.update_error_cooldown(
+        _control_context(chat_id), {"ladderMinIntervalSeconds": v},
+    )
     states.pop_state(chat_id)
     ui.send_result(
         chat_id, f"✅ 阶梯推进最小间隔已更新为 <code>{v}s</code>",
@@ -977,7 +1002,9 @@ def _on_perm_min_age_input(chat_id: int, text: str) -> None:
     if v < 0 or v > 86400:
         ui.send(chat_id, "❌ 范围 0-86400，请重新输入：")
         return
-    config.update(lambda c: c.__setitem__("cooldownPermanentMinAgeSeconds", v))
+    _settings_control.update_error_cooldown(
+        _control_context(chat_id), {"permanentMinAgeSeconds": v},
+    )
     states.pop_state(chat_id)
     ui.send_result(
         chat_id, f"✅ 永久冷却最小累计已更新为 <code>{v}s</code>",
@@ -1017,7 +1044,9 @@ def _on_oauth_grace_input(chat_id: int, text: str) -> None:
     if v < 0 or v > 100:
         ui.send(chat_id, "❌ 范围 0-100，请重新输入：")
         return
-    config.update(lambda c: c.__setitem__("oauthGraceCount", v))
+    _settings_control.update_error_cooldown(
+        _control_context(chat_id), {"oauthGraceCount": v},
+    )
     states.pop_state(chat_id)
     ui.send_result(
         chat_id, f"✅ OAuth 宽容次数已更新为 <code>{v}</code>",
@@ -1038,7 +1067,9 @@ def _on_errwin_input(chat_id: int, text: str) -> None:
     if any(n < 0 for n in nums):
         ui.send(chat_id, "❌ 数字不能为负，请重新输入：")
         return
-    config.update(lambda c: c.__setitem__("errorWindows", nums))
+    _settings_control.update_error_cooldown(
+        _control_context(chat_id), {"errorWindows": nums},
+    )
     states.pop_state(chat_id)
     ui.send_result(
         chat_id,
@@ -1099,7 +1130,7 @@ def _on_scoring_input(chat_id: int, action: str, text: str) -> None:
     if v < rng[0] or v > rng[1]:
         ui.send(chat_id, f"❌ 超出范围 [{rng[0]}, {rng[1]}]，请重新输入：")
         return
-    config.update(lambda c: c.setdefault("scoring", {}).__setitem__(field, v))
+    _settings_control.update_scoring(_control_context(chat_id), {field: v})
     states.pop_state(chat_id)
     ui.send_result(
         chat_id,
@@ -1153,7 +1184,7 @@ def _on_affinity_input(chat_id: int, action: str, text: str) -> None:
     if v < rng[0] or v > rng[1]:
         ui.send(chat_id, f"❌ 超出范围 [{rng[0]}, {rng[1]}]，请重新输入：")
         return
-    config.update(lambda c: c.setdefault("affinity", {}).__setitem__(field, v))
+    _settings_control.update_affinity(_control_context(chat_id), {field: v})
     states.pop_state(chat_id)
     ui.send_result(
         chat_id,
@@ -1191,7 +1222,7 @@ def _on_cch_set(chat_id: int, message_id: int, cb_id: str, mode: str) -> None:
     if mode not in _CCH_MODES:
         ui.answer_cb(cb_id, "无效模式")
         return
-    config.update(lambda c: c.__setitem__("cchMode", mode))
+    _settings_control.update_cch(_control_context(chat_id), {"mode": mode})
     ui.answer_cb(cb_id, f"已切换到 {mode}")
     _show_cch(chat_id, message_id, "-")
 
@@ -1264,7 +1295,9 @@ def _show_quota(chat_id: int, message_id: int, cb_id: str) -> None:
 def _on_quota_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
     cur = bool((config.get().get("quotaMonitor") or {}).get("enabled", False))
     new_val = not cur
-    config.update(lambda c: c.setdefault("quotaMonitor", {}).__setitem__("enabled", new_val))
+    _settings_control.update_quota_monitor(
+        _control_context(chat_id), {"enabled": new_val},
+    )
     ui.answer_cb(cb_id, "已启用" if new_val else "已停用")
     _show_quota(chat_id, message_id, "-")
 
@@ -1291,7 +1324,9 @@ def _on_quota_interval_input(chat_id: int, text: str) -> None:
     if v > 86400:
         ui.send(chat_id, "❌ 间隔不能超过 86400 秒（1 天），请重新输入：")
         return
-    config.update(lambda c: c.setdefault("quotaMonitor", {}).__setitem__("intervalSeconds", v))
+    _settings_control.update_quota_monitor(
+        _control_context(chat_id), {"intervalSeconds": v},
+    )
     states.pop_state(chat_id)
     ui.send_result(
         chat_id, f"✅ 配额监控间隔已更新为 <code>{v}s</code>",
@@ -1320,12 +1355,10 @@ def _on_quota_threshold_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, "❌ 阈值需在 1-100 之间，请重新输入：")
         return
 
-    def _m(c):
-        qm = c.setdefault("quotaMonitor", {})
-        qm["disableThresholdPercent"] = v
-        # resumeThreshold 未单独 UI 暴露，跟禁用阈值保持一致
-        qm["resumeThresholdPercent"] = v
-    config.update(_m)
+    # resumeThreshold 未单独 UI 暴露；共享 control 保持两个权威键一致。
+    _settings_control.update_quota_monitor(
+        _control_context(chat_id), {"thresholdPercent": v},
+    )
     states.pop_state(chat_id)
     ui.send_result(
         chat_id, f"✅ 配额禁用阈值已更新为 <code>{v:.0f}%</code>",
@@ -1383,7 +1416,9 @@ def _show_notif(chat_id: int, message_id: int, cb_id: str) -> None:
 def _on_notif_toggle_main(chat_id: int, message_id: int, cb_id: str) -> None:
     cur = bool((config.get().get("notifications") or {}).get("enabled", True))
     new_val = not cur
-    config.update(lambda c: c.setdefault("notifications", {}).__setitem__("enabled", new_val))
+    _settings_control.update_notifications(
+        _control_context(chat_id), {"enabled": new_val},
+    )
     ui.answer_cb(cb_id, "已开启" if new_val else "已关闭")
     _show_notif(chat_id, message_id, "-")
 
@@ -1398,11 +1433,16 @@ def _on_notif_toggle_event(chat_id: int, message_id: int, cb_id: str, event_key:
     cur = bool(events.get(event_key, True))
     new_val = not cur
 
-    def _m(c):
-        n = c.setdefault("notifications", {})
-        ev = n.setdefault("events", {})
-        ev[event_key] = new_val
-    config.update(_m)
+    public_key = {
+        "channel_permanent": "channelPermanent", "channel_recovered": "channelRecovered",
+        "quota_disabled": "quotaDisabled", "quota_resumed": "quotaResumed",
+        "quota_cooldown": "quotaCooldown", "oauth_refreshed": "oauthRefreshed",
+        "oauth_refresh_failed": "oauthRefreshFailed", "no_channels": "noChannels",
+        "openai_store_save_failed": "openaiStoreSaveFailed", "network_monitor": "networkMonitor",
+    }[event_key]
+    _settings_control.update_notifications(
+        _control_context(chat_id), {"events": {public_key: new_val}},
+    )
     ui.answer_cb(cb_id, "已开" if new_val else "已关")
     _show_notif(chat_id, message_id, "-")
 
@@ -1460,12 +1500,7 @@ def _on_bl_add_default_input(chat_id: int, text: str) -> None:
     if len(kw) > 200:
         ui.send(chat_id, "❌ 关键词过长（上限 200），请重新输入：")
         return
-    def _m(c):
-        bl = c.setdefault("contentBlacklist", {})
-        arr = bl.setdefault("default", [])
-        if kw not in arr:
-            arr.append(kw)
-    config.update(_m)
+    _blacklist_control.add_default(_control_context(chat_id), kw)
     states.pop_state(chat_id)
     ui.send_result(
         chat_id,
@@ -1495,11 +1530,7 @@ def _bl_del_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
         ui.answer_cb(cb_id, "短码已失效")
         return
     kw = full[5:]
-    def _m(c):
-        arr = (c.setdefault("contentBlacklist", {})).setdefault("default", [])
-        if kw in arr:
-            arr.remove(kw)
-    config.update(_m)
+    _blacklist_control.delete_default(_control_context(chat_id), kw)
     ui.answer_cb(cb_id, "已删除")
     _show_blacklist(chat_id, message_id, "-")
 
@@ -1526,13 +1557,9 @@ def _on_bl_add_ch_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, "❌ 渠道名或关键词为空，请重新输入：")
         return
 
-    def _m(c):
-        bl = c.setdefault("contentBlacklist", {})
-        by_ch = bl.setdefault("byChannel", {})
-        arr = by_ch.setdefault(ch_name, [])
-        if kw not in arr:
-            arr.append(kw)
-    config.update(_m)
+    _blacklist_control.add_telegram_channel(
+        _control_context(chat_id), ch_name, kw,
+    )
     states.pop_state(chat_id)
     ui.send_result(
         chat_id,
@@ -1698,7 +1725,7 @@ def _show_dns_cache(chat_id: int, message_id: int, cb_id: str) -> None:
 
 def _clear_dns_cache(chat_id: int, message_id: int, cb_id: str) -> None:
     try:
-        network.clear_dns_cache()
+        _network_control.telegram_clear_dns_cache(_control_context(chat_id))
     except Exception as exc:
         ui.answer_cb(cb_id, "清除失败", show_alert=True)
         ui.send(chat_id, f"❌ 清除 DNS 缓存失败：<code>{ui.escape_html(exc)}</code>")
@@ -1730,7 +1757,7 @@ def _edit_dns(chat_id: int, message_id: int, cb_id: str) -> None:
 
 def _on_dns_input(chat_id: int, text: str) -> None:
     try:
-        servers = network.parse_dns_input(text)
+        servers = _network_control.telegram_parse_dns(text)
     except ValueError as exc:
         ui.send(chat_id, f"❌ {ui.escape_html(exc)}，请重新输入：")
         return
@@ -1738,7 +1765,7 @@ def _on_dns_input(chat_id: int, text: str) -> None:
     progress = ui.send(chat_id, "正在检测 DNS 网络访问情况：\n\n请稍候...")
     msg_id = ((progress or {}).get("result") or {}).get("message_id")
     try:
-        test = network.test_dns_servers(servers)
+        test = _network_control.telegram_test_dns(_control_context(chat_id), servers)
     except Exception as exc:
         ui.send(chat_id, f"❌ DNS 检测异常：<code>{ui.escape_html(exc)}</code>")
         return
@@ -1773,7 +1800,9 @@ def _save_dns_confirm(chat_id: int, message_id: int, cb_id: str, *, force: bool)
         ui.answer_cb(cb_id, "检测未通过，请用强制保存或取消", show_alert=True)
         return
     try:
-        network.save_dns_servers(list(servers))
+        _network_control.telegram_save_dns(
+            _control_context(chat_id), list(servers), test, force=force,
+        )
     except Exception as exc:
         ui.answer_cb(cb_id, "保存失败", show_alert=True)
         ui.send(chat_id, f"❌ DNS 保存失败：<code>{ui.escape_html(exc)}</code>")
@@ -1793,7 +1822,7 @@ def _save_dns_confirm(chat_id: int, message_id: int, cb_id: str, *, force: bool)
 
 def _sync_dns(chat_id: int, message_id: int, cb_id: str) -> None:
     try:
-        servers = network.sync_system_dns_now()
+        servers = _network_control.telegram_sync_dns(_control_context(chat_id))
     except Exception as exc:
         ui.answer_cb(cb_id, "同步失败", show_alert=True)
         ui.send(chat_id, f"❌ 同步系统 DNS 失败：<code>{ui.escape_html(exc)}</code>")
@@ -1829,14 +1858,16 @@ def _edit_socks5(chat_id: int, message_id: int, cb_id: str) -> None:
 
 def _on_socks5_input(chat_id: int, text: str) -> None:
     try:
-        norm = network.normalize_socks5_url(text)
+        norm = _network_control.telegram_normalize_socks5(text)
     except ValueError as exc:
         ui.send(chat_id, f"❌ {ui.escape_html(exc)}，请重新输入：")
         return
     progress = ui.send(chat_id, "正在检测 SOCKS5 网络访问情况：\n\n请稍候...")
     msg_id = ((progress or {}).get("result") or {}).get("message_id")
     try:
-        test = asyncio.run(network.test_socks5(norm.url))
+        test = asyncio.run(
+            _network_control.telegram_test_socks5(_control_context(chat_id), norm.url)
+        )
     except Exception as exc:
         ui.send(chat_id, f"❌ SOCKS5 检测异常：<code>{ui.escape_html(exc)}</code>")
         return
@@ -1868,7 +1899,9 @@ def _save_socks5_confirm(chat_id: int, message_id: int, cb_id: str, *, force: bo
         ui.answer_cb(cb_id, "检测未通过，请用强制保存或取消", show_alert=True)
         return
     try:
-        saved = network.save_socks5(url, enabled=True)
+        saved = _network_control.telegram_save_socks5(
+            _control_context(chat_id), url, test, force=force,
+        )
     except Exception as exc:
         ui.answer_cb(cb_id, "保存失败", show_alert=True)
         ui.send(chat_id, f"❌ SOCKS5 保存失败：<code>{ui.escape_html(exc)}</code>")
@@ -1894,7 +1927,9 @@ def _toggle_socks5(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.answer_cb(cb_id, "请先设置 SOCKS5 地址", show_alert=True)
         _edit_socks5(chat_id, message_id, "-")
         return
-    network.set_socks5_enabled(not enabled)
+    _network_control.telegram_set_socks5_enabled(
+        _control_context(chat_id), not enabled,
+    )
     ui.answer_cb(cb_id, "已启用" if not enabled else "已关闭")
     _show_network(chat_id, message_id, "-")
 
@@ -1983,10 +2018,14 @@ def _mon_toggle(chat_id: int, message_id: int, cb_id: str, key: str) -> None:
     c = _mon_cfg()
     if key == "enabled":
         cur = bool(c.get("enabled", True))
-        network_monitor.update_settings(lambda m: m.__setitem__("enabled", not cur))
+        _network_control.telegram_update_monitor(
+            _control_context(chat_id), lambda m: m.__setitem__("enabled", not cur),
+        )
     elif key in ("dns", "socks5"):
         cur = bool(c.get(key, False))
-        network_monitor.update_settings(lambda m: m.__setitem__(key, not cur))
+        _network_control.telegram_update_monitor(
+            _control_context(chat_id), lambda m: m.__setitem__(key, not cur),
+        )
     else:
         ui.answer_cb(cb_id, "未知开关")
         return
@@ -2014,7 +2053,9 @@ def _on_monitor_interval_input(chat_id: int, text: str) -> None:
     if v < 5:
         ui.send(chat_id, "❌ 检测间隔至少 5 秒，请重新输入：")
         return
-    network_monitor.update_settings(lambda m: m.__setitem__("intervalSeconds", v))
+    _network_control.telegram_update_monitor(
+        _control_context(chat_id), lambda m: m.__setitem__("intervalSeconds", v),
+    )
     states.pop_state(chat_id)
     ui.send_result(chat_id, f"✅ 网络检测间隔已更新为 <code>{v}s</code>", back_label="◀ 返回网络检测", back_callback="sys:mon:show")
 
@@ -2049,7 +2090,7 @@ def _mon_core_toggle(chat_id: int, message_id: int, cb_id: str, key: str) -> Non
     cur = bool((_mon_cfg().get("core") or {}).get(key))
     def _m(mon: dict) -> None:
         mon.setdefault("core", {})[key] = not cur
-    network_monitor.update_settings(_m)
+    _network_control.telegram_update_monitor(_control_context(chat_id), _m)
     ui.answer_cb(cb_id, "已切换")
     _show_monitor_core(chat_id, message_id, "-")
 
@@ -2105,7 +2146,7 @@ def _mon_channels_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
     cur = bool((_mon_cfg().get("channels") or {}).get("enabled", False))
     def _m(mon: dict) -> None:
         mon.setdefault("channels", {"enabled": False, "byKey": {}})["enabled"] = not cur
-    network_monitor.update_settings(_m)
+    _network_control.telegram_update_monitor(_control_context(chat_id), _m)
     ui.answer_cb(cb_id, "已切换")
     _show_monitor_channels(chat_id, message_id, "-")
 
@@ -2117,7 +2158,9 @@ def _mon_channel_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -
         return
     key = full[len("monch:"):]
     cur = network_monitor.channel_enabled(key)
-    network_monitor.set_channel_enabled(key, not cur)
+    _network_control.telegram_set_monitor_channel(
+        _control_context(chat_id), key, not cur,
+    )
     ui.answer_cb(cb_id, "已切换")
     _show_monitor_channels(chat_id, message_id, "-")
 
@@ -2126,7 +2169,9 @@ def _run_monitor_now(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id, "开始检测")
     ui.edit(chat_id, message_id, "🩺 正在执行网络检测，请稍候...")
     try:
-        results = asyncio.run(network_monitor.run_once(save=True))
+        results = asyncio.run(
+            _network_control.telegram_run_monitor(_control_context(chat_id))
+        )
     except Exception as exc:
         ui.edit(chat_id, message_id, f"❌ 网络检测异常：<code>{ui.escape_html(exc)}</code>", reply_markup=ui.inline_kb([[ui.btn("◀ 返回网络检测", "sys:mon:show")]]))
         return
@@ -2392,9 +2437,9 @@ def _on_cc_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
     cfg = config.get()
     cur = bool((cfg.get("concurrency") or {}).get("enabled", True))
     new_val = not cur
-    def _mut(c):
-        c.setdefault("concurrency", {})["enabled"] = new_val
-    config.update(_mut)
+    _settings_control.update_concurrency(
+        _control_context(chat_id), {"enabled": new_val},
+    )
     _show_concurrency(chat_id, message_id, "")
 
 
@@ -2417,9 +2462,9 @@ def _on_cc_queue_wait_input(chat_id: int, text: str) -> None:
     except ValueError:
         ui.send(chat_id, "❌ 需要非负整数，请重新输入：")
         return
-    def _mut(c):
-        c.setdefault("concurrency", {})["queueWaitSeconds"] = v
-    config.update(_mut)
+    _settings_control.update_concurrency(
+        _control_context(chat_id), {"queueWaitSeconds": v},
+    )
     states.pop_state(chat_id)
     ui.send(chat_id, f"✅ 队列等待已更新为 <code>{v}s</code>")
     send_new(chat_id)
@@ -2445,9 +2490,9 @@ def _on_cc_default_max_input(chat_id: int, text: str) -> None:
     except ValueError:
         ui.send(chat_id, "❌ 需要非负整数，请重新输入：")
         return
-    def _mut(c):
-        c.setdefault("concurrency", {})["defaultMaxConcurrent"] = v
-    config.update(_mut)
+    _settings_control.update_concurrency(
+        _control_context(chat_id), {"defaultMaxConcurrent": v},
+    )
     states.pop_state(chat_id)
     label = "不限" if v == 0 else str(v)
     ui.send(chat_id, f"✅ 默认最大并发数已更新为 <code>{label}</code>")
@@ -2533,9 +2578,9 @@ def _show_aklim(chat_id: int, message_id: int, cb_id: str) -> None:
 def _on_aklim_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
     cfg = config.get()
     cur = bool((cfg.get("apiKeyConcurrency") or {}).get("enabled", True))
-    def _mut(c):
-        c.setdefault("apiKeyConcurrency", {})["enabled"] = not cur
-    config.update(_mut)
+    _settings_control.update_api_key_concurrency(
+        _control_context(chat_id), {"enabled": not cur},
+    )
     ui.answer_cb(cb_id, "已切换")
     _show_aklim(chat_id, message_id, "")
 
@@ -2567,9 +2612,9 @@ def _on_aklim_input(chat_id: int, action: str, text: str) -> None:
     key_map = {"max": "defaultMaxConcurrent", "queue": "defaultMaxQueue", "wait": "defaultQueueWaitSeconds"}
     if field not in key_map:
         states.pop_state(chat_id); return
-    def _mut(c):
-        c.setdefault("apiKeyConcurrency", {})[key_map[field]] = value
-    config.update(_mut)
+    _settings_control.update_api_key_concurrency(
+        _control_context(chat_id), {key_map[field]: value},
+    )
     states.pop_state(chat_id)
     label = _fmt_aklim_duration(value) if field == "wait" else ("不限" if field == "max" and value == 0 else str(value))
     ui.send(chat_id, f"✅ API Key 默认限流已更新为 <code>{ui.escape_html(label)}</code>")
@@ -2606,11 +2651,9 @@ def _show_ws_mode(chat_id: int, message_id: int, cb_id: str) -> None:
 def _on_ws_mode_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
     cur = _ws_mode_enabled()
     new_enabled = not cur
-    def _mut(c):
-        openai_cfg = c.setdefault("openai", {})
-        openai_cfg["responsesUpstreamWsForOAuth"] = new_enabled
-        openai_cfg.pop("responsesUpstreamTransport", None)
-        openai_cfg.pop("responsesUpstreamWs", None)
-    config.update(_mut)
+    _settings_control.update_websocket(
+        _control_context(chat_id),
+        {"responsesUpstreamWsForOAuth": new_enabled},
+    )
     ui.answer_cb(cb_id, "已切换")
     _show_ws_mode(chat_id, message_id, "")
