@@ -239,3 +239,36 @@ def test_media_error_text_is_sanitized_without_changing_business_text(tmp_path):
 
     assert marker not in result.items[0]["error"]
     assert "ordinary provider failure" in result.items[0]["error"]
+
+
+def test_media_detail_direct_and_http_sanitize_raw_text_fields(tmp_path):
+    marker = "P4_MEDIA_DETAIL_MARKER"
+    artifact = tmp_path / f"api_token={marker}; ordinary-image.png"
+    artifact.write_bytes(b"png")
+    row = _row(1, "success", "generate", 100, artifact)
+    row.update({
+        "account_key": f"ordinary account id; session_secret={marker}",
+        "account_email": f"ordinary account label; credential={marker}",
+        "upstream_request_id": f"ordinary upstream request; exchangeSecret={marker}",
+        "upstream_status": f"ordinary upstream status; challenge_secret={marker}",
+        "prompt_preview": (
+            f"ordinary prompt; api_token={marker}; managementKey={marker}"
+        ),
+    })
+    control = MediaControl(media_db=FakeMediaDb([row]), config=FakeConfig())
+
+    direct = control.detail(context(), "1")
+    client, _, controls, auth = build_client(tmp_path)
+    controls.media = control
+    response = client.get("/api/management/v1/media-logs/1", headers=auth)
+    assert response.status_code == 200, response.text
+
+    for detail in (direct, response.json()["data"]):
+        assert marker not in json.dumps(detail, default=str)
+        assert "ordinary account id" in detail["accountId"]
+        assert "ordinary account label" in detail["accountLabel"]
+        assert "ordinary upstream request" in detail["upstreamRequestId"]
+        assert "ordinary upstream status" in detail["upstreamStatus"]
+        assert "ordinary prompt" in detail["promptPreview"]
+        assert detail["artifactCount"] == 1
+        assert detail["paths"] == ["api_token=<redacted>; ordinary-image.png"]

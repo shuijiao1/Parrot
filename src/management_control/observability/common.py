@@ -134,15 +134,37 @@ def page_slice(items: Iterable[T], *, page: int, page_size: int) -> PageResult[T
 
 _SECRET_KEYS = {
     "authorization", "proxy-authorization", "x-api-key", "api-key", "apikey",
-    "api_key", "access_token", "refreshtoken", "refresh_token", "id_token",
-    "managementkey", "management_key", "session", "session_token", "password",
-    "client_secret", "bot_token", "bottoken", "github_token", "githubtoken",
-    "cookie", "set-cookie",
+    "api_key", "api_token", "access_token", "refreshtoken", "refresh_token",
+    "id_token", "credential", "managementkey", "management_key", "session",
+    "session_token", "session_secret", "password", "client_secret",
+    "exchange_secret", "challenge_secret", "bot_token", "bottoken",
+    "github_token", "githubtoken", "cookie", "set-cookie",
 }
 _SECRET_KEYS_COMPACT = {
     key.lower().replace(" ", "").replace("-", "").replace("_", "")
     for key in _SECRET_KEYS
 }
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"\b(?P<key>proxy[\s_-]?authorization|authorization|x[\s_-]?api[\s_-]?key|"
+    r"api[\s_-]?(?:key|token)|management[\s_-]?key|bot[\s_-]?token|"
+    r"github[\s_-]?token|access[\s_-]?token|refresh[\s_-]?token|id[\s_-]?token|"
+    r"session[\s_-]?(?:token|secret)|password|client[\s_-]?secret|"
+    r"exchange[\s_-]?secret|challenge[\s_-]?secret|credential|"
+    r"set[\s_-]?cookie|cookie)"
+    r"(?P<key_quote>[\"']?)(?P<separator>\s*[:=]\s*)"
+    r"(?:bearer\s+|basic\s+)?"
+    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;&}\]\"']+)",
+    re.IGNORECASE,
+)
+
+
+def _redact_secret_assignment(match: re.Match[str]) -> str:
+    raw_value = match.group("value")
+    quote = raw_value[0] if len(raw_value) >= 2 and raw_value[0] == raw_value[-1] and raw_value[0] in "\"'" else ""
+    return (
+        match.group("key") + match.group("key_quote") + match.group("separator")
+        + quote + "<redacted>" + quote
+    )
 
 
 def _camel_key(value: str) -> str:
@@ -178,18 +200,18 @@ def sanitize_credentials(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(sanitize_credentials(item) for item in value)
     if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            clean = sanitize_credentials(parsed)
+            if clean != parsed:
+                return json.dumps(clean, ensure_ascii=False, separators=(",", ":"))
         lowered = value.lower().strip()
         if lowered.startswith("bearer ") or lowered.startswith("basic "):
             return value.split(" ", 1)[0] + " <redacted>"
-        value = re.sub(
-            r"(?i)\b(proxy[\s_-]?authorization|authorization|x[\s_-]?api[\s_-]?key|"
-            r"api[\s_-]?key|management[\s_-]?key|bot[\s_-]?token|github[\s_-]?token|"
-            r"access[\s_-]?token|refresh[\s_-]?token|id[\s_-]?token|session[\s_-]?token|"
-            r"password|client[\s_-]?secret|set[\s_-]?cookie|cookie)"
-            r"(\s*[:=]\s*)(?:bearer\s+|basic\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
-            lambda match: match.group(1) + match.group(2) + "<redacted>",
-            value,
-        )
+        value = _SECRET_ASSIGNMENT_RE.sub(_redact_secret_assignment, value)
         value = re.sub(
             r"(?i)([a-z][a-z0-9+.-]*://[^:/@\s]+:)[^@/\s]+(@)",
             r"\1<redacted>\2",

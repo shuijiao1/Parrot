@@ -233,16 +233,18 @@ class MediaControl:
         row = self.media_db.get_log(numeric_id)
         if not row:
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
-        result = self._record(row)
+        clean = sanitize_credentials(dict(row))
+        paths = self._paths(row)
+        result = self._record(clean)
         result.update({
-            "accountId": str(row.get("account_key") or "") or None,
-            "accountLabel": str(row.get("account_email") or "") or None,
-            "upstreamRequestId": str(row.get("upstream_request_id") or "") or None,
-            "upstreamStatus": str(row.get("upstream_status") or "") or None,
-            "httpStatus": int(row.get("http_status") or 0) or None,
-            "promptPreview": str(row.get("prompt_preview") or "") or None,
-            "artifactCount": len(self._paths(row)),
-            "paths": [os.path.basename(path) for path in self._paths(row)],
+            "accountId": str(clean.get("account_key") or "") or None,
+            "accountLabel": str(clean.get("account_email") or "") or None,
+            "upstreamRequestId": str(clean.get("upstream_request_id") or "") or None,
+            "upstreamStatus": str(clean.get("upstream_status") or "") or None,
+            "httpStatus": int(clean.get("http_status") or 0) or None,
+            "promptPreview": str(clean.get("prompt_preview") or "") or None,
+            "artifactCount": len(paths),
+            "paths": [sanitize_credentials(os.path.basename(path)) for path in paths],
         })
         result["revision"] = revision_for(result)
         return result

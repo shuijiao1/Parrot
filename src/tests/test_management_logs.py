@@ -203,6 +203,44 @@ def test_sanitize_credentials_redacts_nested_keys_header_lines_and_url_userinfo(
     assert "secret" not in json.dumps(clean)
 
 
+def test_sanitize_credentials_covers_key_family_in_dict_plain_and_nested_json():
+    keys = (
+        "api_token", "apiToken", "credential", "exchangeSecret", "exchange_secret",
+        "challengeSecret", "challenge_secret", "sessionSecret", "session_secret",
+        "managementKey", "botToken", "github_token", "apiKey", "accessToken",
+        "refreshToken", "sessionToken", "clientSecret",
+    )
+    marker = "P4_CREDENTIAL_MARKER"
+    secrets = {key: f"{marker}_{index}" for index, key in enumerate(keys)}
+    ordinary = "ordinary token count=42; credential descriptions and business text remain"
+
+    clean_dict = sanitize_credentials({**secrets, "content": ordinary})
+    assert all(clean_dict[key] == "<redacted>" for key in keys)
+    assert clean_dict["content"] == ordinary
+
+    plain = ordinary + "; " + "; ".join(
+        f"{key}{'=' if index % 2 else ': '}{value}"
+        for index, (key, value) in enumerate(secrets.items())
+    )
+    clean_plain = sanitize_credentials(plain)
+    assert marker not in clean_plain
+    assert clean_plain.count("<redacted>") == len(keys)
+    assert ordinary in clean_plain
+
+    nested_json = json.dumps({
+        "payload": json.dumps({**secrets, "content": ordinary}),
+        "content": ordinary,
+    })
+    clean_nested_json = sanitize_credentials(nested_json)
+    assert marker not in clean_nested_json
+    outer = json.loads(clean_nested_json)
+    inner = json.loads(outer["payload"])
+    assert all(inner[key] == "<redacted>" for key in keys)
+    assert outer["content"] == ordinary
+    assert inner["content"] == ordinary
+    assert sanitize_credentials(ordinary) == ordinary
+
+
 def test_logs_control_filter_sort_page_total_detail_and_secret_safe_body():
     control = LogsControl(log_db=FakeLogDb(), config=FakeConfig(), oauth_manager=FakeOAuth())
     ctx = context()
