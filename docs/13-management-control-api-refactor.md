@@ -473,7 +473,7 @@ API filter 状态由请求参数表达，不复用 TG 的 `loglist:`/`logfilter:
 | `GET /media-logs/{mediaLogId}/artifacts` | `listMediaArtifacts` | 可下载 artifact metadata |
 | `GET /media-logs/{mediaLogId}/artifacts/{artifactId}` | `downloadMediaArtifact` | 鉴权流式下载缓存媒体；不存在/过期返回稳定错误 |
 
-状态 enum 固定覆盖 `running|pending|success|failed|expired|cancelled`；TG 图标仍为 `⏳/✅/❌/⌛/⏹`，每页 6 条，查看缓存媒体仍调用原 send_photo/video/document 行为。
+状态 enum 固定覆盖 `running|pending|success|failed|expired|cancelled`；TG 图标仍为 `⏳/✅/❌/⌛/⏹`，每页 6 条。v0.31.13 的 TG 缓存查看只有 `send_photo`/`send_video` 两个分支：`media_type == "video"` 走视频，其余均走图片；不存在 `sendDocument` 成功分支。API 的 artifact 下载能力不改变这一冻结事实。
 
 ### 9.4 RetentionControl
 
@@ -697,7 +697,7 @@ TG model/scope picker 每页 10 条；开关、system message、model/fallback/l
 
 ## 14. Telegram 零变化完整功能清单
 
-本节每个 `TG-*` 是必须有自动化轨迹的验收项。轨迹需覆盖每个列出的 callback family/state 分支的成功、取消、过期/非法输入和业务失败；同一模式可参数化，但不得只测“打开首页”。
+本节每个 `TG-*` 是必须有自动化轨迹的验收项。轨迹需覆盖 v0.31.13 实际存在的每个列出 callback family/state 分支的成功、取消、过期/非法输入和业务失败；同一模式可参数化，但不得只测“打开首页”。若清单中的名词同时来自 API 合同、而基线源码不存在对应 TG 成功分支，必须按第 19 节核实并在本文明确记录，以“入口不存在”或真实 fallback/非法行为的负向轨迹冻结；不得伪造 trace，也不得新增 Telegram 交互来凑齐清单。
 
 ### 14.1 核心、命令、主菜单
 
@@ -741,10 +741,10 @@ TG model/scope picker 每页 10 条；开关、system message、model/fallback/l
 - **TG-STATS-01**：`stats:view:<0|3|7|month>:<all|channel|model|apikey>` 的汇总/展开、family、channel/model/key、cache miss/recent calls、loading/error；正文和按钮逐字节。
 - **TG-STATS-02**：`stats:vis` / `stats:vistog` 五项 `byChannel/byModel/byApiKey/cacheMisses/recentCalls`，默认 true，基础信息始终显示。
 - **TG-LOG-01 列表**：`menu:logs`、page/refresh/query/queryclear/list，列表每页 6；status/protocol/transport/retry chain/preview、filter summary 和 suffix banner。
-- **TG-LOG-02 filter**：server-side `loglist:` / `logfilter:` short state；status/apiKey/model/channel 选项；toggle/all/invert/confirm/cancel/clear；search text state。
+- **TG-LOG-02 filter**：server-side `loglist:` / `logfilter:` short state；v0.31.13 的 TG 成功选项只有 apiKey/model/channel，包含 toggle/all/invert/confirm/cancel/clear 与 search text state；`status` 是 Management API 查询能力，TG 不存在对应 picker/成功 callback，对人为 `logs:filter:status:*` 入口冻结现有“筛选状态已失效”负向轨迹。
 - **TG-LOG-03 detail**：`logs:detail/dpage`，stage/round/attempt、usage/price/cost formula/error；detail pages 与 back state。
 - **TG-LOG-04 inspector**：request/response/body/ins/full/search，检查器每页 6、item preview 1500 字符、kind counts/filter/sort、full item、encrypted/unreadable body sanitize。
-- **TG-MEDIA-01**：`media:logs/page/refresh/detail/view`，每页 6；running/pending/success/failed/expired/cancelled 图标；生成/编辑/延长；cached image/video/document 重发和缺失错误。
+- **TG-MEDIA-01**：`media:logs/page/refresh/detail/view`，每页 6；running/pending/success/failed/expired/cancelled 图标；生成/编辑/延长；cached image/video 重发和缺失错误。v0.31.13 无 TG document 重发分支；人为构造的非 video `media_type` 仍按现有图片路径处理，需以实际 fallback 轨迹锁定，禁止伪造 `sendDocument`。
 
 ### 14.5 Settings、mapping、routing 和运维
 
