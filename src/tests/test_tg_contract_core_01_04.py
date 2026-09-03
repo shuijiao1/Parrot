@@ -313,6 +313,12 @@ def test_core_01_to_04_trace(case, monkeypatch):
 def test_core_fragment_schema_unique_ids_and_bidirectional_capability_coverage():
     assert_capability_coverage(CORE_CAPABILITY_IDS, CASES)
     assert len({case["caseId"] for case in CASES}) == len(CASES)
+    # `mauth:` is the contract-authorized P0 isolated callback surface, not
+    # existing v0.31.13 callback behavior and therefore must not be frozen here.
+    assert not any(
+        case["entry"].get("update", {}).get("callback_query", {}).get("data", "").startswith("mauth:")
+        for case in CASES
+    )
 
 
 def test_strict_comparator_and_replay_have_no_normalization_or_ignore_policy():
