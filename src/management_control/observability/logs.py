@@ -244,7 +244,7 @@ class LogsControl:
     def _list_record(self, row: dict[str, Any]) -> dict[str, Any]:
         clean = sanitize_credentials(dict(row))
         billing = self._billing_summary(self.log_db.cost_for_log(row))
-        return {
+        result = {
             "id": str(clean.get("request_id") or clean.get("id") or ""),
             "status": str(clean.get("status") or "unknown"),
             "createdAt": utc_datetime(clean.get("created_at")),
@@ -261,8 +261,9 @@ class LogsControl:
             "costTicks": billing["costTicks"],
             "billing": billing,
             "error": clean.get("error_message"),
-            "revision": revision_for(clean),
         }
+        result["revision"] = revision_for(result)
+        return result
 
     def filter_options(self, context: ManagementContext) -> dict[str, Any]:
         require(context)

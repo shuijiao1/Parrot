@@ -392,6 +392,38 @@ def test_logs_control_filter_sort_page_total_detail_and_secret_safe_body():
     assert missing.value.code is ManagementErrorCode.RESOURCE_NOT_FOUND
 
 
+def test_logs_list_revision_tracks_public_channel_not_redacted_secret_source():
+    first_secret = "P4_REVISION_SECRET_ONE"
+    second_secret = "P4_REVISION_SECRET_TWO"
+    db = FakeLogDb()
+    row = db.rows[0]
+    row["final_channel_key"] = "api:one"
+    row["error_message"] = f"upstreamSecret={first_secret}; retry failed"
+    control = LogsControl(log_db=db, config=FakeConfig(), oauth_manager=FakeOAuth())
+
+    original = control.list_logs(context(), RequestLogQuery(page_size=1)).items[0]
+    row["final_channel_key"] = "api:two"
+    channel_changed = control.list_logs(context(), RequestLogQuery(page_size=1)).items[0]
+
+    assert original["channelId"] == "api:one"
+    assert channel_changed["channelId"] == "api:two"
+    assert original["revision"] != channel_changed["revision"]
+
+    row["error_message"] = f"upstreamSecret={second_secret}; retry failed"
+    secret_changed = control.list_logs(context(), RequestLogQuery(page_size=1)).items[0]
+
+    assert secret_changed["error"] == "upstreamSecret=<redacted>; retry failed"
+    assert {
+        key: value for key, value in channel_changed.items() if key != "revision"
+    } == {
+        key: value for key, value in secret_changed.items() if key != "revision"
+    }
+    assert channel_changed["revision"] == secret_changed["revision"]
+    serialized = json.dumps((original, channel_changed, secret_changed), default=str)
+    assert first_secret not in serialized
+    assert second_secret not in serialized
+
+
 def test_body_kind_counts_follow_search_before_kind_filter_and_page():
     control = LogsControl(log_db=FakeLogDb(), config=FakeConfig(), oauth_manager=FakeOAuth())
     db = control.log_db
