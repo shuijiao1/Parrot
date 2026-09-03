@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -8,10 +9,43 @@ from fastapi.testclient import TestClient
 
 from src.management_auth import AuthMethod, Capability
 from src.management_control import ManagementContext, ManagementError
+from src.management_control.auxiliary.updates import _sanitize_log
 from src.tests.management_auxiliary_support import bearer, build_auxiliary_app, create_session
 
 
 BASE = "/api/management/v1"
+_SECRET_LOG_KEYS = (
+    "apiToken",
+    "api_token",
+    "apiKey",
+    "api_key",
+    "api-key",
+    "apikey",
+    "x-api-key",
+    "accessToken",
+    "access_token",
+    "refreshToken",
+    "refresh_token",
+    "idToken",
+    "id_token",
+    "managementKey",
+    "management_key",
+    "botToken",
+    "bot_token",
+    "githubToken",
+    "github_token",
+    "clientSecret",
+    "client_secret",
+    "sessionToken",
+    "session_token",
+    "session",
+    "password",
+    "passwd",
+    "cookie",
+    "set-cookie",
+    "Authorization",
+    "Proxy-Authorization",
+)
 
 
 def _poll(client, headers, operation_id):
@@ -266,41 +300,120 @@ def test_update_check_maps_upstream_failure_without_leaking_detail(tmp_path):
     assert marker not in repr(audits)
 
 
+def test_update_failure_log_sanitizer_covers_plain_json_and_escaped_json():
+    for index, key in enumerate(_SECRET_LOG_KEYS):
+        for rendered_key in (key, key.upper()):
+            marker = f"DIRECT_SECRET_{index}_{rendered_key.replace('-', '_')}"
+            values = (
+                f"before {rendered_key}={marker} after",
+                f"before {json.dumps({rendered_key: marker})} after",
+                f"before {json.dumps({rendered_key: marker}).replace(chr(34), r'\"')} after",
+            )
+            for value in values:
+                sanitized = _sanitize_log(value)
+                assert marker not in sanitized, (rendered_key, value, sanitized)
+                assert "before" in sanitized and "after" in sanitized
+                assert "[REDACTED]" in sanitized
+
+    adjacent_cases = (
+        (
+            "Authorization: Basic AUTH_BASIC_MARKER\nhealth header context",
+            ("AUTH_BASIC_MARKER",),
+            "health header context",
+        ),
+        (
+            "Proxy-Authorization: Basic PROXY_BASIC_MARKER",
+            ("PROXY_BASIC_MARKER",),
+            "Proxy-Authorization: Basic",
+        ),
+        (
+            "Cookie: session=COOKIE_MARKER; theme=dark",
+            ("COOKIE_MARKER",),
+            "Cookie:",
+        ),
+        (
+            "Set-Cookie: sid=SET_COOKIE_MARKER; HttpOnly",
+            ("SET_COOKIE_MARKER",),
+            "Set-Cookie:",
+        ),
+        (
+            "retry Bearer BEARER_MARKER after failure",
+            ("BEARER_MARKER",),
+            "after failure",
+        ),
+        (
+            "retry Basic BASIC_MARKER after failure",
+            ("BASIC_MARKER",),
+            "after failure",
+        ),
+        (
+            "fetch https://URL_USER_MARKER:URL_PASSWORD_MARKER@example.invalid/path failed",
+            ("URL_USER_MARKER", "URL_PASSWORD_MARKER"),
+            "example.invalid/path failed",
+        ),
+        (
+            "fetch https://URL_USERNAME_ONLY_MARKER@example.invalid/path failed",
+            ("URL_USERNAME_ONLY_MARKER",),
+            "example.invalid/path failed",
+        ),
+    )
+    for value, markers, context in adjacent_cases:
+        sanitized = _sanitize_log(value)
+        assert all(marker not in sanitized for marker in markers)
+        assert context in sanitized
+
+    boundary_marker = "BOUNDARY_SECRET_MARKER"
+    raw = "x" * 4000 + f"\napiToken={boundary_marker}\nhealth tail context"
+    sanitized = _sanitize_log(raw)
+    assert len(sanitized) == 3500
+    assert boundary_marker not in sanitized
+    assert sanitized.endswith("health tail context")
+    assert raw.endswith("health tail context")
+
+
 def test_update_failure_log_requires_body_capability_audits_and_redacts_markers(tmp_path):
     app, runtime, fixture = build_auxiliary_app(tmp_path)
-    markers = [
-        "MANAGEMENT_KEY_MARKER",
-        "BOT_TOKEN_MARKER",
-        "CUSTOM_TOKEN_MARKER",
-        "CUSTOM_KEY_MARKER",
-        "PASSWORD_MARKER",
-        "SECRET_MARKER",
-        "BEARER_MARKER",
-        "SOCKS_MARKER",
-        "FTP_MARKER",
-    ]
-    fixture.update_gateway.failure_log = lambda: "\n".join([
-        f'managementKey="{markers[0]}"',
-        f"botToken={markers[1]}",
-        f"provider_token: {markers[2]}",
-        f"service_key={markers[3]}",
-        f"password={markers[4]}",
-        f"clientSecret={markers[5]}",
-        f"Authorization: Bearer {markers[6]}",
-        f"socks5://user:{markers[7]}@proxy.invalid:1080",
-        f"ftp://user:{markers[8]}@files.invalid/path",
-    ])
+    markers = []
+    rows = []
+    for index, key in enumerate(_SECRET_LOG_KEYS):
+        marker = f"HTTP_SECRET_MARKER_{index}"
+        markers.append(marker)
+        if index % 3 == 0:
+            rows.append(f"{key}={marker}")
+        elif index % 3 == 1:
+            rows.append(json.dumps({key: marker}))
+        else:
+            rows.append(json.dumps({key: marker}).replace('"', r'\"'))
+    adjacent_rows = (
+        ("Authorization: Basic HTTP_AUTH_BASIC_MARKER", ("HTTP_AUTH_BASIC_MARKER",)),
+        ("Proxy-Authorization: Basic HTTP_PROXY_BASIC_MARKER", ("HTTP_PROXY_BASIC_MARKER",)),
+        ("Cookie: session=HTTP_COOKIE_MARKER; theme=dark", ("HTTP_COOKIE_MARKER",)),
+        ("Set-Cookie: sid=HTTP_SET_COOKIE_MARKER; HttpOnly", ("HTTP_SET_COOKIE_MARKER",)),
+        ("retry Bearer HTTP_BEARER_MARKER after failure", ("HTTP_BEARER_MARKER",)),
+        ("retry Basic HTTP_BASIC_MARKER after failure", ("HTTP_BASIC_MARKER",)),
+        (
+            "https://HTTP_URL_USER_MARKER:HTTP_URL_PASSWORD_MARKER@example.invalid/path",
+            ("HTTP_URL_USER_MARKER", "HTTP_URL_PASSWORD_MARKER"),
+        ),
+    )
+    for row, row_markers in adjacent_rows:
+        rows.append(row)
+        markers.extend(row_markers)
+    rows.append("health verification failed at backup step")
+    raw_log = "\n".join(rows)
+    fixture.update_gateway.failure_log = lambda: raw_log
+
     restricted = runtime.sessions.issue_for_principal(
         subject_id="read-only",
         auth_method=AuthMethod.MANAGEMENT_KEY,
         roles=(),
         capabilities=(Capability.READ,),
     )
+    restricted_context = ManagementContext(request_id="direct-read-only", actor=restricted.principal)
     with pytest.raises(ManagementError) as denied:
-        fixture.controls.updates.failure_log(
-            ManagementContext(request_id="direct-read-only", actor=restricted.principal)
-        )
+        fixture.controls.updates.failure_log(restricted_context)
     assert denied.value.code.value == "CAPABILITY_DENIED"
+    assert fixture.controls.updates.failure_log_raw(restricted_context) == raw_log
 
     with TestClient(app) as client:
         denied_response = client.get(
@@ -311,14 +424,25 @@ def test_update_failure_log_requires_body_capability_audits_and_redacts_markers(
         headers = bearer(create_session(client))
         response = client.get(BASE + "/updates/failure-log", headers=headers)
         assert response.status_code == 200
-        assert response.json()["data"]["content"].count("[REDACTED]") >= len(markers)
+        content = response.json()["data"]["content"]
+        assert "[REDACTED]" in content
+        assert "health verification failed at backup step" in content
+        assert len(content) <= 3500
         for marker in markers:
             assert marker not in response.text
 
+    assert fixture.update_gateway.failure_log() == raw_log
     audits = fixture.audit.snapshot()
     assert any(record.action == "updates.failure-log.read" for record in audits)
+    public_surfaces = (
+        response.text,
+        repr(audits),
+        repr(runtime.state_store.audit_snapshot()),
+        repr(runtime.operations._items),
+        repr(app.openapi()),
+    )
     for marker in markers:
-        assert marker not in repr(audits)
+        assert all(marker not in surface for surface in public_surfaces)
 
 
 def test_stage_plan_is_actor_bound_and_failed_stage_cannot_activate(tmp_path):

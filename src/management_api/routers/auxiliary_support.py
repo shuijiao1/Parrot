@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Callable
 
 from fastapi import Depends, Request
 
@@ -14,6 +14,7 @@ from src.management_control.auxiliary import (
     UpdateControl,
     XaiMediaControl,
 )
+from src.management_control import ErrorField, ManagementError, ManagementErrorCode
 from src.management_control.operations import ManagementOperation
 
 from ..dependencies import ManagementRuntime, get_management_runtime, management_request_id
@@ -43,6 +44,29 @@ def get_bound_auxiliary_controls(
     request.app.state.management_auxiliary_controls = current
     request.app.state.management_auxiliary_controls_runtime = runtime
     return current
+
+
+def reject_unknown_query(*allowed: str) -> Callable[[Request], None]:
+    """Build a route dependency that rejects undeclared query parameters."""
+    allowed_names = frozenset(allowed)
+
+    def guard(request: Request) -> None:
+        unknown = sorted(set(request.query_params) - allowed_names)
+        if not unknown:
+            return
+        raise ManagementError(
+            ManagementErrorCode.VALIDATION_FAILED,
+            fields=(
+                ErrorField(
+                    path=name,
+                    code="UNKNOWN_QUERY_PARAMETER",
+                    message="Unknown query parameter",
+                )
+                for name in unknown
+            ),
+        )
+
+    return guard
 
 
 def response_meta(request: Request) -> ResponseMeta:

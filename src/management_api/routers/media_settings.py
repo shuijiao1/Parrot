@@ -21,7 +21,12 @@ from ..schemas.auxiliary_media import (
     XaiMediaSettingsData,
     XaiMediaSettingsPatch,
 )
-from .auxiliary_support import get_bound_auxiliary_controls, response_meta, success_response
+from .auxiliary_support import (
+    get_bound_auxiliary_controls,
+    reject_unknown_query,
+    response_meta,
+    success_response,
+)
 
 
 router = APIRouter()
@@ -111,6 +116,7 @@ def _xai(value) -> XaiMediaSettingsData:
 @router.get(
     "/images/settings",
     operation_id="getImageSettings",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["images"],
     response_model=DataEnvelope[ImageSettingsData],
     responses={**success_response(200, _IMAGE_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -126,6 +132,7 @@ def get_image_settings(
 @router.patch(
     "/images/settings",
     operation_id="updateImageSettings",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["images"],
     response_model=DataEnvelope[ImageSettingsData],
     responses={**success_response(200, _IMAGE_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -148,6 +155,7 @@ def update_image_settings(
 @router.get(
     "/images/accounts/{accountId}",
     operation_id="getImageAccountState",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["images"],
     response_model=DataEnvelope[ImageAccountStateData],
     responses={**success_response(200, _ACCOUNT_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -164,6 +172,7 @@ def get_image_account_state(
 @router.patch(
     "/images/accounts/{accountId}",
     operation_id="updateImageAccountState",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["images"],
     response_model=DataEnvelope[ImageAccountStateData],
     responses={**success_response(200, _ACCOUNT_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -188,6 +197,7 @@ def update_image_account_state(
 @router.get(
     "/xai/media-settings",
     operation_id="getXaiMediaSettings",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["xai-media"],
     response_model=DataEnvelope[XaiMediaSettingsData],
     responses={**success_response(200, _XAI_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -203,6 +213,7 @@ def get_xai_media_settings(
 @router.patch(
     "/xai/media-settings",
     operation_id="updateXaiMediaSettings",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["xai-media"],
     response_model=DataEnvelope[XaiMediaSettingsData],
     responses={**success_response(200, _XAI_EXAMPLE), **management_error_responses(*_ERRORS)},

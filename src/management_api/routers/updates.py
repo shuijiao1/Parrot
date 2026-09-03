@@ -31,6 +31,7 @@ from .auxiliary_support import (
     get_bound_auxiliary_controls,
     no_content_response,
     operation_data,
+    reject_unknown_query,
     response_meta,
     success_response,
 )
@@ -150,6 +151,7 @@ def _check(value) -> UpdateCheckData:
 @router.get(
     "/updates/settings",
     operation_id="getSettings",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["updates"],
     response_model=DataEnvelope[UpdateSettingsData],
     responses={**success_response(200, _SETTINGS_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -165,6 +167,7 @@ def get_update_settings(
 @router.patch(
     "/updates/settings",
     operation_id="updateSettings",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["updates"],
     response_model=DataEnvelope[UpdateSettingsData],
     responses={**success_response(200, _SETTINGS_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -187,6 +190,7 @@ def update_settings(
 @router.post(
     "/updates/actions/check",
     operation_id="checkForUpdates",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["updates"],
     response_model=DataEnvelope[UpdateCheckData],
     responses={**success_response(200, _CHECK_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -202,6 +206,7 @@ def check_for_updates(
 @router.put(
     "/updates/ignored-versions/{version}",
     operation_id="ignoreUpdateVersion",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["updates"],
     response_model=DataEnvelope[UpdateSettingsData],
     responses={**success_response(200, _SETTINGS_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -220,6 +225,7 @@ def ignore_update_version(
 @router.delete(
     "/updates/ignored-versions/{version}",
     operation_id="unignoreUpdateVersion",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["updates"],
     status_code=status.HTTP_204_NO_CONTENT,
     responses={**no_content_response("Update version unignored"), **management_error_responses(*_ERRORS)},
@@ -237,6 +243,7 @@ def unignore_update_version(
 @router.get(
     "/updates/backups",
     operation_id="listUpdateBackups",
+    dependencies=[Depends(reject_unknown_query("mode", "sort", "page", "pageSize"))],
     tags=["updates"],
     response_model=UpdateBackupListEnvelope,
     responses={**success_response(200, _BACKUPS_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -280,6 +287,7 @@ def list_update_backups(
 @router.get(
     "/updates/failure-log",
     operation_id="getUpdateFailureLog",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["updates"],
     response_model=DataEnvelope[UpdateFailureLogData],
     responses={**success_response(200, _FAILURE_LOG_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -299,6 +307,7 @@ def get_update_failure_log(
 @router.post(
     "/updates/{version}/actions/stage",
     operation_id="stageUpdate",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["updates"],
     status_code=status.HTTP_202_ACCEPTED,
     response_model=DataEnvelope[StageUpdateOperationData],
@@ -322,6 +331,7 @@ def stage_update(
 @router.post(
     "/updates/staged/actions/restart",
     operation_id="activateStagedUpdate",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["updates"],
     status_code=status.HTTP_202_ACCEPTED,
     response_model=DataEnvelope[ManagementOperationData],
@@ -348,6 +358,7 @@ def activate_staged_update(
 @router.delete(
     "/updates/staged",
     operation_id="cancelStagedUpdate",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["updates"],
     status_code=status.HTTP_204_NO_CONTENT,
     responses={**no_content_response("Staged update cancelled"), **management_error_responses(*_ERRORS)},

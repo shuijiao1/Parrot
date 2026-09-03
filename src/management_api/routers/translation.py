@@ -28,6 +28,7 @@ from .auxiliary_support import (
     get_bound_auxiliary_controls,
     no_content_response,
     operation_data,
+    reject_unknown_query,
     response_meta,
     success_response,
 )
@@ -127,6 +128,7 @@ def _settings(value) -> TranslationSettingsData:
 @router.get(
     "/translation",
     operation_id="getTranslationSettings",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["translation"],
     response_model=DataEnvelope[TranslationSettingsData],
     responses={**success_response(200, _SETTINGS_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -142,6 +144,7 @@ def get_translation_settings(
 @router.patch(
     "/translation",
     operation_id="updateTranslationSettings",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["translation"],
     response_model=DataEnvelope[TranslationSettingsData],
     responses={**success_response(200, _SETTINGS_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -167,6 +170,7 @@ def update_translation_settings(
 @router.get(
     "/translation/cache",
     operation_id="getTranslationCacheStats",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["translation"],
     response_model=DataEnvelope[TranslationCacheData],
     responses={**success_response(200, _CACHE_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -193,6 +197,7 @@ def get_translation_cache_stats(
 @router.delete(
     "/translation/cache",
     operation_id="clearTranslationCache",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["translation"],
     status_code=status.HTTP_204_NO_CONTENT,
     responses={**no_content_response("Translation cache cleared"), **management_error_responses(*_ERRORS)},
@@ -209,6 +214,7 @@ def clear_translation_cache(
 @router.post(
     "/translation/actions/test",
     operation_id="testTranslation",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["translation"],
     status_code=status.HTTP_202_ACCEPTED,
     response_model=DataEnvelope[ManagementOperationData],
@@ -230,6 +236,7 @@ def test_translation(
 @router.get(
     "/translation/languages",
     operation_id="listTranslationLanguages",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["translation"],
     response_model=DataEnvelope[TranslationLanguagesData],
     responses={**success_response(200, _LANGUAGES_EXAMPLE), **management_error_responses(*_ERRORS)},

@@ -27,6 +27,7 @@ from .auxiliary_support import (
     get_bound_auxiliary_controls,
     no_content_response,
     operation_data,
+    reject_unknown_query,
     response_meta,
     success_response,
 )
@@ -124,6 +125,7 @@ def _incident(value) -> StatusIncidentData:
 @router.get(
     "/status-alerts/settings",
     operation_id="getStatusAlertSettings",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["status-alerts"],
     response_model=DataEnvelope[StatusAlertSettingsData],
     responses={**success_response(200, _SETTINGS_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -139,6 +141,7 @@ def get_status_alert_settings(
 @router.patch(
     "/status-alerts/settings",
     operation_id="updateStatusAlertSettings",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["status-alerts"],
     response_model=DataEnvelope[StatusAlertSettingsData],
     responses={**success_response(200, _SETTINGS_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -161,6 +164,7 @@ def update_status_alert_settings(
 @router.get(
     "/status-alerts/incidents",
     operation_id="listStatusIncidents",
+    dependencies=[Depends(reject_unknown_query("view", "provider", "impact", "sort", "page", "pageSize"))],
     tags=["status-alerts"],
     response_model=StatusIncidentListEnvelope,
     responses={**success_response(200, _LIST_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -195,6 +199,7 @@ def list_status_incidents(
 @router.post(
     "/status-alerts/actions/refresh",
     operation_id="refreshStatusAlerts",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["status-alerts"],
     status_code=status.HTTP_202_ACCEPTED,
     response_model=DataEnvelope[ManagementOperationData],
@@ -212,6 +217,7 @@ def refresh_status_alerts(
 @router.post(
     "/status-alerts/incidents/{incidentId}/actions/mute",
     operation_id="muteStatusIncident",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["status-alerts"],
     response_model=DataEnvelope[StatusIncidentData],
     responses={**success_response(200, _INCIDENT_ENVELOPE_EXAMPLE), **management_error_responses(*_ERRORS)},
@@ -230,6 +236,7 @@ def mute_status_incident(
 @router.delete(
     "/status-alerts/incidents/{incidentId}/mute",
     operation_id="unmuteStatusIncident",
+    dependencies=[Depends(reject_unknown_query())],
     tags=["status-alerts"],
     status_code=status.HTTP_204_NO_CONTENT,
     responses={**no_content_response("Status incident unmuted"), **management_error_responses(*_ERRORS)},
