@@ -13,18 +13,43 @@ from __future__ import annotations
 
 from typing import Optional
 
-from ... import __version__, config, update_checker, updater
+from ...management_control.auxiliary import get_auxiliary_controls
+from ...management_control.auxiliary.common import telegram_context
+from ...management_control.auxiliary.updates import (
+    STAGE_BACKING_UP,
+    STAGE_FAILED,
+    STAGE_IDLE,
+    STAGE_PULLING,
+    STAGE_RESTARTING,
+    STAGE_ROLLED_BACK,
+    STAGE_STAGED,
+    STAGE_SUCCESS,
+    STAGE_VERIFYING,
+)
 from .. import states, ui
 
 
+_CONTROL = get_auxiliary_controls().updates
+
+
+def _ctx(chat_id: int = 0):
+    return telegram_context(chat_id)
+
+
 def _cfg() -> dict:
-    return config.get().get("updateChecker") or {}
+    value = _CONTROL.get_settings(_ctx())
+    return {
+        "enabled": value.enabled,
+        "includePrerelease": value.include_prerelease,
+        "autoUpdate": value.auto_update,
+        "intervalSeconds": value.interval_seconds,
+        "ignoredVersions": list(value.ignored_versions),
+        "repo": _CONTROL.repository(_ctx()),
+    }
 
 
-def _update_cfg(patch: dict) -> None:
-    def _mut(c):
-        c.setdefault("updateChecker", {}).update(patch)
-    config.update(_mut)
+def _update_cfg(patch: dict, chat_id: int = 0) -> None:
+    _CONTROL.set_settings_direct(_ctx(chat_id), patch)
 
 
 # ─── 主菜单文本 ──────────────────────────────────────────────────
@@ -38,7 +63,7 @@ def _format_main_text() -> str:
     repo = cfg.get("repo") or "danger-dream/Parrot"
     ignored = list(cfg.get("ignoredVersions") or [])
 
-    st = update_checker.get_cached() or {}
+    st = _CONTROL.cached_release(_ctx()) or {}
     latest = st.get("latest_version")
     latest_name = st.get("latest_name") or ""
     latest_pub = st.get("latest_published_at") or ""
@@ -48,13 +73,13 @@ def _format_main_text() -> str:
     if len(latest_body) > 800:
         latest_body = latest_body[:800].rstrip() + "…"
 
-    mode = updater.get_mode()
+    mode = _CONTROL.mode(_ctx())
     mode_label = {"docker": "🐳 Docker", "systemd": "⚙ systemd", "bare": "📄 源码"}.get(mode, mode)
 
     lines = [
         "🆕 <b>版本更新</b>",
         "",
-        f"当前版本: <code>v{__version__}</code>",
+        f"当前版本: <code>v{_CONTROL.current_version}</code>",
         f"运行形态: {mode_label}",
         f"仓库: <code>{ui.escape_html(repo)}</code>",
         f"自动检查: <code>{'开' if enabled else '关'}</code> · 间隔 <code>{interval}s</code> · "
@@ -65,18 +90,18 @@ def _format_main_text() -> str:
     ]
 
     # 自更新进行中的状态提示
-    su = updater.load_state()
+    su = _CONTROL.state_raw(_ctx())
     su_stage = su.get("stage")
-    if su_stage and su_stage not in (updater.STAGE_IDLE,):
+    if su_stage and su_stage not in (STAGE_IDLE,):
         stage_label = {
-            updater.STAGE_BACKING_UP: "📦 备份中",
-            updater.STAGE_PULLING: "⬇️ 拉取中",
-            updater.STAGE_STAGED: "⏸ 已就绪，等待确认重启",
-            updater.STAGE_RESTARTING: "🔄 重启生效中",
-            updater.STAGE_VERIFYING: "🔎 健康检查中",
-            updater.STAGE_SUCCESS: "✅ 上次更新成功",
-            updater.STAGE_FAILED: "❌ 上次更新失败",
-            updater.STAGE_ROLLED_BACK: "↩️ 上次更新已回滚",
+            STAGE_BACKING_UP: "📦 备份中",
+            STAGE_PULLING: "⬇️ 拉取中",
+            STAGE_STAGED: "⏸ 已就绪，等待确认重启",
+            STAGE_RESTARTING: "🔄 重启生效中",
+            STAGE_VERIFYING: "🔎 健康检查中",
+            STAGE_SUCCESS: "✅ 上次更新成功",
+            STAGE_FAILED: "❌ 上次更新失败",
+            STAGE_ROLLED_BACK: "↩️ 上次更新已回滚",
         }.get(su_stage, su_stage)
         lines.append(f"<b>更新状态</b>: {stage_label}")
         if su.get("message"):
@@ -86,7 +111,7 @@ def _format_main_text() -> str:
     if not latest:
         lines.append("ℹ 暂无 release 数据；点「🔄 立即检查」拉取。")
     else:
-        is_newer = update_checker._has_newer(latest)
+        is_newer = _CONTROL.is_newer(_ctx(), latest)
         head = "🟢 有新版本" if is_newer and latest not in set(ignored) else (
                "🔕 新版本已忽略" if is_newer else "✅ 已是最新")
         lines.append(f"<b>最新 release</b>: <code>{ui.escape_html(latest)}</code>"
@@ -113,24 +138,24 @@ def _format_kb() -> dict:
     auto_update = bool(cfg.get("autoUpdate", False))
     interval = int(cfg.get("intervalSeconds", 3600) or 3600)
     ignored = set(cfg.get("ignoredVersions") or [])
-    st = update_checker.get_cached() or {}
+    st = _CONTROL.cached_release(_ctx()) or {}
     latest = st.get("latest_version")
 
     rows: list[list[dict]] = []
 
     # ── 自更新行（最显眼，放最上）──
-    su = updater.load_state()
+    su = _CONTROL.state_raw(_ctx())
     su_stage = su.get("stage")
-    if su_stage == updater.STAGE_STAGED:
+    if su_stage == STAGE_STAGED:
         # staged 态：二次确认
         rows.append([
             ui.btn("✅ 确认重启生效", "upd:confirm_restart"),
             ui.btn("↩️ 取消并回滚", "upd:cancel_staged"),
         ])
-    elif su_stage in (updater.STAGE_BACKING_UP, updater.STAGE_PULLING,
-                      updater.STAGE_RESTARTING, updater.STAGE_VERIFYING):
+    elif su_stage in (STAGE_BACKING_UP, STAGE_PULLING,
+                      STAGE_RESTARTING, STAGE_VERIFYING):
         rows.append([ui.btn("⏳ 更新进行中…", "upd:noop")])
-    elif latest and update_checker._has_newer(latest) and latest not in ignored:
+    elif latest and _CONTROL.is_newer(_ctx(), latest) and latest not in ignored:
         # 有新版且未忽略：可一键更新
         rows.append([ui.btn(f"🚀 立即更新到 {latest}", f"upd:do_update:{latest}")])
 
@@ -147,7 +172,7 @@ def _format_kb() -> dict:
         ui.btn("🗂 备份列表", "upd:backups"),
     ])
     rows.append([ui.btn("📋 更新日志", "upd:faillog")])
-    if latest and update_checker._has_newer(latest):
+    if latest and _CONTROL.is_newer(_ctx(), latest):
         if latest in ignored:
             rows.append([ui.btn(f"✅ 取消忽略 {latest}", f"upd:unignore:{latest}")])
         else:
@@ -172,21 +197,21 @@ def send_new(chat_id: int) -> None:
 
 def _toggle_enabled(chat_id: int, message_id: int, cb_id: str) -> None:
     cur = bool(_cfg().get("enabled", True))
-    _update_cfg({"enabled": not cur})
+    _update_cfg({"enabled": not cur}, chat_id)
     ui.answer_cb(cb_id, "已关闭" if cur else "已开启")
     show(chat_id, message_id)
 
 
 def _toggle_pre(chat_id: int, message_id: int, cb_id: str) -> None:
     cur = bool(_cfg().get("includePrerelease", True))
-    _update_cfg({"includePrerelease": not cur})
+    _update_cfg({"includePrerelease": not cur}, chat_id)
     ui.answer_cb(cb_id, "已切换")
     show(chat_id, message_id)
 
 
 def _toggle_auto(chat_id: int, message_id: int, cb_id: str) -> None:
     cur = bool(_cfg().get("autoUpdate", False))
-    _update_cfg({"autoUpdate": not cur})
+    _update_cfg({"autoUpdate": not cur}, chat_id)
     ui.answer_cb(cb_id, "自动更新已开启" if not cur else "自动更新已关闭")
     show(chat_id, message_id)
 
@@ -209,7 +234,7 @@ def _on_interval_input(chat_id: int, text: str) -> None:
     except ValueError:
         ui.send(chat_id, "❌ 需要 ≥300 的整数（最小 5 分钟），请重新输入：")
         return
-    _update_cfg({"intervalSeconds": v})
+    _update_cfg({"intervalSeconds": v}, chat_id)
     states.pop_state(chat_id)
     ui.send(chat_id, f"✅ 检查间隔已更新为 <code>{v}s</code>")
     send_new(chat_id)
@@ -218,7 +243,7 @@ def _on_interval_input(chat_id: int, text: str) -> None:
 def _refresh(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id, "拉取中…")
     try:
-        update_checker.force_refresh_sync()
+        _CONTROL.refresh_direct(_ctx(chat_id))
     except Exception as exc:
         ui.send(chat_id, f"❌ 拉取失败: <code>{ui.escape_html(str(exc))}</code>")
         return
@@ -229,7 +254,7 @@ def _ignore_version(chat_id: int, message_id: int, cb_id: str, version: str) -> 
     if not version:
         ui.answer_cb(cb_id, "版本号为空")
         return
-    update_checker.add_ignored(version)
+    _CONTROL.ignore_direct(_ctx(chat_id), version)
     ui.answer_cb(cb_id, f"已忽略 {version}")
     show(chat_id, message_id)
 
@@ -238,20 +263,20 @@ def _unignore_version(chat_id: int, message_id: int, cb_id: str, version: str) -
     if not version:
         ui.answer_cb(cb_id, "版本号为空")
         return
-    update_checker.remove_ignored(version)
+    _CONTROL.unignore_direct(_ctx(chat_id), version)
     ui.answer_cb(cb_id, f"已取消忽略 {version}")
     show(chat_id, message_id)
 
 
 def _clear_ignored(chat_id: int, message_id: int, cb_id: str) -> None:
-    update_checker.clear_ignored()
+    _CONTROL.clear_ignored_direct(_ctx(chat_id))
     ui.answer_cb(cb_id, "已清空")
     show(chat_id, message_id)
 
 
 def _backups(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    backups = updater.list_backups()
+    backups = _CONTROL.backups_raw(_ctx(chat_id))
     if not backups:
         text = "🗂 <b>备份列表</b>\n\n暂无备份。"
     else:
@@ -271,7 +296,7 @@ def _backups(chat_id: int, message_id: int, cb_id: str) -> None:
 def _faillog(chat_id: int, message_id: int, cb_id: str) -> None:
     """展示最近一次更新的失败日志。"""
     ui.answer_cb(cb_id)
-    log = updater.get_update_log()
+    log = _CONTROL.failure_log_raw(_ctx(chat_id))
     if not log.strip():
         text = "📋 <b>更新日志</b>\n\n暂无日志记录。"
     else:
@@ -289,7 +314,7 @@ def _do_update(chat_id: int, message_id: int, cb_id: str, version: str) -> None:
     if not version:
         ui.answer_cb(cb_id, "版本号为空")
         return
-    if updater.is_busy():
+    if _CONTROL.is_busy(_ctx(chat_id)):
         ui.answer_cb(cb_id, "已有更新进行中", show_alert=True)
         show(chat_id, message_id)
         return
@@ -297,7 +322,7 @@ def _do_update(chat_id: int, message_id: int, cb_id: str, version: str) -> None:
     ui.answer_cb(cb_id)
     text = (
         f"🚀 <b>确认更新到 {ui.escape_html(version)}？</b>\n\n"
-        f"当前: <code>v{__version__}</code>\n"
+        f"当前: <code>v{_CONTROL.current_version}</code>\n"
         f"流程：① 强制备份 → ② 拉取新版本 → ③ <b>停下等你二次确认</b> → ④ 重启生效\n\n"
         f"第一步只做备份和拉取，<b>不会重启</b>，可随时取消。"
     )
@@ -315,7 +340,7 @@ def _stage(chat_id: int, message_id: int, cb_id: str, version: str) -> None:
     def _progress(stage: str, text: str) -> None:
         try:
             kb = None
-            if stage == updater.STAGE_STAGED:
+            if stage == STAGE_STAGED:
                 kb = ui.inline_kb([
                     [ui.btn("✅ 确认重启生效", "upd:confirm_restart"),
                      ui.btn("↩️ 取消并回滚", "upd:cancel_staged")],
@@ -325,12 +350,13 @@ def _stage(chat_id: int, message_id: int, cb_id: str, version: str) -> None:
         except Exception:
             pass
 
-    updater.set_progress_callback(_progress)
-    try:
-        ok, detail = updater.stage_update(version, chat_id=chat_id, notify_msg_id=message_id)
-    finally:
-        # 清掉回调，避免后续 resume/其它流程的 _emit 误 edit 这条旧消息
-        updater.set_progress_callback(None)
+    ok, detail = _CONTROL.stage_direct(
+        _ctx(chat_id),
+        version,
+        progress=_progress,
+        chat_id=chat_id,
+        notify_msg_id=message_id,
+    )
     if not ok:
         ui.edit(chat_id, message_id,
                 ui.truncate(f"❌ 更新未完成：{ui.escape_html(detail)}"),
@@ -343,24 +369,33 @@ def _stage(chat_id: int, message_id: int, cb_id: str, version: str) -> None:
 def _confirm_restart(chat_id: int, message_id: int, cb_id: str) -> None:
     """二阶确认：用户确认重启生效。"""
     ui.answer_cb(cb_id, "正在重启…")
-    st = updater.load_state()
-    if st.get("stage") != updater.STAGE_STAGED:
+    st = _CONTROL.state_raw(_ctx())
+    if st.get("stage") != STAGE_STAGED:
         ui.edit(chat_id, message_id, "⚠️ 当前不在待确认状态，可能已重启或已取消。",
                 reply_markup=ui.inline_kb([[ui.btn("◀ 返回", "menu:update")]]))
         return
     # 记录通知消息位置，重启后由 resume 流程 edit 它
-    updater.save_state(chat_id=chat_id, notify_msg_id=message_id)
-    ui.edit(chat_id, message_id,
-            ui.truncate("🔄 <b>正在重启生效…</b>\n\n稍候将自动回填健康检查结果。"),
-            reply_markup=None)
-    ok, detail = updater.confirm_restart()
+    def _before_activate() -> None:
+        ui.edit(chat_id, message_id,
+                ui.truncate("🔄 <b>正在重启生效…</b>\n\n稍候将自动回填健康检查结果。"),
+                reply_markup=None)
+
+    result = _CONTROL.activate_direct(
+        _ctx(chat_id),
+        chat_id=chat_id,
+        notify_msg_id=message_id,
+        before_activate=_before_activate,
+    )
+    if result is None:
+        return
+    ok, detail = result
     if not ok:
         ui.send(chat_id, f"❌ 重启触发失败：<code>{ui.escape_html(detail)}</code>")
 
 
 def _cancel_staged(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id, "正在取消…")
-    ok, detail = updater.cancel_staged()
+    ok, detail = _CONTROL.cancel_direct(_ctx(chat_id))
     ui.edit(chat_id, message_id,
             ui.truncate(f"↩️ <b>已取消更新</b>\n\n{ui.escape_html(detail)}"),
             reply_markup=ui.inline_kb([[ui.btn("◀ 返回", "menu:update")]]))

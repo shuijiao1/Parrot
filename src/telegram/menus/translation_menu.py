@@ -10,9 +10,16 @@ import asyncio
 import json
 import threading
 
-from ... import config, translation
-from ...channel import registry
+from ...management_control.auxiliary import get_auxiliary_controls
+from ...management_control.auxiliary.common import telegram_context
 from .. import states, ui
+
+
+_CONTROL = get_auxiliary_controls().translation
+
+
+def _ctx(chat_id: int = 0):
+    return telegram_context(chat_id)
 
 
 # ─── 常量 ─────────────────────────────────────────────────────────
@@ -39,7 +46,24 @@ _LANGUAGES = [
 
 
 def _get_cfg() -> dict:
-    return translation._get_cfg()
+    value = _CONTROL.get_settings(_ctx())
+    return {
+        "enabled": value.enabled,
+        "model": value.model,
+        "fallbackModel": value.fallback_model,
+        "targetLanguage": value.target_language,
+        "timeoutSeconds": value.timeout_seconds,
+        "maxHistoryMessages": value.max_history_messages,
+        "cacheTtlDays": value.cache_ttl_days,
+        "cachePreloadCount": value.cache_preload_count,
+        "failureAlertThreshold": value.failure_alert_threshold,
+        "memoryCacheMaxMb": value.memory_cache_max_mb,
+        "memoryCacheTtlSeconds": value.memory_cache_ttl_seconds,
+        "translateSystemMessages": value.translate_system_messages,
+        "scope": {"models": list(value.scope.models), "channels": list(value.scope.channels)},
+        "modelOverrides": value.model_overrides,
+        "prompt": value.prompt,
+    }
 
 
 def _current_model_name(cfg: dict | None = None) -> str:
@@ -122,54 +146,22 @@ def _scope_summary(kind: str, cfg: dict | None = None) -> str:
 
 def _channel_scope_items() -> list[tuple[str, str]]:
     items: list[tuple[str, str]] = []
-    for ch in registry.all_channels():
-        key = str(getattr(ch, "key", "") or "")
-        if not key:
-            continue
-        typ = str(getattr(ch, "type", "") or "")
-        if typ == "oauth":
-            label = ui.channel_display_name(key, with_family=False)
+    for channel in _CONTROL.available_channels(_ctx()):
+        if channel.type == "oauth":
+            label = ui.channel_display_name(channel.id, with_family=False)
         else:
             # API channels can emulate multiple providers; keep a generic key icon.
-            label = "🔑 " + str(
-                getattr(ch, "display_name", "") or getattr(ch, "name", "") or key
-            )
-        items.append((key, label))
+            label = "🔑 " + channel.display_name
+        items.append((channel.id, label))
     return items
 
 
-def _toggle_scope_value(kind: str, value: str) -> None:
-    value = str(value or "").strip()
-    if kind not in ("models", "channels") or not value:
-        return
-
-    def _m(c):
-        tl = c.setdefault("translation", {})
-        scope = tl.setdefault("scope", {})
-        if not isinstance(scope, dict):
-            scope = {}
-            tl["scope"] = scope
-        values = _string_list(scope.get(kind))
-        if value in values:
-            values.remove(value)
-        else:
-            values.append(value)
-        scope[kind] = values
-    config.update(_m)
+def _toggle_scope_value(kind: str, value: str, chat_id: int = 0) -> None:
+    _CONTROL.toggle_scope(_ctx(chat_id), kind, value)
 
 
-def _clear_scope(kind: str) -> None:
-    if kind not in ("models", "channels"):
-        return
-
-    def _m(c):
-        tl = c.setdefault("translation", {})
-        scope = tl.setdefault("scope", {})
-        if not isinstance(scope, dict):
-            scope = {}
-            tl["scope"] = scope
-        scope[kind] = []
-    config.update(_m)
+def _clear_scope(kind: str, chat_id: int = 0) -> None:
+    _CONTROL.clear_scope(_ctx(chat_id), kind)
 
 
 # ─── 主页面 ───────────────────────────────────────────────────────
@@ -191,10 +183,16 @@ def _main_text_and_kb() -> tuple[str, dict]:
     override_summary = _override_summary_for_model(str(model or ""), cfg)
     model_scope_summary = _scope_summary("models", cfg)
     channel_scope_summary = _scope_summary("channels", cfg)
-    ready_ok, ready_reason = translation.validate_ready(cfg, require_enabled=False)
+    ready_ok, ready_reason = _CONTROL.readiness(_ctx(), enabled=False)
 
-    cache_n = translation.cache_count()
-    stats = translation.cache_hit_stats()
+    cache = _CONTROL.cache_stats(_ctx())
+    cache_n = cache.entries
+    stats = {
+        "memoryBytes": cache.memory_bytes,
+        "memoryEntries": cache.memory_entries,
+        "hits": cache.hits,
+        "misses": cache.misses,
+    }
     mem_bytes = int(stats.get("memoryBytes", 0) or 0)
     mem_entries = int(stats.get("memoryEntries", 0) or 0)
 
@@ -266,18 +264,13 @@ def _on_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
     cur = bool(_get_cfg().get("enabled"))
     new_val = not cur
     if new_val:
-        cfg = _get_cfg()
-        probe_cfg = dict(cfg)
-        probe_cfg["enabled"] = True
-        ok, reason = translation.validate_ready(probe_cfg, require_enabled=True)
+        ok, reason = _CONTROL.readiness(_ctx(chat_id), enabled=True)
         if not ok:
             ui.answer_cb(cb_id, f"不能开启: {reason}", show_alert=True)
             show(chat_id, message_id, "-")
             return
 
-    def _m(c):
-        c.setdefault("translation", {})["enabled"] = new_val
-    config.update(_m)
+    _CONTROL.set_field_direct(_ctx(chat_id), "enabled", new_val)
     ui.answer_cb(cb_id, "已开启" if new_val else "已关闭")
     show(chat_id, message_id, "-")
 
@@ -285,9 +278,7 @@ def _on_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
 def _on_toggle_system(chat_id: int, message_id: int, cb_id: str) -> None:
     cur = bool(_get_cfg().get("translateSystemMessages", False))
 
-    def _m(c):
-        c.setdefault("translation", {})["translateSystemMessages"] = not cur
-    config.update(_m)
+    _CONTROL.set_field_direct(_ctx(chat_id), "translateSystemMessages", not cur)
     ui.answer_cb(cb_id, "已开启系统消息翻译" if not cur else "已关闭系统消息翻译")
     show(chat_id, message_id, "-")
 
@@ -300,7 +291,7 @@ def _model_picker(
 ) -> None:
     """显示模型选择器。field = "model" 或 "fallback"。"""
     ui.answer_cb(cb_id)
-    models = registry.available_models()
+    models = _CONTROL.available_models(_ctx(chat_id))
     if not models:
         ui.edit(
             chat_id, message_id,
@@ -358,9 +349,7 @@ def _on_pick_model(
 
     config_key = "model" if field == "model" else "fallbackModel"
 
-    def _m(c):
-        c.setdefault("translation", {})[config_key] = model_name
-    config.update(_m)
+    _CONTROL.set_field_direct(_ctx(chat_id), config_key, model_name)
 
     label = "翻译模型" if field == "model" else "备用模型"
     ui.answer_cb(cb_id, f"✅ {label}: {model_name}")
@@ -368,9 +357,7 @@ def _on_pick_model(
 
 
 def _on_clear_fallback(chat_id: int, message_id: int, cb_id: str) -> None:
-    def _m(c):
-        c.setdefault("translation", {})["fallbackModel"] = ""
-    config.update(_m)
+    _CONTROL.set_field_direct(_ctx(chat_id), "fallbackModel", "")
     ui.answer_cb(cb_id, "已清除备用模型")
     show(chat_id, message_id, "-")
 
@@ -397,9 +384,7 @@ def _show_lang_picker(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _on_pick_lang(chat_id: int, message_id: int, cb_id: str, lang: str) -> None:
-    def _m(c):
-        c.setdefault("translation", {})["targetLanguage"] = lang
-    config.update(_m)
+    _CONTROL.set_field_direct(_ctx(chat_id), "targetLanguage", lang)
     ui.answer_cb(cb_id, f"✅ 目标语言: {lang}")
     show(chat_id, message_id, "-")
 
@@ -447,9 +432,7 @@ def _on_numeric_input(chat_id: int, key: str, text: str) -> None:
         ui.send(chat_id, f"❌ 范围 {lo}-{hi}，请重新输入：")
         return
 
-    def _m(c):
-        c.setdefault("translation", {})[config_key] = v
-    config.update(_m)
+    _CONTROL.set_field_direct(_ctx(chat_id), config_key, v)
     states.pop_state(chat_id)
     ui.send_result(
         chat_id,
@@ -464,7 +447,7 @@ def _show_scope_models(chat_id: int, message_id: int, cb_id: str, page: int = 0)
     if cb_id:
         ui.answer_cb(cb_id)
     try:
-        models = registry.available_models()
+        models = _CONTROL.available_models(_ctx(chat_id))
     except Exception:
         models = []
     selected = set(_scope_cfg().get("models") or [])
@@ -571,7 +554,7 @@ def _on_toggle_scope_model(chat_id: int, message_id: int, cb_id: str, code: str)
         ui.answer_cb(cb_id, "会话已过期", show_alert=True)
         return
     model = tag[len("tl:scope:model:"):]
-    _toggle_scope_value("models", model)
+    _toggle_scope_value("models", model, chat_id)
     ui.answer_cb(cb_id, "已更新生效模型")
     _show_scope_models(chat_id, message_id, "", 0)
 
@@ -582,7 +565,7 @@ def _on_toggle_scope_channel(chat_id: int, message_id: int, cb_id: str, code: st
         ui.answer_cb(cb_id, "会话已过期", show_alert=True)
         return
     key = tag[len("tl:scope:channel:"):]
-    _toggle_scope_value("channels", key)
+    _toggle_scope_value("channels", key, chat_id)
     ui.answer_cb(cb_id, "已更新生效渠道/账号")
     _show_scope_channels(chat_id, message_id, "", 0)
 
@@ -627,37 +610,7 @@ def _show_model_params(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _update_current_model_body(mutator) -> tuple[bool, str]:
-    cfg = _get_cfg()
-    model = _current_model_name(cfg)
-    if not model:
-        return False, "请先设置翻译模型"
-
-    def _m(c):
-        tl = c.setdefault("translation", {})
-        overrides = tl.setdefault("modelOverrides", {})
-        if not isinstance(overrides, dict):
-            overrides = {}
-            tl["modelOverrides"] = overrides
-        item = overrides.get(model)
-        if not isinstance(item, dict):
-            item = {}
-        body = item.get("body")
-        if not isinstance(body, dict):
-            body = {}
-        body = dict(body)
-        mutator(body)
-        body = _sanitize_override_body(body)
-        if body:
-            item["body"] = body
-            overrides[model] = item
-        else:
-            item.pop("body", None)
-            if item:
-                overrides[model] = item
-            else:
-                overrides.pop(model, None)
-    config.update(_m)
-    return True, model
+    return _CONTROL.update_current_model_body(_ctx(), mutator)
 
 
 def _on_set_thinking(chat_id: int, message_id: int, cb_id: str, mode: str) -> None:
@@ -688,12 +641,7 @@ def _on_clear_model_params(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.answer_cb(cb_id, "请先设置翻译模型", show_alert=True)
         return
 
-    def _m(c):
-        tl = c.setdefault("translation", {})
-        overrides = tl.setdefault("modelOverrides", {})
-        if isinstance(overrides, dict):
-            overrides.pop(model, None)
-    config.update(_m)
+    _CONTROL.clear_current_model_override(_ctx(chat_id))
     ui.answer_cb(cb_id, f"已清除 {model} 的模型参数")
     _show_model_params(chat_id, message_id, "-")
 
@@ -756,7 +704,7 @@ def _show_prompt(chat_id: int, message_id: int, cb_id: str) -> None:
     cfg = _get_cfg()
     prompt = cfg.get("prompt") or ""
     is_default = not prompt
-    display_prompt = prompt if prompt else translation.DEFAULT_TRANSLATION_PROMPT
+    display_prompt = prompt if prompt else _CONTROL.default_prompt
     target_lang = cfg.get("targetLanguage") or "English"
 
     text = (
@@ -792,9 +740,7 @@ def _on_prompt_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, "❌ 提示词不能为空，请重新输入：")
         return
 
-    def _m(c):
-        c.setdefault("translation", {})["prompt"] = prompt
-    config.update(_m)
+    _CONTROL.set_field_direct(_ctx(chat_id), "prompt", prompt)
     states.pop_state(chat_id)
     ui.send_result(
         chat_id,
@@ -804,9 +750,7 @@ def _on_prompt_input(chat_id: int, text: str) -> None:
 
 
 def _on_prompt_reset(chat_id: int, message_id: int, cb_id: str) -> None:
-    def _m(c):
-        c.setdefault("translation", {})["prompt"] = ""
-    config.update(_m)
+    _CONTROL.set_field_direct(_ctx(chat_id), "prompt", "")
     ui.answer_cb(cb_id, "已恢复默认")
     _show_prompt(chat_id, message_id, "-")
 
@@ -832,8 +776,7 @@ def _spawn_async_task(coro_factory, name: str = "translation-test") -> None:
 
 def _show_test_prompt(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    cfg = _get_cfg()
-    ok, reason = translation.validate_ready(cfg, require_enabled=False)
+    ok, reason = _CONTROL.readiness(_ctx(chat_id), enabled=False)
     if not ok:
         ui.edit(
             chat_id, message_id,
@@ -861,7 +804,7 @@ def _on_test_input(chat_id: int, text: str) -> None:
     msg_id = ((sent.get("result") or {}) if isinstance(sent, dict) else {}).get("message_id")
 
     async def _run():
-        result = await translation.translate_text_for_test(sample)
+        result = await _CONTROL.test_text_direct(_ctx(chat_id), sample)
         ok = bool(result.get("ok"))
         target_lang = result.get("targetLanguage") or _get_cfg().get("targetLanguage") or "English"
         if ok:
@@ -891,7 +834,7 @@ def _on_test_input(chat_id: int, text: str) -> None:
 
 def _show_clear_cache(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    count = translation.cache_count()
+    count = _CONTROL.cache_stats(_ctx(chat_id)).entries
     text = (
         f"确定要清空翻译缓存吗？\n\n"
         f"当前缓存 <code>{count}</code> 条记录。\n"
@@ -904,7 +847,7 @@ def _show_clear_cache(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _on_clear_confirm(chat_id: int, message_id: int, cb_id: str) -> None:
-    cleared = translation.clear_cache()
+    cleared = _CONTROL.clear_cache(_ctx(chat_id))
     ui.answer_cb(cb_id, f"已清空 {cleared} 条")
     show(chat_id, message_id, "-")
 
@@ -958,7 +901,7 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data.startswith("tl:scope:models:"):
         tail = data.split(":", 3)[3]
         if tail == "clear":
-            _clear_scope("models")
+            _clear_scope("models", chat_id)
             ui.answer_cb(cb_id, "已设为全部模型生效")
             _show_scope_models(chat_id, message_id, "", 0)
         else:
@@ -967,7 +910,7 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data.startswith("tl:scope:channels:"):
         tail = data.split(":", 3)[3]
         if tail == "clear":
-            _clear_scope("channels")
+            _clear_scope("channels", chat_id)
             ui.answer_cb(cb_id, "已设为全部渠道/账号生效")
             _show_scope_channels(chat_id, message_id, "", 0)
         else:

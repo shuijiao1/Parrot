@@ -9,9 +9,16 @@ import json
 import os
 from typing import Optional
 
-from ... import config, image_db
-from ...openai import images_simple
+from ...management_control.auxiliary import get_auxiliary_controls
+from ...management_control.auxiliary.common import telegram_context
 from .. import states, ui
+
+
+_CONTROL = get_auxiliary_controls().images
+
+
+def _ctx(chat_id: int = 0):
+    return telegram_context(chat_id)
 
 
 def _fmt_bytes(n) -> str:
@@ -30,7 +37,7 @@ def _fmt_bytes(n) -> str:
 
 
 def _cfg() -> dict:
-    return images_simple.settings()
+    return _CONTROL.settings_raw_direct(_ctx())
 
 
 def _render() -> tuple[str, dict]:
@@ -73,20 +80,17 @@ def send_new(chat_id: int) -> None:
     ui.send(chat_id, text, reply_markup=kb)
 
 
-def _mutate_images(fn) -> None:
-    def m(cfg):
-        img = cfg.setdefault("images", {})
-        fn(img)
-    config.update(m)
+def _mutate_images(fn, chat_id: int = 0) -> None:
+    _CONTROL.mutate_direct(_ctx(chat_id), fn)
 
 
 def on_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
-    _mutate_images(lambda img: img.__setitem__("enabled", not bool(img.get("enabled", True))))
+    _mutate_images(lambda img: img.__setitem__("enabled", not bool(img.get("enabled", True))), chat_id)
     show(chat_id, message_id, cb_id)
 
 
 def on_cache_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
-    _mutate_images(lambda img: img.__setitem__("cacheEnabled", not bool(img.get("cacheEnabled", False))))
+    _mutate_images(lambda img: img.__setitem__("cacheEnabled", not bool(img.get("cacheEnabled", False))), chat_id)
     show(chat_id, message_id, cb_id)
 
 
@@ -144,7 +148,7 @@ def on_accounts(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     rows = []
     lines = ["🚫 <b>图片禁用账号</b>", "", "点击账号切换图片模块禁用状态；这里只影响图片生成/编辑，不影响普通 API。", ""]
-    accounts = images_simple.list_image_accounts(include_disabled=True)
+    accounts = _CONTROL.accounts_raw_direct(_ctx(chat_id))
     if not accounts:
         lines.append(f"暂无 {ui.provider_tag('openai')} OAuth 账号。")
     for row in accounts:
@@ -172,15 +176,7 @@ def on_account_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -> 
         on_accounts(chat_id, message_id, cb_id)
         return
     ak = full[len("imgacc:"):]
-    def m(img):
-        vals = list(img.get("disabledAccounts") or [])
-        low = {str(x).lower(): i for i, x in enumerate(vals)}
-        if ak.lower() in low:
-            vals.pop(low[ak.lower()])
-        else:
-            vals.append(ak)
-        img["disabledAccounts"] = vals
-    _mutate_images(m)
+    _CONTROL.toggle_account_direct(_ctx(chat_id), ak)
     on_accounts(chat_id, message_id, cb_id)
 
 
@@ -194,15 +190,11 @@ def on_view_image(chat_id: int, message_id: int, cb_id: str, short: str) -> None
     except Exception:
         ui.answer_cb(cb_id, "日志无效")
         return
-    row = image_db.get_log(log_id)
+    row = _CONTROL.cached_image_log(_ctx(chat_id), log_id)
     if not row:
         ui.answer_cb(cb_id, "日志不存在")
         return
-    try:
-        paths = json.loads(row.get("cache_paths") or "[]")
-    except Exception:
-        paths = []
-    paths = [p for p in paths if isinstance(p, str) and os.path.exists(p)]
+    paths = list(row.paths)
     if not paths:
         ui.answer_cb(cb_id, "图片缓存不存在或已清理", show_alert=True)
         return
@@ -211,8 +203,8 @@ def on_view_image(chat_id: int, message_id: int, cb_id: str, short: str) -> None
         ui.send_photo(
             chat_id, p,
             caption=(
-                f"🖼 图片日志 #{row.get('id')} · {'生成' if row.get('action') == 'generate' else '编辑'}\n"
-                f"账号: <code>{ui.escape_html(row.get('account_email') or '?')}</code>"
+                f"🖼 图片日志 #{row.id} · {'生成' if row.action == 'generate' else '编辑'}\n"
+                f"账号: <code>{ui.escape_html(row.account_email or '?')}</code>"
             ),
         )
 
@@ -250,7 +242,7 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         if not val:
             ui.send(chat_id, "❌ 模型名不能为空，请重新输入：")
             return True
-        _mutate_images(lambda img: img.__setitem__("mainModel", val))
+        _mutate_images(lambda img: img.__setitem__("mainModel", val), chat_id)
         states.pop_state(chat_id)
         ui.send_result(chat_id, f"✅ 主模型已更新为 <code>{ui.escape_html(val)}</code>", back_label="◀ 返回 GPT 图片设置", back_callback="img:show")
         return True
@@ -258,7 +250,7 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         if not val:
             ui.send(chat_id, "❌ 模型名不能为空，请重新输入：")
             return True
-        _mutate_images(lambda img: img.__setitem__("toolModel", val))
+        _mutate_images(lambda img: img.__setitem__("toolModel", val), chat_id)
         states.pop_state(chat_id)
         ui.send_result(chat_id, f"✅ 图片模型已更新为 <code>{ui.escape_html(val)}</code>", back_label="◀ 返回 GPT 图片设置", back_callback="img:show")
         return True
@@ -267,7 +259,7 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
             ui.send(chat_id, "❌ 路径不能为空，请重新输入：")
             return True
         # 只做基本路径规范化；真正写文件时仍由 images_simple 用安全文件名写入。
-        _mutate_images(lambda img: img.__setitem__("cachePath", val))
+        _mutate_images(lambda img: img.__setitem__("cachePath", val), chat_id)
         states.pop_state(chat_id)
         ui.send_result(chat_id, f"✅ 缓存路径已更新为 <code>{ui.escape_html(val)}</code>", back_label="◀ 返回 GPT 图片设置", back_callback="img:show")
         return True
@@ -279,7 +271,7 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         except Exception:
             ui.send(chat_id, "❌ 请输入非负整数天数，例如 <code>0</code> 或 <code>30</code>：")
             return True
-        _mutate_images(lambda img: img.__setitem__("cacheRetentionDays", days))
+        _mutate_images(lambda img: img.__setitem__("cacheRetentionDays", days), chat_id)
         states.pop_state(chat_id)
         ui.send_result(chat_id, f"✅ 缓存保留天数已更新为 <code>{days}</code>", back_label="◀ 返回 GPT 图片设置", back_callback="img:show")
         return True
@@ -291,7 +283,7 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         except Exception:
             ui.send(chat_id, "❌ 格式不对，请输入如 <code>1GB</code> / <code>500MB</code> / <code>0</code>：")
             return True
-        _mutate_images(lambda img: img.__setitem__("cacheMaxBytes", n))
+        _mutate_images(lambda img: img.__setitem__("cacheMaxBytes", n), chat_id)
         states.pop_state(chat_id)
         ui.send_result(chat_id, f"✅ 缓存空间上限已更新为 <code>{_fmt_bytes(n)}</code>", back_label="◀ 返回 GPT 图片设置", back_callback="img:show")
         return True

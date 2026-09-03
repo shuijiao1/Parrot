@@ -8,8 +8,16 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from ... import config
+from ...management_control.auxiliary import get_auxiliary_controls
+from ...management_control.auxiliary.common import telegram_context
 from .. import states, ui
+
+
+_CONTROL = get_auxiliary_controls().xai_media
+
+
+def _ctx(chat_id: int = 0):
+    return telegram_context(chat_id)
 
 
 _IMAGE_MODELS_STATE = "xim_edit_image_models"
@@ -22,8 +30,7 @@ _DURATION_RE = re.compile(r"^(\d+)\s*([smhd]?)$", re.IGNORECASE)
 
 
 def _provider_cfg() -> dict:
-    raw = config.get().get("xaiOAuth") or {}
-    return raw if isinstance(raw, dict) else {}
+    return _CONTROL.settings_raw_direct(_ctx())
 
 
 def _models(key: str) -> list[str]:
@@ -139,15 +146,8 @@ def _ask(
     )
 
 
-def _mutate_xai(key: str, value) -> None:
-    def _mutate(cfg: dict) -> None:
-        section = cfg.get("xaiOAuth")
-        if not isinstance(section, dict):
-            section = {}
-            cfg["xaiOAuth"] = section
-        section[key] = value
-
-    config.update(_mutate)
+def _mutate_xai(key: str, value, chat_id: int = 0) -> None:
+    _CONTROL.set_raw_field(_ctx(chat_id), key, value)
 
 
 def on_edit_image_models(chat_id: int, message_id: int, cb_id: str) -> None:
@@ -254,7 +254,7 @@ def _save_models(chat_id: int, *, key: str, label: str, text: str) -> None:
     except ValueError as exc:
         ui.send(chat_id, f"❌ {ui.escape_html(str(exc))}，请重新输入：")
         return
-    _mutate_xai(key, models)
+    _mutate_xai(key, models, chat_id)
     states.pop_state(chat_id)
     value = "、".join(models) if models else "（空）"
     ui.send_result(
@@ -278,7 +278,7 @@ def _save_duration(
     except ValueError as exc:
         ui.send(chat_id, f"❌ {ui.escape_html(str(exc))}，请重新输入：")
         return
-    _mutate_xai(key, seconds)
+    _mutate_xai(key, seconds, chat_id)
     states.pop_state(chat_id)
     ui.send_result(
         chat_id,

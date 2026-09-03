@@ -1,0 +1,821 @@
+"""Application update settings and staged update control."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import re
+import secrets
+import threading
+from collections import OrderedDict
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Protocol
+
+from src import __version__, update_checker, updater
+from src.management_auth.principal import Capability
+
+from ..context import AuditSink, ManagementContext
+from ..errors import ManagementError, ManagementErrorCode
+from ..operations import ManagementOperation, OperationRegistry, OperationStore
+from .common import (
+    ConfigGateway,
+    ModuleConfigGateway,
+    audit,
+    ensure_revision,
+    invalid_field,
+    require,
+    revision_for,
+    string_list,
+)
+
+
+STAGE_IDLE = "idle"
+STAGE_BACKING_UP = "backing_up"
+STAGE_PULLING = "pulling"
+STAGE_STAGED = "staged"
+STAGE_RESTARTING = "restarting"
+STAGE_VERIFYING = "verifying"
+STAGE_SUCCESS = "success"
+STAGE_FAILED = "failed"
+STAGE_ROLLED_BACK = "rolled_back"
+_ACTIVE_STAGES = {STAGE_BACKING_UP, STAGE_PULLING, STAGE_RESTARTING, STAGE_VERIFYING}
+_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s]+"),
+    re.compile(r"(?i)((?:access|refresh|session|api)[_-]?token\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)((?:password|secret|api[_-]?key)\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)(https?://[^\s:/]+:)[^@\s]+(@)"),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateSettings:
+    enabled: bool
+    include_prerelease: bool
+    auto_update: bool
+    interval_seconds: int
+    ignored_versions: tuple[str, ...]
+    revision: str
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateState:
+    stage: str
+    mode: str
+    from_version: str | None
+    to_version: str | None
+    target_version: str | None
+    message: str | None
+    revision: str
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateCheckResult:
+    current_version: str
+    candidate_version: str | None
+    candidate_name: str | None
+    changelog: str | None
+    published_at: str | None
+    prerelease: bool
+    release_url: str | None
+    newer: bool
+    ignored: bool
+    revision: str
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateBackup:
+    ref: str
+    version: str
+    target_version: str
+    mode: str
+    created_at: str
+    revision: str
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateBackupPage:
+    items: tuple[UpdateBackup, ...]
+    page: int
+    page_size: int
+    total: int
+    has_next: bool
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateFailureLog:
+    content: str
+    revision: str
+
+
+@dataclass(slots=True)
+class _ActivationPlan:
+    actor_key: str
+    revision: str
+    target_version: str
+    expires_at: datetime
+    consumed: bool = False
+
+
+class UpdateGateway(Protocol):
+    @property
+    def current_version(self) -> str: ...
+    def cached_release(self) -> dict[str, Any]: ...
+    def is_newer(self, version: str | None) -> bool: ...
+    def force_refresh(self) -> None: ...
+    def add_ignored(self, version: str) -> None: ...
+    def remove_ignored(self, version: str) -> None: ...
+    def clear_ignored(self) -> None: ...
+    def mode(self) -> str: ...
+    def state(self) -> dict[str, Any]: ...
+    def busy(self) -> bool: ...
+    def backups(self) -> list[dict[str, Any]]: ...
+    def failure_log(self) -> str: ...
+    def set_progress(self, callback: Callable[[str, str], None] | None) -> None: ...
+    def stage(self, version: str, *, chat_id: int | None = None, notify_msg_id: int | None = None) -> tuple[bool, str]: ...
+    def save_state(self, **fields: Any) -> None: ...
+    def activate(self) -> tuple[bool, str]: ...
+    def cancel(self) -> tuple[bool, str]: ...
+    def activation_is_terminal(self) -> bool: ...
+
+
+class ModuleUpdateGateway:
+    @property
+    def current_version(self) -> str:
+        return __version__
+
+    def cached_release(self) -> dict[str, Any]:
+        return update_checker.get_cached() or {}
+
+    def is_newer(self, version: str | None) -> bool:
+        return update_checker._has_newer(version)
+
+    def force_refresh(self) -> None:
+        update_checker.force_refresh_sync()
+
+    def add_ignored(self, version: str) -> None:
+        update_checker.add_ignored(version)
+
+    def remove_ignored(self, version: str) -> None:
+        update_checker.remove_ignored(version)
+
+    def clear_ignored(self) -> None:
+        update_checker.clear_ignored()
+
+    def mode(self) -> str:
+        return updater.get_mode()
+
+    def state(self) -> dict[str, Any]:
+        return updater.load_state()
+
+    def busy(self) -> bool:
+        return updater.is_busy()
+
+    def backups(self) -> list[dict[str, Any]]:
+        return updater.list_backups()
+
+    def failure_log(self) -> str:
+        return updater.get_update_log()
+
+    def set_progress(self, callback: Callable[[str, str], None] | None) -> None:
+        updater.set_progress_callback(callback)
+
+    def stage(self, version: str, *, chat_id: int | None = None, notify_msg_id: int | None = None) -> tuple[bool, str]:
+        return updater.stage_update(version, chat_id=chat_id, notify_msg_id=notify_msg_id)
+
+    def save_state(self, **fields: Any) -> None:
+        updater.save_state(**fields)
+
+    def activate(self) -> tuple[bool, str]:
+        return updater.confirm_restart()
+
+    def cancel(self) -> tuple[bool, str]:
+        return updater.cancel_staged()
+
+    def activation_is_terminal(self) -> bool:
+        # The production restart only becomes terminal after this process exits and
+        # the new process completes health verification/rollback.
+        return False
+
+
+Scheduler = Callable[[Callable[[], None], str], None]
+Clock = Callable[[], datetime]
+
+
+def _thread_scheduler(task: Callable[[], None], name: str) -> None:
+    threading.Thread(target=task, daemon=True, name=name).start()
+
+
+def _actor_key(context: ManagementContext) -> str:
+    return context.actor.session_id or context.actor.subject_id
+
+
+def _sanitize_log(value: str) -> str:
+    result = str(value or "")[-3500:]
+    for pattern in _SECRET_PATTERNS:
+        if pattern.groups == 2:
+            result = pattern.sub(r"\1[REDACTED]\2", result)
+        else:
+            result = pattern.sub(r"\1[REDACTED]", result)
+    return result
+
+
+class UpdateControl:
+    STAGE_KIND = "updates.stage"
+    ACTIVATE_KIND = "updates.activate"
+
+    def __init__(
+        self,
+        *,
+        config_gateway: ConfigGateway | None = None,
+        update_gateway: UpdateGateway | None = None,
+        audit_sink: AuditSink | None = None,
+        scheduler: Scheduler | None = None,
+        clock: Clock | None = None,
+        plan_ttl_seconds: int = 600,
+    ) -> None:
+        self._config = config_gateway or ModuleConfigGateway()
+        self._updates = update_gateway or ModuleUpdateGateway()
+        self._audit_sink = audit_sink
+        self._scheduler = scheduler or _thread_scheduler
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._plan_ttl = timedelta(seconds=plan_ttl_seconds)
+        self._operation_store: OperationStore | None = None
+        self._operation_registry: OperationRegistry | None = None
+        self._bound_registries: set[int] = set()
+        self._plans: dict[str, _ActivationPlan] = {}
+        self._idempotency: OrderedDict[tuple[str, str, str], tuple[str, str]] = OrderedDict()
+        self._lock = threading.RLock()
+
+    @property
+    def current_version(self) -> str:
+        return self._updates.current_version
+
+    def bind_operations(self, store: OperationStore, registry_: OperationRegistry) -> None:
+        identity = id(registry_)
+        if identity not in self._bound_registries:
+            registry_.register(self.STAGE_KIND, self._start_stage)
+            registry_.register(self.ACTIVATE_KIND, self._start_activate)
+            self._bound_registries.add(identity)
+        self._operation_store = store
+        self._operation_registry = registry_
+
+    @staticmethod
+    def _effective(root: dict[str, Any]) -> dict[str, Any]:
+        raw = root.get("updateChecker") or {}
+        return {
+            "enabled": bool(raw.get("enabled", True)),
+            "includePrerelease": bool(raw.get("includePrerelease", True)),
+            "autoUpdate": bool(raw.get("autoUpdate", False)),
+            "intervalSeconds": int(raw.get("intervalSeconds", 3600) or 3600),
+            "ignoredVersions": string_list(raw.get("ignoredVersions")),
+        }
+
+    @staticmethod
+    def _settings_dto(value: dict[str, Any]) -> UpdateSettings:
+        stable = {
+            "enabled": bool(value["enabled"]),
+            "includePrerelease": bool(value["includePrerelease"]),
+            "autoUpdate": bool(value["autoUpdate"]),
+            "intervalSeconds": int(value["intervalSeconds"]),
+            "ignoredVersions": string_list(value["ignoredVersions"]),
+        }
+        return UpdateSettings(
+            enabled=stable["enabled"],
+            include_prerelease=stable["includePrerelease"],
+            auto_update=stable["autoUpdate"],
+            interval_seconds=stable["intervalSeconds"],
+            ignored_versions=tuple(stable["ignoredVersions"]),
+            revision=revision_for(stable),
+        )
+
+    def get_settings(self, context: ManagementContext) -> UpdateSettings:
+        require(context, Capability.READ)
+        return self._settings_dto(self._effective(self._config.get()))
+
+    @staticmethod
+    def _validate_version(version: str, path: str = "version") -> str:
+        normalized = str(version or "").strip()
+        if not _VERSION_RE.fullmatch(normalized):
+            raise invalid_field(path, "INVALID_VERSION", "version contains unsupported characters")
+        return normalized
+
+    def update_settings(
+        self,
+        context: ManagementContext,
+        patch: dict[str, Any],
+        *,
+        expected_revision: str | None = None,
+    ) -> UpdateSettings:
+        require(context, Capability.WRITE)
+        value = copy.deepcopy(patch)
+        if "intervalSeconds" in value:
+            interval = value["intervalSeconds"]
+            if not isinstance(interval, int) or isinstance(interval, bool) or not 300 <= interval <= 604800:
+                raise invalid_field("intervalSeconds", "OUT_OF_RANGE", "must be between 300 and 604800")
+        if "ignoredVersions" in value:
+            versions = string_list(value["ignoredVersions"])
+            value["ignoredVersions"] = [self._validate_version(item, "ignoredVersions") for item in versions]
+
+        def mutate(root: dict[str, Any]) -> None:
+            current = self._settings_dto(self._effective(root))
+            ensure_revision(expected_revision, current.revision)
+            root.setdefault("updateChecker", {}).update(copy.deepcopy(value))
+
+        self._config.update(mutate)
+        audit(self._audit_sink, context, action="updates.settings.update", target="updates")
+        return self._settings_dto(self._effective(self._config.get()))
+
+    def check(self, context: ManagementContext) -> UpdateCheckResult:
+        require(context, Capability.WRITE)
+        self._updates.force_refresh()
+        result = self.cached_check(context)
+        audit(self._audit_sink, context, action="updates.check", target="updates")
+        return result
+
+    def refresh_direct(self, context: ManagementContext) -> None:
+        require(context, Capability.WRITE)
+        self._updates.force_refresh()
+        audit(self._audit_sink, context, action="updates.check", target="updates")
+
+    def set_settings_direct(self, context: ManagementContext, patch: dict[str, Any]) -> UpdateSettings:
+        require(context, Capability.WRITE)
+
+        def mutate(root: dict[str, Any]) -> None:
+            root.setdefault("updateChecker", {}).update(copy.deepcopy(patch))
+
+        self._config.update(mutate)
+        audit(self._audit_sink, context, action="updates.settings.update", target="updates")
+        return self._settings_dto(self._effective(self._config.get()))
+
+    def repository(self, context: ManagementContext) -> str:
+        require(context, Capability.READ)
+        raw = self._config.get().get("updateChecker") or {}
+        return str(raw.get("repo") or "danger-dream/Parrot")
+
+    def cached_check(self, context: ManagementContext) -> UpdateCheckResult:
+        require(context, Capability.READ)
+        cached = self._updates.cached_release()
+        candidate = cached.get("latest_version")
+        settings = self.get_settings(context)
+        stable = {
+            "currentVersion": self._updates.current_version,
+            "candidateVersion": candidate,
+            "candidateName": cached.get("latest_name"),
+            "changelog": cached.get("latest_body"),
+            "publishedAt": cached.get("latest_published_at"),
+            "prerelease": bool(cached.get("latest_prerelease")),
+            "releaseUrl": cached.get("latest_url"),
+            "newer": self._updates.is_newer(candidate),
+            "ignored": bool(candidate and candidate in settings.ignored_versions),
+        }
+        return UpdateCheckResult(
+            current_version=stable["currentVersion"],
+            candidate_version=stable["candidateVersion"],
+            candidate_name=stable["candidateName"],
+            changelog=stable["changelog"],
+            published_at=stable["publishedAt"],
+            prerelease=stable["prerelease"],
+            release_url=stable["releaseUrl"],
+            newer=stable["newer"],
+            ignored=stable["ignored"],
+            revision=revision_for(stable),
+        )
+
+    def ignore_version(
+        self,
+        context: ManagementContext,
+        version: str,
+        *,
+        expected_revision: str | None = None,
+    ) -> UpdateSettings:
+        require(context, Capability.WRITE)
+        version = self._validate_version(version)
+        ensure_revision(expected_revision, self.get_settings(context).revision)
+        self._updates.add_ignored(version)
+        audit(self._audit_sink, context, action="updates.version.ignore", target=version)
+        return self._settings_dto(self._effective(self._config.get()))
+
+    def unignore_version(
+        self,
+        context: ManagementContext,
+        version: str,
+        *,
+        expected_revision: str | None = None,
+    ) -> UpdateSettings:
+        require(context, Capability.WRITE)
+        version = self._validate_version(version)
+        ensure_revision(expected_revision, self.get_settings(context).revision)
+        if version not in self.get_settings(context).ignored_versions:
+            raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+        self._updates.remove_ignored(version)
+        audit(self._audit_sink, context, action="updates.version.unignore", target=version)
+        return self._settings_dto(self._effective(self._config.get()))
+
+    def ignore_direct(self, context: ManagementContext, version: str) -> None:
+        require(context, Capability.WRITE)
+        self._updates.add_ignored(version)
+        audit(self._audit_sink, context, action="updates.version.ignore", target=version)
+
+    def unignore_direct(self, context: ManagementContext, version: str) -> None:
+        require(context, Capability.WRITE)
+        self._updates.remove_ignored(version)
+        audit(self._audit_sink, context, action="updates.version.unignore", target=version)
+
+    def clear_ignored_direct(self, context: ManagementContext) -> UpdateSettings:
+        require(context, Capability.WRITE)
+        self._updates.clear_ignored()
+        audit(self._audit_sink, context, action="updates.versions.clear", target="ignored-versions")
+        return self._settings_dto(self._effective(self._config.get()))
+
+    @staticmethod
+    def _backup(row: dict[str, Any]) -> UpdateBackup:
+        stable = {
+            "ref": str(row.get("ref") or ""),
+            "version": str(row.get("version") or ""),
+            "targetVersion": str(row.get("target_tag") or ""),
+            "mode": str(row.get("mode") or ""),
+            "createdAt": str(row.get("ts") or ""),
+        }
+        return UpdateBackup(
+            ref=stable["ref"],
+            version=stable["version"],
+            target_version=stable["targetVersion"],
+            mode=stable["mode"],
+            created_at=stable["createdAt"],
+            revision=revision_for(stable),
+        )
+
+    def list_backups(
+        self,
+        context: ManagementContext,
+        *,
+        mode: str | None = None,
+        sort: str = "createdAtDesc",
+        page: int = 1,
+        page_size: int = 50,
+    ) -> UpdateBackupPage:
+        require(context, Capability.READ)
+        if mode is not None and mode not in {"docker", "systemd", "bare", "src"}:
+            raise invalid_field("mode", "UNKNOWN_MODE", "unsupported update mode")
+        rows = [self._backup(row) for row in self._updates.backups()]
+        if mode is not None:
+            rows = [row for row in rows if row.mode == mode]
+        rows.sort(key=lambda row: (row.created_at, row.ref), reverse=sort == "createdAtDesc")
+        total = len(rows)
+        start = (page - 1) * page_size
+        return UpdateBackupPage(
+            items=tuple(rows[start : start + page_size]),
+            page=page,
+            page_size=page_size,
+            total=total,
+            has_next=start + page_size < total,
+        )
+
+    def backups_raw(self, context: ManagementContext) -> list[dict[str, Any]]:
+        require(context, Capability.READ)
+        return self._updates.backups()
+
+    def failure_log(self, context: ManagementContext) -> UpdateFailureLog:
+        require(context, Capability.READ)
+        content = _sanitize_log(self._updates.failure_log())
+        return UpdateFailureLog(content=content, revision=revision_for({"content": content}))
+
+    def failure_log_raw(self, context: ManagementContext) -> str:
+        require(context, Capability.READ)
+        return self._updates.failure_log()
+
+    def state_raw(self, context: ManagementContext) -> dict[str, Any]:
+        require(context, Capability.READ)
+        return self._updates.state()
+
+    def state(self, context: ManagementContext) -> UpdateState:
+        require(context, Capability.READ)
+        row = self._updates.state()
+        stable = {
+            "stage": str(row.get("stage") or STAGE_IDLE),
+            "mode": str(row.get("mode") or self._updates.mode()),
+            "fromVersion": row.get("from_version"),
+            "toVersion": row.get("to_version"),
+            "targetVersion": row.get("target_tag"),
+            "message": row.get("message"),
+        }
+        return UpdateState(
+            stage=stable["stage"],
+            mode=stable["mode"],
+            from_version=stable["fromVersion"],
+            to_version=stable["toVersion"],
+            target_version=stable["targetVersion"],
+            message=stable["message"],
+            revision=revision_for(stable),
+        )
+
+    def is_newer(self, context: ManagementContext, version: str | None) -> bool:
+        require(context, Capability.READ)
+        return self._updates.is_newer(version)
+
+    def is_busy(self, context: ManagementContext) -> bool:
+        require(context, Capability.READ)
+        return self._updates.busy()
+
+    def cached_release(self, context: ManagementContext) -> dict[str, Any]:
+        require(context, Capability.READ)
+        return self._updates.cached_release()
+
+    def mode(self, context: ManagementContext) -> str:
+        require(context, Capability.READ)
+        return self._updates.mode()
+
+    def stage_direct(
+        self,
+        context: ManagementContext,
+        version: str,
+        *,
+        progress: Callable[[str, str], None],
+        chat_id: int,
+        notify_msg_id: int,
+    ) -> tuple[bool, str]:
+        require(context, Capability.UPDATE)
+        self._updates.set_progress(progress)
+        try:
+            return self._updates.stage(version, chat_id=chat_id, notify_msg_id=notify_msg_id)
+        finally:
+            self._updates.set_progress(None)
+
+    def activate_direct(
+        self,
+        context: ManagementContext,
+        *,
+        chat_id: int,
+        notify_msg_id: int,
+        before_activate: Callable[[], None],
+    ) -> tuple[bool, str] | None:
+        require(context, Capability.UPDATE)
+        if str(self._updates.state().get("stage") or "") != STAGE_STAGED:
+            return None
+        self._updates.save_state(chat_id=chat_id, notify_msg_id=notify_msg_id)
+        before_activate()
+        return self._updates.activate()
+
+    def cancel_direct(self, context: ManagementContext) -> tuple[bool, str]:
+        require(context, Capability.UPDATE)
+        return self._updates.cancel()
+
+    def _idempotent_existing(
+        self,
+        context: ManagementContext,
+        *,
+        kind: str,
+        fingerprint: str,
+    ) -> ManagementOperation | None:
+        if not context.idempotency_key:
+            raise invalid_field("Idempotency-Key", "REQUIRED", "Idempotency-Key header is required")
+        key = (_actor_key(context), kind, context.idempotency_key)
+        with self._lock:
+            existing = self._idempotency.get(key)
+        if existing is None:
+            return None
+        previous_fingerprint, operation_id = existing
+        if previous_fingerprint != fingerprint:
+            raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+        if self._operation_store is None:
+            raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY, retryable=True)
+        return self._operation_store.get(context, operation_id)
+
+    def _remember_idempotency(
+        self,
+        context: ManagementContext,
+        *,
+        kind: str,
+        fingerprint: str,
+        operation_id: str,
+    ) -> None:
+        key = (_actor_key(context), kind, context.idempotency_key or "")
+        with self._lock:
+            self._idempotency[key] = (fingerprint, operation_id)
+            self._idempotency.move_to_end(key)
+            while len(self._idempotency) > 500:
+                self._idempotency.popitem(last=False)
+
+    def stage_update(self, context: ManagementContext, version: str) -> ManagementOperation:
+        require(context, Capability.UPDATE)
+        version = self._validate_version(version)
+        fingerprint = hashlib.sha256(version.encode()).hexdigest()
+        with self._lock:
+            existing = self._idempotent_existing(context, kind=self.STAGE_KIND, fingerprint=fingerprint)
+            if existing is not None:
+                return existing
+            if self._updates.busy():
+                raise ManagementError(ManagementErrorCode.OPERATION_ALREADY_RUNNING, retryable=True)
+            if self._operation_registry is None:
+                raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY, retryable=True)
+            operation = self._operation_registry.create(
+                context,
+                kind=self.STAGE_KIND,
+                payload={"version": version, "actorKey": _actor_key(context)},
+                cancellable=False,
+            )
+            self._remember_idempotency(
+                context,
+                kind=self.STAGE_KIND,
+                fingerprint=fingerprint,
+                operation_id=operation.id,
+            )
+            return operation
+
+    def _new_plan(self, *, actor_key: str, target_version: str, revision: str) -> tuple[str, datetime]:
+        token = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        expires = self._clock() + self._plan_ttl
+        with self._lock:
+            self._plans[digest] = _ActivationPlan(
+                actor_key=actor_key,
+                revision=revision,
+                target_version=target_version,
+                expires_at=expires,
+            )
+        return token, expires
+
+    def _start_stage(self, operation_id: str, context: ManagementContext, payload: Any) -> None:
+        store = self._operation_store
+        if store is None:
+            raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY, retryable=True)
+
+        def run() -> None:
+            store.mark_running(operation_id)
+            progress_index = {
+                STAGE_BACKING_UP: 1,
+                STAGE_PULLING: 2,
+                STAGE_STAGED: 3,
+            }
+
+            def progress(stage: str, _message: str) -> None:
+                current = progress_index.get(stage)
+                if current is not None:
+                    store.update_progress(
+                        operation_id,
+                        current=current,
+                        total=3,
+                        message_code=f"UPDATE_{stage.upper()}",
+                    )
+
+            self._updates.set_progress(progress)
+            try:
+                ok, _detail = self._updates.stage(str(payload["version"]))
+            except Exception:
+                ok = False
+            finally:
+                self._updates.set_progress(None)
+            if not ok:
+                store.fail(
+                    operation_id,
+                    code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                    message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value,
+                    retryable=True,
+                )
+                return
+            state = self._state_without_auth()
+            token, expires = self._new_plan(
+                actor_key=str(payload["actorKey"]),
+                target_version=str(payload["version"]),
+                revision=state.revision,
+            )
+            store.succeed(
+                operation_id,
+                {
+                    "stagedVersion": payload["version"],
+                    "activationPlanToken": token,
+                    "expectedRevision": state.revision,
+                    "expiresAt": expires.isoformat(),
+                },
+            )
+
+        self._scheduler(run, "management-update-stage")
+        audit(self._audit_sink, context, action="updates.stage", target=operation_id, result="queued")
+
+    def _state_without_auth(self) -> UpdateState:
+        row = self._updates.state()
+        stable = {
+            "stage": str(row.get("stage") or STAGE_IDLE),
+            "mode": str(row.get("mode") or self._updates.mode()),
+            "fromVersion": row.get("from_version"),
+            "toVersion": row.get("to_version"),
+            "targetVersion": row.get("target_tag"),
+            "message": row.get("message"),
+        }
+        return UpdateState(
+            stage=stable["stage"],
+            mode=stable["mode"],
+            from_version=stable["fromVersion"],
+            to_version=stable["toVersion"],
+            target_version=stable["targetVersion"],
+            message=stable["message"],
+            revision=revision_for(stable),
+        )
+
+    def activate_staged(
+        self,
+        context: ManagementContext,
+        *,
+        plan_token: str,
+        expected_revision: str | None,
+    ) -> ManagementOperation:
+        require(context, Capability.UPDATE)
+        if not expected_revision:
+            raise invalid_field("If-Match", "REQUIRED", "If-Match header is required")
+        if not context.idempotency_key:
+            raise invalid_field("Idempotency-Key", "REQUIRED", "Idempotency-Key header is required")
+        if self._operation_registry is None:
+            raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY, retryable=True)
+        digest = hashlib.sha256(str(plan_token or "").encode()).hexdigest()
+        idempotency_key = (_actor_key(context), self.ACTIVATE_KIND, context.idempotency_key)
+        with self._lock:
+            if idempotency_key in self._idempotency:
+                raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+            plan = self._plans.get(digest)
+            if plan is None or plan.consumed:
+                raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+            if self._clock() >= plan.expires_at:
+                plan.consumed = True
+                raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+            if plan.actor_key != _actor_key(context):
+                raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+            current = self._state_without_auth()
+            if current.stage != STAGE_STAGED:
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            ensure_revision(expected_revision, current.revision)
+            ensure_revision(plan.revision, current.revision)
+            plan.consumed = True
+            try:
+                operation = self._operation_registry.create(
+                    context,
+                    kind=self.ACTIVATE_KIND,
+                    payload={"targetVersion": plan.target_version},
+                    cancellable=False,
+                )
+            except Exception:
+                plan.consumed = False
+                raise
+            self._idempotency[idempotency_key] = (digest, operation.id)
+            self._idempotency.move_to_end(idempotency_key)
+            while len(self._idempotency) > 500:
+                self._idempotency.popitem(last=False)
+        audit(self._audit_sink, context, action="updates.activate", target=operation.id, result="queued")
+        return operation
+
+    def _start_activate(self, operation_id: str, _context: ManagementContext, _payload: Any) -> None:
+        store = self._operation_store
+        if store is None:
+            raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY, retryable=True)
+
+        def run() -> None:
+            store.mark_running(operation_id)
+            store.update_progress(
+                operation_id,
+                current=1,
+                total=2,
+                message_code="UPDATE_RESTARTING",
+            )
+            try:
+                ok, _detail = self._updates.activate()
+            except Exception:
+                ok = False
+            if not ok:
+                store.fail(
+                    operation_id,
+                    code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                    message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value,
+                    retryable=True,
+                )
+                return
+            if self._updates.activation_is_terminal():
+                store.update_progress(
+                    operation_id,
+                    current=2,
+                    total=2,
+                    message_code="UPDATE_HEALTH_VERIFIED",
+                )
+                store.succeed(operation_id, {"activated": True})
+            # Production intentionally stays RUNNING until process shutdown marks the
+            # in-memory operation interrupted. The restarted process/health endpoint
+            # is authoritative; returning success here would be false success.
+
+        self._scheduler(run, "management-update-activate")
+
+    def cancel_staged(
+        self,
+        context: ManagementContext,
+        *,
+        expected_revision: str | None = None,
+    ) -> None:
+        require(context, Capability.UPDATE)
+        current = self._state_without_auth()
+        ensure_revision(expected_revision, current.revision)
+        if current.stage != STAGE_STAGED:
+            raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+        ok, _detail = self._updates.cancel()
+        if not ok:
+            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True)
+        audit(self._audit_sink, context, action="updates.staged.cancel", target="staged-update")

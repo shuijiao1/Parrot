@@ -12,8 +12,17 @@ from __future__ import annotations
 
 from typing import Optional
 
-from ... import config, status_monitor
+from ...management_control.auxiliary import get_auxiliary_controls
+from ...management_control.auxiliary.common import telegram_context
+from ...management_control.auxiliary.status_alerts import STATUS_PROVIDERS
 from .. import states, ui
+
+
+_CONTROL = get_auxiliary_controls().status_alerts
+
+
+def _ctx(chat_id: int = 0):
+    return telegram_context(chat_id)
 
 
 _PROVIDERS_ORDER = ("claude", "openai", "cloudflare")
@@ -26,18 +35,22 @@ _IMPACT_OPTIONS = (
 
 
 def _cfg() -> dict:
-    return config.get().get("statusMonitor") or {}
+    value = _CONTROL.get_settings(_ctx())
+    return {
+        "enabled": value.enabled,
+        "intervalSeconds": value.interval_seconds,
+        "targets": list(value.targets),
+        "minImpact": value.min_impact,
+        "notificationEnabled": value.notification_enabled,
+    }
 
 
-def _update_cfg(patch: dict) -> None:
-    def _mut(c):
-        sm = c.setdefault("statusMonitor", {})
-        sm.update(patch)
-    config.update(_mut)
+def _update_cfg(patch: dict, chat_id: int = 0) -> None:
+    _CONTROL.update_settings(_ctx(chat_id), patch)
 
 
 def _format_active_block() -> str:
-    snap = status_monitor.snapshot_active()
+    snap = _CONTROL.snapshot_active(_ctx())
     lines: list[str] = ["<b>当前活跃事件</b>"]
     total = 0
     for p in _PROVIDERS_ORDER:
@@ -46,13 +59,13 @@ def _format_active_block() -> str:
             continue
         total += len(incs)
         lines.append("")
-        lines.append(status_monitor._provider_tag(p))
+        lines.append(_CONTROL.provider_tag(_ctx(), p))
         for i in incs[:5]:
             name = (i.get("name") or "").strip()
             impact = (i.get("impact") or "none").lower()
             status = (i.get("status") or "").lower()
-            icon = status_monitor._IMPACT_ICON.get(impact, "📡")
-            sicon = status_monitor._STATUS_ICON.get(status, "")
+            icon = _CONTROL.impact_icon(_ctx(), impact)
+            sicon = _CONTROL.status_icon(_ctx(), status)
             short = i.get("shortlink") or ""
             lines.append(f"  {icon} {ui.escape_html(name)} · {sicon} <code>{status}</code>")
             if short:
@@ -68,8 +81,8 @@ def _main_text_and_kb() -> tuple[str, dict]:
     interval = int(cfg.get("intervalSeconds", 60) or 60)
     targets = set(cfg.get("targets") or _PROVIDERS_ORDER)
     min_impact = (cfg.get("minImpact") or "minor").lower()
-    notif_evt = ((config.get().get("notifications") or {}).get("events") or {}).get("status_alert", True)
-    muted_total = len(status_monitor.list_muted())
+    notif_evt = bool(cfg.get("notificationEnabled", True))
+    muted_total = len(_CONTROL.list_muted_raw(_ctx()))
 
     lines = [
         "📡 <b>故障订阅</b>",
@@ -105,7 +118,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
         ui.btn(f"🚦 门槛: {min_impact}", "stat:show_impact"),
     ])
     # 活跃事件：每条加一个屏蔽按钮
-    snap = status_monitor.snapshot_active()
+    snap = _CONTROL.snapshot_active(_ctx())
     for p_key in _PROVIDERS_ORDER:
         for inc in (snap.get(p_key) or [])[:5]:
             iid = inc.get("id") or ""
@@ -114,7 +127,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
                 continue
             short = ui.register_code(f"stat_mute:{p_key}:{iid}|{name}")
             rows.append([ui.btn(
-                f"🔕 屏蔽 [{status_monitor._provider_label(p_key)}] {name}",
+                f"🔕 屏蔽 [{_CONTROL.provider_label(_ctx(), p_key)}] {name}",
                 f"stat:mute:{short}",
             )])
     rows.append([
@@ -145,26 +158,17 @@ def send_new(chat_id: int) -> None:
 
 def _toggle_enabled(chat_id: int, message_id: int, cb_id: str) -> None:
     cur = bool(_cfg().get("enabled", True))
-    _update_cfg({"enabled": not cur})
+    _update_cfg({"enabled": not cur}, chat_id)
     ui.answer_cb(cb_id, "已关闭" if cur else "已开启")
     show(chat_id, message_id)
 
 
 def _toggle_target(chat_id: int, message_id: int, cb_id: str, provider: str) -> None:
-    if provider not in status_monitor.TARGETS:
+    if provider not in STATUS_PROVIDERS:
         ui.answer_cb(cb_id, "未知 provider")
         return
-    cfg = _cfg()
-    targets = list(cfg.get("targets") or list(_PROVIDERS_ORDER))
-    if provider in targets:
-        targets.remove(provider)
-        # 同步清掉内存里该 provider 的活跃记录，避免 banner 还显示旧故障
-        status_monitor.forget_provider(provider)
-        msg = f"已移除 {provider}"
-    else:
-        targets.append(provider)
-        msg = f"已添加 {provider}"
-    _update_cfg({"targets": targets})
+    _, removed = _CONTROL.toggle_target(_ctx(chat_id), provider)
+    msg = f"已移除 {provider}" if removed else f"已添加 {provider}"
     ui.answer_cb(cb_id, msg)
     show(chat_id, message_id)
 
@@ -187,7 +191,7 @@ def _on_interval_input(chat_id: int, text: str) -> None:
     except ValueError:
         ui.send(chat_id, "❌ 需要 ≥10 的整数，请重新输入：")
         return
-    _update_cfg({"intervalSeconds": v})
+    _update_cfg({"intervalSeconds": v}, chat_id)
     states.pop_state(chat_id)
     ui.send(chat_id, f"✅ 轮询间隔已更新为 <code>{v}s</code>")
     send_new(chat_id)
@@ -213,7 +217,7 @@ def _set_impact(chat_id: int, message_id: int, cb_id: str, value: str) -> None:
     if value not in valid:
         ui.answer_cb(cb_id, "无效值")
         return
-    _update_cfg({"minImpact": value})
+    _update_cfg({"minImpact": value}, chat_id)
     ui.answer_cb(cb_id, f"门槛已切为 {value}")
     show(chat_id, message_id)
 
@@ -222,12 +226,7 @@ def _refresh(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id, "刷新中…")
     # 同步拉一次（短时间，可接受）
     try:
-        for p in _cfg().get("targets") or list(_PROVIDERS_ORDER):
-            if p in status_monitor.TARGETS:
-                # 已 prime 过的 provider 走 push 模式；首次刷新仍只静默
-                first = p not in status_monitor._initialized_providers
-                status_monitor._process_provider(p, push=not first)
-                status_monitor._initialized_providers.add(p)
+        _CONTROL.refresh_direct(_ctx(chat_id))
     except Exception as exc:
         ui.send(chat_id, f"刷新失败: <code>{ui.escape_html(str(exc))}</code>")
         return
@@ -238,16 +237,16 @@ def _history(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id, "拉取中…")
     lines = ["📜 <b>最近事件（各 provider 最多 5 条）</b>"]
     for p in _cfg().get("targets") or list(_PROVIDERS_ORDER):
-        if p not in status_monitor.TARGETS:
+        if p not in STATUS_PROVIDERS:
             continue
         try:
-            incs = status_monitor.list_recent_incidents(p, limit=5)
+            incs = _CONTROL.recent_direct(_ctx(chat_id), p, limit=5)
         except Exception as exc:
             incs = []
-            lines.append(f"\n{status_monitor._provider_tag(p)} — 拉取失败: <code>{ui.escape_html(str(exc))}</code>")
+            lines.append(f"\n{_CONTROL.provider_tag(_ctx(), p)} — 拉取失败: <code>{ui.escape_html(str(exc))}</code>")
             continue
         lines.append("")
-        lines.append(status_monitor._provider_tag(p))
+        lines.append(_CONTROL.provider_tag(_ctx(), p))
         if not incs:
             lines.append("  (空)")
             continue
@@ -255,8 +254,8 @@ def _history(chat_id: int, message_id: int, cb_id: str) -> None:
             name = (i.get("name") or "").strip()
             impact = (i.get("impact") or "none").lower()
             status = (i.get("status") or "").lower()
-            icon = status_monitor._IMPACT_ICON.get(impact, "📡")
-            sicon = status_monitor._STATUS_ICON.get(status, "")
+            icon = _CONTROL.impact_icon(_ctx(), impact)
+            sicon = _CONTROL.status_icon(_ctx(), status)
             created = i.get("created_at") or ""
             lines.append(
                 f"  {icon} {ui.escape_html(name)}\n"
@@ -280,7 +279,7 @@ def _mute_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
     if not provider or not iid:
         ui.answer_cb(cb_id, "解析失败")
         return
-    status_monitor.mute_incident(provider, iid, name=name)
+    _CONTROL.mute_direct(_ctx(chat_id), provider, iid, name)
     ui.answer_cb(cb_id, f"已屏蔽: {name[:20]}")
     show(chat_id, message_id)
 
@@ -288,7 +287,7 @@ def _mute_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
 def _show_muted_list(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
     if cb_id is not None:
         ui.answer_cb(cb_id)
-    rows_data = status_monitor.list_muted()
+    rows_data = _CONTROL.list_muted_raw(_ctx(chat_id))
     if not rows_data:
         text = "🔕 <b>已屏蔽列表</b>\n\n(当前无屏蔽)"
         ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([
@@ -305,10 +304,10 @@ def _show_muted_list(chat_id: int, message_id: int, cb_id: Optional[str] = None)
         name = r["name"] or "(unnamed)"
         ts = r["muted_at"]
         when = _dt.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
-        lines.append(f"{status_monitor._provider_tag(prov)} {ui.escape_html(name[:60])}")
+        lines.append(f"{_CONTROL.provider_tag(_ctx(chat_id), prov)} {ui.escape_html(name[:60])}")
         lines.append(f"  <code>{ui.escape_html(iid)}</code> · 屏蔽于 {when}")
         short = ui.register_code(f"stat_unmute:{prov}:{iid}")
-        kb_rows.append([ui.btn(f"✅ 解除 [{status_monitor._provider_label(prov)}] {name[:25]}",
+        kb_rows.append([ui.btn(f"✅ 解除 [{_CONTROL.provider_label(_ctx(chat_id), prov)}] {name[:25]}",
                                f"stat:unmute:{short}")])
     if len(rows_data) > 20:
         lines.append(f"\n(仅显示前 20 条，共 {len(rows_data)} 条)")
@@ -326,7 +325,7 @@ def _unmute_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
     if not provider or not iid:
         ui.answer_cb(cb_id, "解析失败")
         return
-    status_monitor.unmute_incident(provider, iid)
+    _CONTROL.unmute_direct(_ctx(chat_id), provider, iid)
     ui.answer_cb(cb_id, "已解除")
     _show_muted_list(chat_id, message_id, cb_id=None)  # 已 answer 过；不再 answer
 
