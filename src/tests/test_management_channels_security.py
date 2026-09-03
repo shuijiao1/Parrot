@@ -18,9 +18,23 @@ from src.tests.test_management_channels_api import (
 
 _ASSIGNMENT_KEYS = (
     "credential",
+    "Credential",
+    "CREDENTIAL",
+    "exchangeCredential",
+    "ExchangeCredential",
+    "exchange_credential",
+    "exchange-credential",
+    "EXCHANGECREDENTIAL",
+    "EXCHANGE_CREDENTIAL",
+    "EXCHANGE-CREDENTIAL",
+    "deploymentCredential",
+    "deployment_credential",
+    "deployment-credential",
+    "DEPLOYMENTCREDENTIAL",
     "exchangeSecret",
     "exchange_secret",
     "exchange-secret",
+    "EXCHANGESECRET",
     "challengeSecret",
     "challenge_secret",
     "challenge-secret",
@@ -33,14 +47,20 @@ _ASSIGNMENT_KEYS = (
     "rotationToken",
     "rotation_token",
     "rotation-token",
+    "ROTATIONTOKEN",
     "signingKey",
     "signing_key",
     "signing-key",
+    "SIGNINGKEY",
     "webhookSecret",
     "webhook_secret",
     "webhook-secret",
+    "WEBHOOKSECRET",
 )
-_ORDINARY_CONTEXT = "ordinary token count=42; token usage is 42"
+_ORDINARY_CONTEXT = (
+    "ordinary token count=42; token usage is 42; basic routing mode; "
+    "Basic routing mode; Bearer support is enabled"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -64,20 +84,88 @@ def _assignment_error_samples():
     structured = json.dumps(assignments, separators=(",", ":"))
     double_encoded = json.dumps(structured)
     escaped_fragment = structured.replace('"', r'\"')
+    auth_markers = ("bearer-sensitive-marker", "basic-sensitive-marker")
     samples = (
         f"provider failed; {_ORDINARY_CONTEXT}; {equals}; retry later",
         f"provider failed; {_ORDINARY_CONTEXT}; {colons}; retry later",
         f"provider failed; {_ORDINARY_CONTEXT}; {structured}; retry later",
         f"provider failed; {_ORDINARY_CONTEXT}; {double_encoded}; retry later",
         f"provider failed; {_ORDINARY_CONTEXT}; payload={escaped_fragment}; retry later",
+        f"provider failed; {_ORDINARY_CONTEXT}; Bearer {auth_markers[0]}; "
+        f"Basic {auth_markers[1]}; retry later",
     )
-    return markers, samples
+    return markers + auth_markers, samples
+
+
+@pytest.mark.parametrize("key", _ASSIGNMENT_KEYS)
+def test_credential_key_classifier_has_exact_assignment_output(key):
+    assert redact_credential_text(f"{key}=marker") == f"{key}=[REDACTED]"
+    assert redact_credential_text(f'{{"{key}":"marker"}}') == (
+        f'{{"{key}":"[REDACTED]"}}'
+    )
+
+
+@pytest.mark.parametrize(
+    "ordinary",
+    (
+        "basic routing mode",
+        "Basic routing mode",
+        "Bearer support is enabled",
+        "Bearer support is enabled.",
+        "monkey=value",
+        "keyboard: qwerty",
+        "secret rotation completed",
+        "token count=42; key count: 3; token usage is 42",
+    ),
+)
+def test_business_text_is_preserved_exactly(ordinary):
+    assert redact_credential_text(ordinary) == ordinary
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    (
+        ("Bearer marker", "Bearer [REDACTED]"),
+        (
+            "request failed: Bearer bearer-sensitive-marker; retry",
+            "request failed: Bearer [REDACTED]; retry",
+        ),
+        (
+            "request failed: Basic basic-sensitive-marker. retry",
+            "request failed: Basic [REDACTED]. retry",
+        ),
+        (
+            "Basic dXNlcjpwYXNz denied",
+            "Basic [REDACTED] denied",
+        ),
+        (
+            "Bearer header-segment.payload-segment.signature-segment",
+            "Bearer [REDACTED]",
+        ),
+        (
+            'Basic "QWxhZGRpbjpvcGVuIHNlc2FtZQ==" denied',
+            'Basic "[REDACTED]" denied',
+        ),
+        (
+            "upstream returned Bearer aZ9kLm2Qp7Vx4Nc8Rt1",
+            "upstream returned Bearer [REDACTED]",
+        ),
+        (
+            "Bearer abcdefghijklmnopqrstuvwxyzabcdef",
+            "Bearer [REDACTED]",
+        ),
+    ),
+)
+def test_auth_scheme_redacts_only_credential_shaped_values_with_exact_output(
+    source, expected,
+):
+    assert redact_credential_text(source) == expected
 
 
 def test_assignment_credential_families_are_redacted_without_business_false_positives():
     ordinary = (
-        "ordinary token count=42; token usage is 42; "
-        "secret rotation completed; keyboard key count=3; monkey=value"
+        f"{_ORDINARY_CONTEXT}; secret rotation completed; "
+        "keyboard key count=3; monkey=value"
     )
     assert redact_credential_text(ordinary) == ordinary
 
