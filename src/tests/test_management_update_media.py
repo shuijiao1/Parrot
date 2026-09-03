@@ -314,7 +314,10 @@ def test_update_failure_log_sanitizer_redacts_generic_secret_keys_exactly():
         (f"secret='{marker}'", "secret='[REDACTED]'"),
         (f"credential={marker}", "credential=[REDACTED]"),
         (f"exchangeSecret={marker}", "exchangeSecret=[REDACTED]"),
+        (f"exchangeCredential={marker}", "exchangeCredential=[REDACTED]"),
+        (f"exchange_credential={marker}", "exchange_credential=[REDACTED]"),
         (f"EXCHANGESECRET:{marker}", "EXCHANGESECRET:[REDACTED]"),
+        (f"upstreamSecret={marker}", "upstreamSecret=[REDACTED]"),
         (f"challengeCredential={marker}", "challengeCredential=[REDACTED]"),
         (f"webhookToken={marker}", "webhookToken=[REDACTED]"),
         (f"WebhookKey={marker}", "WebhookKey=[REDACTED]"),
@@ -337,12 +340,29 @@ def test_update_failure_log_sanitizer_redacts_generic_secret_keys_exactly():
         assert _sanitize_log(raw) == expected
 
 
+@pytest.mark.parametrize(
+    "value",
+    (
+        "monkey=value",
+        "MONKEY=value",
+        "hockey=goal",
+        "turkey=dinner",
+        "donkey=value",
+        "passkey=value",
+        "channelKey=channel-1",
+    ),
+)
+def test_update_failure_log_sanitizer_preserves_non_secret_assignments_exactly(value):
+    assert _sanitize_log(value) == value
+
+
 def test_update_failure_log_sanitizer_preserves_business_text_and_targets_auth_credentials():
     ordinary = "ordinary token count=42 basic routing mode; token usage is 42"
     assert _sanitize_log(ordinary) == ordinary
 
     non_auth = (
         "Bearer capacity planning is enabled",
+        "Bearer support is enabled",
         "bearer routing mode selected",
         "Basic routing mode",
         "basic authentication mode is configured",

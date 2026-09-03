@@ -44,31 +44,43 @@ STAGE_ROLLED_BACK = "rolled_back"
 _ACTIVE_STAGES = {STAGE_BACKING_UP, STAGE_PULLING, STAGE_RESTARTING, STAGE_VERIFYING}
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _REDACTED = "[REDACTED]"
-_SECRET_SUFFIX_PATTERN = r"(?:token|key|secret|credential)"
-_SECRET_KEY_PATTERN = (
-    rf"(?:{_SECRET_SUFFIX_PATTERN}|[a-z0-9]+{_SECRET_SUFFIX_PATTERN}|"
-    rf"(?:[a-z0-9]+[-_.])+(?:{_SECRET_SUFFIX_PATTERN}|password)|"
-    r"session|password|passwd|cookie|set[-_]?cookie)"
+_SECRET_SUFFIX_PATTERN = r"(?i:token|key|secret|credential)"
+_KNOWN_CONCATENATED_SECRET_KEY_PATTERN = (
+    r"(?i:api(?:token|key)|xapikey|accesstoken|refreshtoken|idtoken|"
+    r"managementkey|bottoken|githubtoken|clientsecret|sessiontoken|"
+    r"exchange(?:secret|credential)|challengecredential|upstreamsecret|"
+    r"webhook(?:token|key|secret|credential))"
 )
-_ALL_SECRET_KEY_PATTERN = rf"(?:{_SECRET_KEY_PATTERN}|authorization|proxy[-_]?authorization)"
+# Keep known credential aliases above. Other generic suffixes require a real
+# case transition; generic camel-case ``Key`` is too ambiguous (``channelKey``).
+_CAMEL_SECRET_KEY_PATTERN = r"[A-Za-z0-9]*[a-z0-9](?:Token|Secret|Credential)"
+_SECRET_KEY_PATTERN = (
+    rf"(?:{_SECRET_SUFFIX_PATTERN}|{_KNOWN_CONCATENATED_SECRET_KEY_PATTERN}|"
+    rf"{_CAMEL_SECRET_KEY_PATTERN}|"
+    rf"(?:[A-Za-z0-9]+[-_.])+(?:{_SECRET_SUFFIX_PATTERN}|(?i:password))|"
+    r"(?i:session|password|passwd|cookie|set[-_]?cookie))"
+)
+_ALL_SECRET_KEY_PATTERN = (
+    rf"(?:{_SECRET_KEY_PATTERN}|(?i:authorization|proxy[-_]?authorization))"
+)
 _SECRET_KEY_WITH_BOUNDARIES = rf"(?<![A-Za-z0-9_-]){_SECRET_KEY_PATTERN}(?![A-Za-z0-9_-])"
 _ALL_SECRET_KEY_WITH_BOUNDARIES = rf"(?<![A-Za-z0-9_-]){_ALL_SECRET_KEY_PATTERN}(?![A-Za-z0-9_-])"
 _URL_USERINFO_RE = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s?#@]+@")
 _ESCAPED_JSON_SECRET_RE = re.compile(
-    rf"(?i)((?:\\[\"']){_ALL_SECRET_KEY_PATTERN}(?:\\[\"'])\s*:\s*)(\\[\"'])(.*?)\2"
+    rf"((?:\\[\"']){_ALL_SECRET_KEY_PATTERN}(?:\\[\"'])\s*:\s*)(\\[\"'])(.*?)\2"
 )
 _JSON_SECRET_RE = re.compile(
-    rf"(?i)((?:[\"']){_ALL_SECRET_KEY_PATTERN}(?:[\"'])\s*:\s*)([\"'])(.*?)\2"
+    rf"((?:[\"']){_ALL_SECRET_KEY_PATTERN}(?:[\"'])\s*:\s*)([\"'])(.*?)\2"
 )
 _QUOTED_SECRET_RE = re.compile(
-    rf"(?i)({_ALL_SECRET_KEY_WITH_BOUNDARIES}\s*[:=]\s*)([\"'])(.*?)\2"
+    rf"({_ALL_SECRET_KEY_WITH_BOUNDARIES}\s*[:=]\s*)([\"'])(.*?)\2"
 )
 _AUTH_ASSIGNMENT_RE = re.compile(
     r"(?i)((?<![A-Za-z0-9_-])(?:proxy[-_]?authorization|authorization)"
     r"(?![A-Za-z0-9_-])\s*=\s*)((?:bearer|basic)\s+)?[^\s,;}\]]+"
 )
 _PLAIN_SECRET_RE = re.compile(
-    rf"(?i)({_SECRET_KEY_WITH_BOUNDARIES}\s*[:=]\s*)[^\s\"',;}}\]]+"
+    rf"({_SECRET_KEY_WITH_BOUNDARIES}\s*[:=]\s*)[^\s\"',;}}\]]+"
 )
 _SECRET_HEADER_RE = re.compile(
     r"(?i)(\b(?:proxy[-_]?authorization|authorization|set-cookie|cookie)\b\s*:\s*)[^\r\n]*"
