@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import itertools
 import json
 from pathlib import Path
 import re
@@ -196,6 +197,10 @@ def _run_scheduler(case, monkeypatch):
 
 def _run_view_token_lock(case, monkeypatch):
     menu_cache.reset_for_tests()
+    # reset_for_tests clears subscribers/locks but intentionally leaves the
+    # process-wide monotonic token source alive. Pin that dynamic boundary so
+    # this strict trace is independent of earlier tests in the same process.
+    monkeypatch.setattr(menu_cache, "_view_counter", itertools.count(1))
     events: list[str] = []
     first = menu_cache.begin_view(42, 77)
     second = menu_cache.begin_view(42, 77)

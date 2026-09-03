@@ -97,6 +97,11 @@ def _clear_domain_state() -> None:
     scorer.init()
     affinity.init()
     affinity.client_init()
+    with channel_state.mutation_lock, concurrency._slots_guard:
+        concurrency._slots.clear()
+        concurrency._retired_keys.clear()
+        concurrency._retired_limits.clear()
+        concurrency._deleted_retire_targets.clear()
     apikey_limiter._slots.clear()
     apikey_limiter._queued_body_bytes_by_key.clear()
     apikey_limiter._queued_body_spool_bytes_by_key.clear()
@@ -133,6 +138,14 @@ def _install_config(initial: dict[str, Any]) -> None:
         }
         for key in CONFIG_KEYS:
             cfg[key] = deepcopy(initial.get(key, defaults[key]))
+        # This setting participates in generation retirement but is intentionally
+        # outside the segment's business-state snapshot. Pin the production
+        # default so a prior test cannot change the captured frozen limit.
+        cfg["concurrency"] = deepcopy(initial.get("concurrency", {
+            "enabled": True,
+            "queueWaitSeconds": 30,
+            "defaultMaxConcurrent": 0,
+        }))
     config.update(mutate)
     registry.rebuild_from_config()
 
