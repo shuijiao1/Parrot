@@ -14,7 +14,12 @@ from __future__ import annotations
 import time
 
 from ... import concurrency, config, log_db
+from ...management_control.observability import DEFAULT_STATS_CONTROL, telegram_context
 from .. import menu_cache, ui
+
+
+_CONTROL = DEFAULT_STATS_CONTROL
+_CONTEXT = telegram_context()
 
 
 _VALID_PERIODS = ("0", "3", "7", "month")
@@ -426,7 +431,7 @@ def _render_overall(result: dict, period: str,
     header = f"📊 <b>统计 — {_PERIOD_LABELS.get(period, period)}</b>"
 
     # 读可见性配置
-    vis = (config.get().get("telegram") or {}).get("statsVisibility") or {}
+    vis = _CONTROL.get_preferences(_CONTEXT)
     show_by_channel = bool(vis.get("byChannel", True))
     show_by_model = bool(vis.get("byModel", True))
     show_by_apikey = bool(vis.get("byApiKey", True))
@@ -436,9 +441,8 @@ def _render_overall(result: dict, period: str,
     sections: list[str] = [header]
 
     # 并发概要（启用时）
-    cc_cfg = config.get().get("concurrency") or {}
-    if bool(cc_cfg.get("enabled", True)):
-        totals = concurrency.totals()
+    if _CONTROL.concurrency_enabled(_CONTEXT):
+        totals = _CONTROL.concurrency_totals(_CONTEXT)
         if totals["in_flight"] > 0 or totals["waiting"] > 0:
             sections.append(
                 f"⚡ 并发: 在途 <b>{totals['in_flight']}</b>"
@@ -510,10 +514,9 @@ def _channel_family_icon(channel_key: str) -> str:
         provider = ui.channel_provider(channel_key)
         return f"{provider_icon} {ui.escape_html(ui.provider_label(provider))}"
     try:
-        from ...channel import registry
-        ch = registry.get_channel(channel_key)
-        if ch is not None:
-            fam = ui.family_of(getattr(ch, "protocol", None))
+        protocol = _CONTROL.channel_family(_CONTEXT, channel_key)
+        if protocol:
+            fam = ui.family_of(protocol)
             if fam:
                 return ui.family_tag(fam)
     except Exception:
@@ -717,7 +720,7 @@ def view(chat_id: int, message_id: int, cb_id: str,
         # 今日/本月由主动预热负责；3/7 天只排入同一个串行队列。
         if period not in ("0", "month"):
             menu_cache.PERIOD_STATS.request(
-                key, lambda: log_db.stats_period_snapshot(since),
+                key, lambda: _CONTROL.period_snapshot_since(_CONTEXT, since),
             )
             ui.answer_cb(cb_id, "统计正在准备，请稍后再试")
         else:
@@ -730,7 +733,7 @@ def view(chat_id: int, message_id: int, cb_id: str,
     ui.edit(chat_id, message_id, _maybe_suffix_status_banner(text), reply_markup=kb)
     if period not in ("0", "month") and not cached.fresh:
         menu_cache.PERIOD_STATS.request(
-            key, lambda: log_db.stats_period_snapshot(since),
+            key, lambda: _CONTROL.period_snapshot_since(_CONTEXT, since),
         )
 
 
@@ -790,12 +793,7 @@ _VIS_ITEMS = [
 
 def _vis_get() -> dict:
     """拿到当前可见性配置，缺失字段全填 True。"""
-    from ... import config as _cfg
-    tg = _cfg.get().get("telegram") or {}
-    cur = dict(tg.get("statsVisibility") or {})
-    for k, *_ in _VIS_ITEMS:
-        cur.setdefault(k, True)
-    return cur
+    return _CONTROL.get_preferences(_CONTEXT)
 
 
 def _vis_text_and_kb(period: str) -> tuple[str, dict]:
@@ -839,14 +837,8 @@ def toggle_visibility(chat_id: int, message_id: int, cb_id: str,
     if key not in valid_keys:
         ui.answer_cb(cb_id, "无效项")
         return
-    from ... import config as _cfg
     cur = _vis_get()
     new_val = not bool(cur.get(key, True))
-
-    def _mut(c):
-        tg = c.setdefault("telegram", {})
-        sv = tg.setdefault("statsVisibility", {})
-        sv[key] = new_val
-    _cfg.update(_mut)
+    _CONTROL.update_preferences(_CONTEXT, {key: new_val})
     ui.answer_cb(cb_id, "已显示" if new_val else "已隐藏")
     view_visibility(chat_id, message_id, "", period)

@@ -17,7 +17,12 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from ... import config, log_db, oauth_manager
+from ...management_control.observability import DEFAULT_LOGS_CONTROL, telegram_context
 from .. import log_inspector, states, ui
+
+
+_CONTROL = DEFAULT_LOGS_CONTROL
+_CONTEXT = telegram_context()
 
 
 _LIST_PAGE_SIZE = 6
@@ -173,10 +178,13 @@ def _active_filters(state: dict) -> dict:
 def _page_rows(state: dict) -> tuple[list[dict], int, int, int, dict]:
     st = _normalize_list_state(state)
     filters = _active_filters(st)
-    total = log_db.recent_logs_count(**filters)
+    total = _CONTROL.telegram_count(_CONTEXT, **filters)
     page, total_pages = _clamp_page(st["p"], total)
     st["p"] = page
-    rows = log_db.recent_logs(_LIST_PAGE_SIZE, offset=(page - 1) * _LIST_PAGE_SIZE, **filters)
+    rows = _CONTROL.telegram_recent(
+        _CONTEXT, limit=_LIST_PAGE_SIZE,
+        offset=(page - 1) * _LIST_PAGE_SIZE, **filters,
+    )
     return rows, total, page, total_pages, st
 
 
@@ -237,16 +245,16 @@ def _filter_summary(kind: str, values: list[str]) -> str:
 def _api_key_options() -> list[str]:
     opts = []
     try:
-        opts.extend((config.get().get("apiKeys") or {}).keys())
+        opts.extend(_CONTROL.configured_api_keys(_CONTEXT))
     except Exception:
         pass
-    opts.extend(log_db.recent_log_values("apikey"))
+    opts.extend(_CONTROL.recent_values(_CONTEXT, "apikey"))
     return _norm_values(opts)
 
 
 def _model_options() -> list[str]:
     # parrot-test* 是内部/历史测试模型（如上下文溢出探针），不展示给用户筛选。
-    return [m for m in _norm_values(log_db.recent_log_values("model"))
+    return [m for m in _norm_values(_CONTROL.recent_values(_CONTEXT, "model"))
             if not m.startswith("parrot-test")]
 
 
@@ -258,17 +266,7 @@ def _channel_options() -> list[str]:
     """
     opts: list[str] = []
     try:
-        for ch in config.get().get("channels") or []:
-            name = str(ch.get("name") or "").strip()
-            if name:
-                opts.append(f"api:{name}")
-    except Exception:
-        pass
-    try:
-        for acc in oauth_manager.list_accounts():
-            ak = oauth_manager._account_key(acc)
-            if ak:
-                opts.append(f"oauth:{ak}")
+        opts.extend(_CONTROL.configured_channels(_CONTEXT))
     except Exception:
         pass
     return _norm_values(opts)
@@ -819,7 +817,7 @@ def _render_detail(detail: dict) -> str:
     stored_detail = detail.get("detail") or {}
     if isinstance(stored_detail, dict):
         cost_row["response_body"] = stored_detail.get("response_body")
-    cost_metrics = log_db.cost_for_log(cost_row)
+    cost_metrics = _CONTROL.cost_for_log(_CONTEXT, cost_row)
 
     if status == "success":
         lines.extend(["", "<b>Tokens</b>"])
@@ -985,7 +983,7 @@ def show_detail(chat_id: int, message_id: int, cb_id: str, short: str,
                 reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", _list_cb(list_state))]]))
         return
     try:
-        detail = log_db.log_detail(rid)
+        detail = _CONTROL.raw_detail_for_telegram(_CONTEXT, rid)
     except Exception as exc:
         ui.edit(chat_id, message_id, f"❌ 查询失败: <code>{ui.escape_html(str(exc))}</code>",
                 reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", _list_cb(list_state))]]))
@@ -1000,7 +998,7 @@ def show_detail(chat_id: int, message_id: int, cb_id: str, short: str,
     if len(detail_pages) > 1:
         text += f"\n\n<i>详情第 {detail_page}/{len(detail_pages)} 页</i>"
     rows: list[list[dict]] = []
-    if config.get().get("logStoreBodies", True) is not False:
+    if _CONTROL.log_store_bodies(_CONTEXT):
         stored_detail = detail.get("detail") or {}
         body_row: list[dict] = []
         if isinstance(stored_detail, dict) and stored_detail.get("request_body") is not None:
@@ -1073,7 +1071,7 @@ def _raw_for_kind(detail: dict, kind: str):
 def _items_for_state(state: dict) -> tuple[str, list[dict], str]:
     rid = str(state.get("r") or "")
     kind = "request" if state.get("k") == "request" else "response"
-    detail = log_db.log_detail(rid)
+    detail = _CONTROL.raw_detail_for_telegram(_CONTEXT, rid)
     raw = _raw_for_kind(detail, kind)
     if not raw:
         return rid, [], ""

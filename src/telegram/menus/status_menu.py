@@ -18,7 +18,12 @@ from ... import affinity, apikey_limiter, concurrency, config, cooldown, load_ba
 from ...oauth_ids import account_key as _account_key
 from ...openai.codex_constants import codex_cli_version
 from ...channel import registry
+from ...management_control.observability import DEFAULT_STATUS_CONTROL, telegram_context
 from .. import ui
+
+
+_CONTROL = DEFAULT_STATUS_CONTROL
+_CONTEXT = telegram_context()
 
 
 _SERVICE_START_TS = time.time()
@@ -45,15 +50,15 @@ def _channel_overview() -> dict:
         "total_all": 总数（合计；family=None 的渠道也算进来，用于单独兜底展示）,
       }
     """
-    chs = registry.all_channels()
+    chs = _CONTROL.channels(_CONTEXT)
     cd_keys: set[str] = set()
     perm_keys: set[str] = set()
     quota_cooldown_keys: set[str] = set()
-    for e in cooldown.active_entries():
+    for e in _CONTROL.cooldowns(_CONTEXT):
         cd_keys.add(e["channel_key"])
         if e["cooldown_until"] == -1:
             perm_keys.add(e["channel_key"])
-        elif quota_errors.active_quota_cooldown(e):
+        elif _CONTROL.active_quota_cooldown(_CONTEXT, e):
             quota_cooldown_keys.add(e["channel_key"])
 
     def _new_bucket() -> dict:
@@ -94,9 +99,9 @@ def _channel_overview() -> dict:
 def _problem_channels() -> list[str]:
     """问题渠道（含原因），用于"⚠ 问题渠道"区。"""
     out: list[str] = []
-    chs = registry.all_channels()
+    chs = _CONTROL.channels(_CONTEXT)
     cd_map: dict[str, list[dict]] = {}
-    for e in cooldown.active_entries():
+    for e in _CONTROL.cooldowns(_CONTEXT):
         cd_map.setdefault(e["channel_key"], []).append(e)
 
     for ch in chs:
@@ -123,8 +128,8 @@ def _problem_channels() -> list[str]:
             ec = int(e.get("error_count") or 0)
             if e["cooldown_until"] == -1:
                 out.append(f"• {icon} {short} ({model}) — 永久冷却 · 累计失败 {ec} 次")
-            elif quota_errors.active_quota_cooldown(e):
-                reset = quota_errors.format_bjt_ms(e["cooldown_until"], compact=True)
+            elif _CONTROL.active_quota_cooldown(_CONTEXT, e):
+                reset = _CONTROL.format_quota_reset_bjt(_CONTEXT, e["cooldown_until"])
                 out.append(
                     f"• 🟠 {short} ({model}) — <b>配额冷却</b>\n"
                     f"  恢复 {reset} · 周/月额度耗尽（1310）"
@@ -143,16 +148,16 @@ def _fastest_channels_by_family(top_per_family: int = 5) -> dict:
     返回 {"anthropic": [...], "openai": [...]}
     每个元素为 (f"{channel_key}|{model}", {"rate":.., "avg_first_byte_ms":..., ...})
     """
-    chs = registry.all_channels()
+    chs = _CONTROL.channels(_CONTEXT)
     ch_by_key = {ch.key: ch for ch in chs}
     enabled_keys = {ch.key for ch in chs if ch.enabled and not ch.disabled_reason}
     if not enabled_keys:
         return {"anthropic": [], "openai": []}
     cd_pairs: set[tuple[str, str]] = set()
-    for e in cooldown.active_entries():
+    for e in _CONTROL.cooldowns(_CONTEXT):
         cd_pairs.add((e["channel_key"], e["model"]))
 
-    snapshot = scorer.snapshot()
+    snapshot = _CONTROL.scorer_snapshot(_CONTEXT)
     by_family: dict[str, list] = {"anthropic": [], "openai": []}
     for stat in snapshot:
         ck = stat["channel_key"]
@@ -189,14 +194,14 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
                            + codex_primary / codex_secondary（codex 专属，更精细）
     """
     out: list[str] = []
-    cfg = config.get()
+    cfg = _CONTROL.config_snapshot(_CONTEXT)
     account_keys = [
         _account_key(a) for a in cfg.get("oauthAccounts", [])
         if a.get("email") and not a.get("disabled_reason")
-        and oauth_manager.provider_of(a) in ("claude", "openai", "xai", "cursor")
+        and _CONTROL.provider_of(_CONTEXT, a) in ("claude", "openai", "xai", "cursor")
     ]
     if account_keys:
-        oauth_manager.ensure_quota_fresh_sync(account_keys)
+        _CONTROL.refresh_telegram_quota(_CONTEXT, account_keys)
     for acc in cfg.get("oauthAccounts", []):
         email = acc.get("email")
         if not email:
@@ -204,11 +209,11 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
         if acc.get("disabled_reason"):
             continue
         ak = _account_key(acc)
-        row = state_db.quota_load(ak)
+        row = _CONTROL.quota_row(_CONTEXT, ak)
         if not row:
             continue
 
-        provider = oauth_manager.provider_of(acc)
+        provider = _CONTROL.provider_of(_CONTEXT, acc)
         if provider == "openai":
             # OpenAI OAuth 没有 sonnet/opus；使用 five_hour / seven_day（通用）
             # + codex_primary / codex_secondary（codex 专属）
@@ -221,7 +226,7 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
             }
         elif provider == "claude":
             # Anthropic: 5h / 7d / Sonnet / Opus / Fable
-            fable_util, _fable_reset = oauth_manager.fable_display_from_quota_row(row)
+            fable_util, _fable_reset = _CONTROL.fable_display(_CONTEXT, row)
             utils = {
                 "5h": row.get("five_hour_util"),
                 "7d": row.get("seven_day_util"),
@@ -233,7 +238,7 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
             # Grok/xAI: 官方 weekly credits 映射到通用 7d 缓存列。
             utils = {"周额度": row.get("seven_day_util")}
         elif provider == "cursor":
-            usage = oauth_manager.usage_from_quota_row(row)
+            usage = _CONTROL.usage_from_quota(_CONTEXT, row)
             cursor = usage.get("cursor") if isinstance(usage.get("cursor"), dict) else {}
             utils = {
                 "总额度": cursor.get("total_utilization"),
@@ -263,12 +268,7 @@ def _today_snapshot_by_family() -> dict:
 
     def _snap(fam: str | None) -> dict:
         try:
-            r = log_db.stats_summary(
-                since_ts=since,
-                family=fam,
-                summary_top_limit=0,
-                include_cost=False,
-            )
+            r = _CONTROL.stats_summary(_CONTEXT, since_ts=since, family=fam)
             o = r.get("overall") or {}
             return {
                 "total": int(o.get("total") or 0),
@@ -295,7 +295,7 @@ def _month_tps_by_channel_model() -> dict:
     bjt = timezone(timedelta(hours=8))
     month_start = datetime.now(bjt).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     try:
-        return log_db.tps_by_channel_model(since_ts=month_start.timestamp())
+        return _CONTROL.tps_by_channel_model(_CONTEXT, since_ts=month_start.timestamp())
     except Exception:
         return {}
 
@@ -381,12 +381,12 @@ def _fmt_aklim_seconds(seconds: int) -> str:
 
 
 def _apikey_limiter_block() -> list[str]:
-    totals = apikey_limiter.totals()
+    totals = _CONTROL.concurrency_snapshot(_CONTEXT)["apiKeyTotals"]
     out = [
         f"  在途 <b>{totals['in_flight']}</b> · 排队 <b>{totals['waiting']}</b> · 追踪 {totals['tracked_keys']} 个 Key",
     ]
     interesting = [
-        r for r in apikey_limiter.snapshot()
+        r for r in _CONTROL.concurrency_snapshot(_CONTEXT)["apiKeys"]
         if r.get("in_flight", 0) > 0 or r.get("waiting", 0) > 0
     ]
     if not interesting:
@@ -408,7 +408,7 @@ def _apikey_limiter_block() -> list[str]:
 
 def _concurrency_block(cc_cfg: dict) -> list[str]:
     """状态总览里的并发信息块：总计 + 配置 + 各渠道一行。"""
-    totals = concurrency.totals()
+    totals = _CONTROL.concurrency_snapshot(_CONTEXT)["channelTotals"]
     default_max = int(cc_cfg.get("defaultMaxConcurrent", 0))
     queue_wait = int(cc_cfg.get("queueWaitSeconds", 30))
     out = [
@@ -418,7 +418,7 @@ def _concurrency_block(cc_cfg: dict) -> list[str]:
         f"  默认上限 <code>{default_max if default_max > 0 else '不限'}</code>"
         f" · 队列等待 <code>{queue_wait}s</code>",
     ]
-    snap = concurrency.snapshot()
+    snap = _CONTROL.concurrency_snapshot(_CONTEXT)["channels"]
     # 只列"有在途 / 有排队 / 已饱和"的渠道，减少噪声
     interesting = [
         r for r in snap
@@ -460,9 +460,9 @@ def _concurrency_block(cc_cfg: dict) -> list[str]:
 
 
 def _compose() -> tuple[str, dict]:
-    cfg = config.get()
+    cfg = _CONTROL.config_snapshot(_CONTEXT)
     uptime = _fmt_uptime(time.time() - _SERVICE_START_TS)
-    mode = load_balancing.display_mode(cfg.get("channelSelection", "smart"))
+    mode = _CONTROL.selection_mode(_CONTEXT, cfg.get("channelSelection", "smart"))
 
     overview = _channel_overview()
     today = _today_snapshot_by_family()
@@ -478,7 +478,7 @@ def _compose() -> tuple[str, dict]:
     lines = [
         "📊 <b>状态总览</b>",
         sep,
-        f"🕐 运行: <code>{uptime}</code> · ⚙ 选路: <code>{mode}</code> · 🔗 亲和: <code>{affinity.count()}</code>",
+        f"🕐 运行: <code>{uptime}</code> · ⚙ 选路: <code>{mode}</code> · 🔗 亲和: <code>{_CONTROL.affinity_count(_CONTEXT)}</code>",
         f"🧬 Codex CLI: <code>v{ui.escape_html(codex_cli_version())}</code>",
     ]
 
@@ -522,7 +522,7 @@ def _compose() -> tuple[str, dict]:
 
     # API Key 限流队列
     ak_cfg = cfg.get("apiKeyConcurrency") or {}
-    ak_totals = apikey_limiter.totals()
+    ak_totals = _CONTROL.concurrency_snapshot(_CONTEXT)["apiKeyTotals"]
     if bool(ak_cfg.get("enabled", True)) or ak_totals.get("in_flight", 0) > 0 or ak_totals.get("waiting", 0) > 0:
         lines += ["", "<b>🔑 API Key 队列:</b>"]
         lines += _apikey_limiter_block()

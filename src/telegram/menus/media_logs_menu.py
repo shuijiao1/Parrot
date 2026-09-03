@@ -11,7 +11,12 @@ from typing import Optional
 
 from ... import config, media_db
 from ...oauth_ids import account_key as make_account_key
+from ...management_control.observability import DEFAULT_MEDIA_CONTROL, telegram_context
 from .. import ui
+
+
+_CONTROL = DEFAULT_MEDIA_CONTROL
+_CONTEXT = telegram_context()
 
 
 _PAGE_SIZE = 6
@@ -125,7 +130,7 @@ def _paths(row: dict) -> list[str]:
         values = []
     if not isinstance(values, list):
         return []
-    return [path for path in values if isinstance(path, str) and os.path.exists(path)]
+    return _CONTROL.existing_paths(_CONTEXT, row)
 
 
 def _row_metrics(row: dict) -> str:
@@ -149,7 +154,7 @@ def _row_metrics(row: dict) -> str:
             parts.append(dims)
 
     if row.get("status") in {"running", "pending"}:
-        parts.append(f"已等待 {media_db.seconds_since(row.get('created_at'))}s")
+        parts.append(f"已等待 {_CONTROL.seconds_since(row.get('created_at'))}s")
     elif row.get("duration_ms") is not None:
         parts.append(_fmt_ms(row.get("duration_ms")))
     cost = _fmt_cost_ticks(row.get("cost_usd_ticks"))
@@ -159,22 +164,7 @@ def _row_metrics(row: dict) -> str:
 
 
 def _current_account_top(limit: int = 3) -> list[dict]:
-    active_keys = {
-        make_account_key(account)
-        for account in config.get().get("oauthAccounts", [])
-        if isinstance(account, dict)
-    }
-    active_keys.discard("")
-
-    current: list[dict] = []
-    # Read past the first three because historical rows from removed accounts may
-    # otherwise hide lower-ranked accounts that still exist in the configuration.
-    for row in media_db.account_top(1000):
-        if str(row.get("account_key") or "") in active_keys:
-            current.append(row)
-            if len(current) >= limit:
-                break
-    return current
+    return _CONTROL.account_top(_CONTEXT, limit=limit)
 
 
 def _page_info(page: int, total: int) -> tuple[int, int]:
@@ -234,7 +224,7 @@ def _render_list(rows: list[dict], *, summary: dict, top: list[dict], page: int,
             ),
             f"<code>{ui.escape_html(_model(row))}</code> · {ui.escape_html(_row_metrics(row))}",
             (
-                f"<code>{media_db.fmt_bjt(row.get('created_at'))}</code> · "
+                f"<code>{_CONTROL.fmt_bjt(row.get('created_at'))}</code> · "
                 f"Key <code>{ui.escape_html(row.get('api_key_name') or '?')}</code>"
             ),
         ])
@@ -269,10 +259,10 @@ def _list_kb(rows: list[dict], *, page: int, pages: int) -> dict:
 
 
 def _page_data(page: int) -> tuple[list[dict], dict, list[dict], int, int]:
-    total = media_db.count()
-    page, pages = _page_info(page, total)
-    rows = media_db.recent(_PAGE_SIZE, offset=(page - 1) * _PAGE_SIZE)
-    return rows, media_db.summary(), _current_account_top(3), page, pages
+    rows, summary, page, pages = _CONTROL.telegram_page(
+        _CONTEXT, page=page, page_size=_PAGE_SIZE,
+    )
+    return rows, summary, _current_account_top(3), page, pages
 
 
 def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, *, page: int = 1) -> None:
@@ -304,7 +294,7 @@ def _resolve_log(short: str) -> dict | None:
         log_id = int(full[len("medialog:"):])
     except (TypeError, ValueError):
         return None
-    return media_db.get_log(log_id)
+    return _CONTROL.raw_log_for_telegram(_CONTEXT, log_id)
 
 
 def _render_detail(row: dict) -> str:
@@ -325,11 +315,11 @@ def _render_detail(row: dict) -> str:
             + "</code>"
         ),
         "",
-        f"创建: <code>{media_db.fmt_bjt(row.get('created_at'))}</code>",
-        f"更新: <code>{media_db.fmt_bjt(row.get('updated_at'))}</code>",
+        f"创建: <code>{_CONTROL.fmt_bjt(row.get('created_at'))}</code>",
+        f"更新: <code>{_CONTROL.fmt_bjt(row.get('updated_at'))}</code>",
     ]
     if row.get("finished_at"):
-        lines.append(f"完成: <code>{media_db.fmt_bjt(row.get('finished_at'))}</code>")
+        lines.append(f"完成: <code>{_CONTROL.fmt_bjt(row.get('finished_at'))}</code>")
 
     dims = _dimensions(row)
     if dims:
@@ -371,7 +361,7 @@ def _render_detail(row: dict) -> str:
     if row.get("upstream_status"):
         lines.append(f"上游状态: <code>{ui.escape_html(row.get('upstream_status'))}</code>")
     if row.get("last_polled_at"):
-        lines.append(f"最后查询: <code>{media_db.fmt_bjt(row.get('last_polled_at'))}</code>")
+        lines.append(f"最后查询: <code>{_CONTROL.fmt_bjt(row.get('last_polled_at'))}</code>")
 
     lines.extend([
         "",

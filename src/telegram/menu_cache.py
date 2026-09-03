@@ -16,6 +16,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from ..management_control.observability import DEFAULT_STATS_CONTROL, telegram_context
+
+
+_STATS_CONTROL = DEFAULT_STATS_CONTROL
+_CONTEXT = telegram_context()
+
 
 _BJT = timezone(timedelta(hours=8))
 _INITIALIZING_TEXT = "统计正在初始化，请稍后再试"
@@ -338,8 +344,6 @@ COORDINATOR = StatsRefreshCoordinator()
 
 
 def _refresh_common_periods() -> bool:
-    from .. import log_db
-
     ok = True
     seen: set[int] = set()
     # 默认“今日”优先；月初两者边界相同，只查询一次。
@@ -352,15 +356,15 @@ def _refresh_common_periods() -> bool:
         seen.add(since_int)
         ok = PERIOD_STATS.refresh_now(
             ("period", since_int),
-            lambda start=since: log_db.stats_period_snapshot(start),
+            lambda start=since: _STATS_CONTROL.period_snapshot_since(_CONTEXT, start),
         ) and ok
     return ok
 
 
 def _refresh_lifetime() -> bool:
-    from .. import log_db
-
-    return LIFETIME_STATS.refresh_now("lifetime", log_db.stats_lifetime)
+    return LIFETIME_STATS.refresh_now(
+        "lifetime", lambda: _STATS_CONTROL.lifetime_snapshot(_CONTEXT),
+    )
 
 
 def _refresh_oauth_windows() -> bool:
@@ -371,11 +375,9 @@ def _refresh_oauth_windows() -> bool:
 
 
 def _refresh_apikey_history() -> bool:
-    from .. import log_db
-
     return HISTORY_TOTALS.refresh_now(
         "apikey-history",
-        log_db.request_totals_by_apikey,
+        lambda: _STATS_CONTROL.request_totals_by_apikey(_CONTEXT),
     )
 
 
@@ -385,7 +387,6 @@ def _queue_model_detail_snapshots() -> bool:
     这里只发现任务并入队，不执行 SQL、不创建线程。真正的查询仍由同一个
     ``tg-stats-scheduler`` 在后续循环中逐个串行执行。
     """
-    from .. import config, log_db, oauth_manager, state_db
     from ..oauth_ids import account_key as oauth_account_key
     from .menus import oauth_menu
 
@@ -402,16 +403,11 @@ def _queue_model_detail_snapshots() -> bool:
 
     # OAuth 详情必须按各账号自己的 provider/billing 周期预热；不能继续
     # 沿用自然月 key，否则首次进入详情会显示另一统计口径或等待二次点击。
-    for account in oauth_manager.list_accounts():
+    for account in _STATS_CONTROL.oauth_accounts(_CONTEXT):
         account_key = oauth_account_key(account)
         if not account_key:
             continue
-        try:
-            row = state_db.quota_load(account_key)
-        except RuntimeError:
-            # Test/bootstrap callers may start the stats scheduler before the
-            # durable state store; account metadata can still resolve a period.
-            row = {}
+        row = _STATS_CONTROL.quota_row(_CONTEXT, account_key)
         local_period = oauth_menu._oauth_local_period(account, row=row)
         account_since = float(local_period["since"])
         key = ("oauth-model", account_key, int(account_since))
@@ -428,21 +424,15 @@ def _queue_model_detail_snapshots() -> bool:
         cached_models = DETAIL_STATS.peek(key).value
         DETAIL_STATS.request(
             key,
-            lambda target=account_key, start=account_since: log_db.channel_model_stats(
-                f"oauth:{target}", since_ts=start,
+            lambda target=account_key, start=account_since: _STATS_CONTROL.channel_model_stats(
+                _CONTEXT, f"oauth:{target}", since_ts=start,
             ),
             # 总体已有调用时，空模型列表只能是冷启动竞态留下的无效快照。
             force=isinstance(cached_models, list) and not cached_models,
         )
 
     # Ordinary API channels remain natural-month reports.
-    channel_keys: list[str] = []
-    for channel in config.get().get("channels") or []:
-        if not isinstance(channel, dict):
-            continue
-        name = str(channel.get("name") or "").strip()
-        if name:
-            channel_keys.append(f"api:{name}")
+    channel_keys = _STATS_CONTROL.configured_channel_keys(_CONTEXT)
 
     seen_channels: set[str] = set()
     for channel_key in channel_keys:
@@ -455,24 +445,22 @@ def _queue_model_detail_snapshots() -> bool:
             continue
         DETAIL_STATS.request(
             key,
-            lambda target=channel_key, start=since: log_db.channel_model_stats(
-                target, since_ts=start,
+            lambda target=channel_key, start=since: _STATS_CONTROL.channel_model_stats(
+                _CONTEXT, target, since_ts=start,
             ),
         )
 
-    api_keys = config.get().get("apiKeys") or {}
-    if isinstance(api_keys, dict):
-        for name in api_keys:
-            key = ("apikey-model", name, int(since))
-            if not _has_calls(by_apikey.get(name)):
-                DETAIL_STATS.store(key, [])
-                continue
-            DETAIL_STATS.request(
-                key,
-                lambda target=name, start=since: log_db.apikey_model_stats(
-                    target, since_ts=start,
-                ),
-            )
+    for name in _STATS_CONTROL.configured_api_key_names(_CONTEXT):
+        key = ("apikey-model", name, int(since))
+        if not _has_calls(by_apikey.get(name)):
+            DETAIL_STATS.store(key, [])
+            continue
+        DETAIL_STATS.request(
+            key,
+            lambda target=name, start=since: _STATS_CONTROL.apikey_model_stats(
+                _CONTEXT, target, since_ts=start,
+            ),
+        )
     return True
 
 
