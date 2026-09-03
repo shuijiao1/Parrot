@@ -15,9 +15,7 @@ import math
 import re
 from typing import Optional
 
-from ... import affinity, config, load_balancing, model_mapping
-from ...channel import registry
-from ...oauth_ids import provider_from_channel_key
+from ...management_control.load_balancing import load_balancing_control
 from .. import states, ui
 
 _MODE_LABELS = {
@@ -30,12 +28,12 @@ _MODEL_REF_PREFIX = "lb:model:"
 
 
 def _all_channels() -> list:
-    return list(registry.all_channels())
+    return list(load_balancing_control.all_channels())
 
 
 def _channel_icon(ch, *, model_context: bool = False) -> str:
     if ch.type == "oauth":
-        provider = provider_from_channel_key(ch.key)
+        provider = load_balancing_control.provider_from_channel_key(ch.key)
         if provider in {"openai", "xai", "cursor", "claude", "antigravity"}:
             return f"{ui.provider_custom_emoji_html(provider)} 🔐"
         return "✉ 🔐"
@@ -59,10 +57,10 @@ def _status_text(ch) -> str:
 
 def _compact_channel_label(ch) -> str:
     if ch.type == "oauth":
-        provider = provider_from_channel_key(ch.key)
+        provider = load_balancing_control.provider_from_channel_key(ch.key)
         same_provider = [
             item for item in _all_channels()
-            if item.type == "oauth" and provider_from_channel_key(item.key) == provider
+            if item.type == "oauth" and load_balancing_control.provider_from_channel_key(item.key) == provider
         ]
         if len(same_provider) == 1:
             return ui.provider_label(provider)
@@ -70,7 +68,7 @@ def _compact_channel_label(ch) -> str:
 
 
 def _format_item_line(idx: int, key: str, *, model_context: bool = False) -> str:
-    ch = registry.get_channel(key)
+    ch = load_balancing_control.get_channel(key)
     if ch is None:
         return f"{idx}. <code>{ui.escape_html(key)}</code> ⚠ 已不存在"
     display = ui.channel_display_name(ch.key, with_family=False)
@@ -105,34 +103,16 @@ def _split_number_rows(n: int, max_cols: int = 6) -> list[list[int]]:
 
 
 def _client_models() -> list[str]:
-    models: set[str] = set()
-    mapping = model_mapping.get_ingress_map(model_mapping.GLOBAL_MAPPING_LINE)
-    for ch in _all_channels():
-        try:
-            values = ch.list_client_models()
-        except Exception:
-            values = getattr(ch, "models", []) or []
-        for model in values or []:
-            value = str(model or "").strip()
-            if value:
-                models.add(str(mapping.get(value) or value).strip())
-    return sorted(models, key=lambda value: value.lower())
+    return load_balancing_control.client_models()
 
 
 def _channels_for_model(model: str) -> list:
-    result = []
-    for ch in _all_channels():
-        try:
-            if ch.supports_model(model) is not None:
-                result.append(ch)
-        except Exception:
-            continue
-    return result
+    return load_balancing_control.channels_for_model(model)
 
 
 def _effective_model_keys(model: str) -> list[str]:
     channels = _channels_for_model(model)
-    return load_balancing.effective_order_for_model(model, channels)
+    return load_balancing_control.effective_order_for_model(model, channels)
 
 
 def _model_code(model: str) -> str:
@@ -155,12 +135,12 @@ def _resolve_model_code(code: str) -> str | None:
 
 
 def _main_text_and_kb() -> tuple[str, dict]:
-    mode = (config.get().get("channelSelection") or "smart").lower()
+    mode = load_balancing_control.get_mode()
     lines = ["⚖️ <b>负载均衡</b>", "", "当前调度算法:"]
     for value in ("smart", "order", "priority"):
         prefix = "✅ " if mode == value else ""
         lines.append(
-            f"{prefix}{_MODE_LABELS[value]}（{load_balancing.mode_description(value)}）"
+            f"{prefix}{_MODE_LABELS[value]}（{load_balancing_control.mode_description(value)}）"
         )
     lines.extend(["", "请选择调度算法"])
     rows: list[list[dict]] = [[
@@ -182,6 +162,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
 
 
 def show(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
+    load_balancing_control.bind_telegram_actor(chat_id)
     if cb_id is not None:
         ui.answer_cb(cb_id)
     text, keyboard = _main_text_and_kb()
@@ -189,13 +170,14 @@ def show(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
 
 
 def send_new(chat_id: int) -> None:
+    load_balancing_control.bind_telegram_actor(chat_id)
     text, keyboard = _main_text_and_kb()
     ui.send(chat_id, text, reply_markup=keyboard)
 
 
 def _on_mode(chat_id: int, message_id: int, cb_id: str, mode: str) -> None:
     try:
-        load_balancing.set_mode(mode)
+        load_balancing_control.set_mode(mode)
     except Exception as exc:
         ui.answer_cb(cb_id, "切换失败", show_alert=True)
         ui.send(chat_id, f"❌ 切换失败: <code>{ui.escape_html(str(exc))}</code>")
@@ -247,7 +229,7 @@ def _edit_text_and_kb(data: dict) -> tuple[str, dict]:
         "",
     ]
     if kind == "model" and models:
-        inherited = not load_balancing.has_model_priority(models[0])
+        inherited = not load_balancing_control.has_model_priority(models[0])
         lines.append(
             "当前来源：<b>统一渠道/账户顺序（尚无模型专属覆盖）</b>"
             if inherited else "当前来源：<b>模型专属顺序</b>"
@@ -303,7 +285,7 @@ def _show_edit(chat_id: int, message_id: int, cb_id: str | None = None) -> None:
 
 
 def _start_channels(chat_id: int, message_id: int, cb_id: str) -> None:
-    draft = load_balancing.normalize_channel_order()
+    draft = load_balancing_control.normalize_channel_order()
     _store_edit_state(chat_id, {
         "kind": "channels", "draft": draft, "initial": draft, "selected": [],
     })
@@ -447,7 +429,7 @@ def _save(chat_id: int, message_id: int, cb_id: str) -> None:
     draft = list(data.get("draft") or [])
     models = list(data.get("models") or [])
     if kind == "channels":
-        load_balancing.save_channel_order(draft)
+        load_balancing_control.save_channel_order(draft)
         success = "✅ 已保存统一渠道/账户优先级。"
         back = "lb:channels"
     else:
@@ -455,7 +437,7 @@ def _save(chat_id: int, message_id: int, cb_id: str) -> None:
         for model in models:
             supported = {ch.key for ch in _channels_for_model(model)}
             orders[model] = [key for key in draft if key in supported]
-        load_balancing.save_model_orders(orders)
+        load_balancing_control.save_model_orders(orders)
         success = f"✅ 已保存 {len(models)} 个模型的专属优先级。"
         back = f"lb:models:{max(1, int(data.get('return_page') or 1))}"
     states.pop_state(chat_id)
@@ -483,7 +465,7 @@ def _clear_single_model(chat_id: int, message_id: int, cb_id: str) -> None:
     if not data or data.get("kind") != "model" or len(models) != 1:
         ui.answer_cb(cb_id, "会话已失效")
         return
-    removed = load_balancing.clear_model_orders(models)
+    removed = load_balancing_control.clear_model_orders(models)
     model = models[0]
     draft = _effective_model_keys(model)
     data["draft"] = draft
@@ -544,6 +526,7 @@ def _order_input_start(chat_id: int, message_id: int, cb_id: str) -> None:
 def handle_text_state(chat_id: int, action: str, text: str) -> bool:
     if action != "lb_order_input":
         return False
+    load_balancing_control.bind_telegram_actor(chat_id)
     state = states.get_state(chat_id)
     data = dict(((state or {}).get("data") or {}).get("edit") or {})
     draft = list(data.get("draft") or [])
@@ -581,9 +564,9 @@ def _model_summary_line(model: str) -> str:
     keys = _effective_model_keys(model)
     labels = []
     for key in keys:
-        ch = registry.get_channel(key)
+        ch = load_balancing_control.get_channel(key)
         labels.append(_compact_channel_label(ch) if ch is not None else key)
-    source = "专属" if load_balancing.has_model_priority(model) else "默认"
+    source = "专属" if load_balancing_control.has_model_priority(model) else "默认"
     text = f"渠道（{source}）：" + (" → ".join(labels) if labels else "无可用渠道")
     return text if len(text) <= 420 else text[:419] + "…"
 
@@ -752,8 +735,7 @@ def _cancel_model_bulk(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _aff_confirm_all(chat_id: int, message_id: int, cb_id: str) -> None:
-    fp_total = affinity.count()
-    client_total = affinity.client_count()
+    fp_total, client_total = load_balancing_control.affinity_counts()
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id,
@@ -771,17 +753,14 @@ def _aff_confirm_all(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _aff_exec_all(chat_id: int, message_id: int, cb_id: str) -> None:
-    fp_total = affinity.count()
-    client_total = affinity.client_count()
-    affinity.delete_all()
-    affinity.client_delete_all()
+    fp_total, client_total = load_balancing_control.clear_all_affinity_telegram()
     ui.answer_cb(cb_id, f"已清 fp {fp_total}、client {client_total}")
     show(chat_id, message_id)
 
 
 def _aff_confirm_family(chat_id: int, message_id: int, cb_id: str, family: str) -> None:
     """旧 Telegram 消息兼容入口；新 UI 不再按家族展示。"""
-    if family not in load_balancing.FAMILIES:
+    if family not in load_balancing_control.FAMILIES:
         ui.answer_cb(cb_id, "无效协议类型")
         return
     ui.answer_cb(cb_id)
@@ -797,11 +776,10 @@ def _aff_confirm_family(chat_id: int, message_id: int, cb_id: str, family: str) 
 
 
 def _aff_exec_family(chat_id: int, message_id: int, cb_id: str, family: str) -> None:
-    if family not in load_balancing.FAMILIES:
+    if family not in load_balancing_control.FAMILIES:
         ui.answer_cb(cb_id, "无效协议类型")
         return
-    fp_count = affinity.delete_by_protocol(family)
-    client_count = affinity.client_delete_by_protocol(family)
+    fp_count, client_count = load_balancing_control.clear_family_affinity_telegram(family)
     ui.answer_cb(cb_id, f"已清 fp {fp_count}、client {client_count}")
     show(chat_id, message_id)
 
@@ -810,6 +788,7 @@ def _aff_exec_family(chat_id: int, message_id: int, cb_id: str, family: str) -> 
 
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
+    load_balancing_control.bind_telegram_actor(chat_id)
     if data == "menu:loadbalancing":
         show(chat_id, message_id, cb_id); return True
     if data.startswith("lb:mode:"):

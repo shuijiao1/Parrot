@@ -40,8 +40,11 @@ import math
 import threading
 from typing import Mapping, Optional
 
-from ... import compact_rescue, model_mapping, model_metadata, model_pricing
+from ...management_control.mapping import mapping_control
 from .. import states, ui
+
+# Legacy test seam now points at the shared control rather than a business module.
+compact_rescue = mapping_control
 
 
 # ─── 常量 ─────────────────────────────────────────────────────────
@@ -52,7 +55,7 @@ _METADATA_SYNC_RUNNING = False
 
 # line <-> 短码(callback_data 不能塞带斜线的 line 名, 用固定 3 位 hex 避免爆 64B)
 _LINE_CODE: dict[str, str] = {
-    model_mapping.GLOBAL_MAPPING_LINE: "glo",
+    mapping_control.GLOBAL_MAPPING_LINE: "glo",
     "anthropic":        "anp",  # legacy callback compatibility
     "openai-chat":      "oac",
     "openai-responses": "oar",
@@ -60,7 +63,7 @@ _LINE_CODE: dict[str, str] = {
 _CODE_LINE: dict[str, str] = {v: k for k, v in _LINE_CODE.items()}
 
 _LINE_ICON: dict[str, str] = {
-    model_mapping.GLOBAL_MAPPING_LINE: "🔁",
+    mapping_control.GLOBAL_MAPPING_LINE: "🔁",
 }
 
 
@@ -71,7 +74,7 @@ def _line_body_label(line: str) -> str:
         return f"{ui.family_tag('openai')} Chat (/v1/chat/completions)"
     if line == "openai-responses":
         return f"{ui.family_tag('openai')} Responses (/v1/responses)"
-    return f"{_LINE_ICON.get(line, '🔁')} {ui.escape_html(model_mapping.INGRESS_LABEL[line])}"
+    return f"{_LINE_ICON.get(line, '🔁')} {ui.escape_html(mapping_control.INGRESS_LABEL[line])}"
 
 
 def _code_of_line(line: str) -> str:
@@ -85,16 +88,16 @@ def _line_of_code(code: str) -> Optional[str]:
 # ─── Level 1 总览 ─────────────────────────────────────────────────
 
 def _overview_text() -> str:
-    mp = model_mapping.get_ingress_map(model_mapping.GLOBAL_MAPPING_LINE)
-    bindings = model_metadata.list_bindings()
-    compact = model_metadata.get_compression_model() or "(未设置)"
+    mp = mapping_control.get_ingress_map(mapping_control.GLOBAL_MAPPING_LINE)
+    bindings = mapping_control.list_bindings()
+    compact = mapping_control.get_compression_model() or "(未设置)"
     lines = [
         "🤖 <b>模型管理</b>",
         "",
         f"🔁 模型映射：<b>{len(mp)}</b> 条",
         f"🧾 模型元数据绑定：<b>{len(bindings)}</b> 条",
         f"🗜 压缩模型：<code>{ui.escape_html(compact)}</code>",
-        f"🧩 分段目标：<code>{compact_rescue.chunk_target_tokens():,}</code> tokens",
+        f"🧩 分段目标：<code>{mapping_control.chunk_target_tokens():,}</code> tokens",
         "",
         f"<i>模型映射按模型名全局生效，不再区分 {ui.family_tag('anthropic')} / {ui.family_tag('openai')} 入口。</i>",
     ]
@@ -104,7 +107,7 @@ def _overview_text() -> str:
 def _overview_kb() -> dict:
     return ui.inline_kb([
         [
-            ui.btn("🔁 模型映射", f"map:line:{_code_of_line(model_mapping.GLOBAL_MAPPING_LINE)}"),
+            ui.btn("🔁 模型映射", f"map:line:{_code_of_line(mapping_control.GLOBAL_MAPPING_LINE)}"),
             ui.btn("🧾 模型元数据", "map:meta"),
         ],
         [
@@ -115,19 +118,21 @@ def _overview_kb() -> dict:
 
 
 def show(chat_id: int, message_id: int, cb_id: str) -> None:
+    mapping_control.bind_telegram_actor(chat_id)
     ui.answer_cb(cb_id)
     ui.edit(chat_id, message_id, _overview_text(), reply_markup=_overview_kb())
 
 
 def send_new(chat_id: int) -> None:
+    mapping_control.bind_telegram_actor(chat_id)
     ui.send(chat_id, _overview_text(), reply_markup=_overview_kb())
 
 
 # ─── Level 2 单条 line 的管理页 ────────────────────────────────────
 
 def _line_text(line: str) -> str:
-    default = model_mapping.get_default_model(line)
-    mp = model_mapping.get_ingress_map(line)
+    default = mapping_control.get_default_model(line)
+    mp = mapping_control.get_ingress_map(line)
     out = [
         _line_body_label(line),
         "",
@@ -159,7 +164,7 @@ def _line_kb(line: str) -> dict:
     rows.append([ui.btn("➕ 新增映射", f"map:add:{lc}")])
 
     # 每条映射一个按钮 → 点进去看详情/改/删
-    mp = model_mapping.get_ingress_map(line)
+    mp = mapping_control.get_ingress_map(line)
     for alias, real in sorted(mp.items()):
         # alias 可能带符号, 用短码
         ac = ui.register_code(f"map:alias:{line}:{alias}")
@@ -190,7 +195,7 @@ def _show_item(
     if at_line != line:
         ui.answer_cb(cb_id, "会话异常"); return
 
-    mp = model_mapping.get_ingress_map(line)
+    mp = mapping_control.get_ingress_map(line)
     real = mp.get(alias)
     if real is None:
         ui.answer_cb(cb_id, "该映射已不存在")
@@ -228,7 +233,7 @@ def _start_edit_alias(
         ui.answer_cb(cb_id, "会话异常"); return
     if at_line != line:
         ui.answer_cb(cb_id, "会话异常"); return
-    mp = model_mapping.get_ingress_map(line)
+    mp = mapping_control.get_ingress_map(line)
     if alias not in mp:
         ui.answer_cb(cb_id, "该映射已不存在")
         _show_line(chat_id, message_id, "-", line); return
@@ -281,13 +286,13 @@ def _on_alias_edit(chat_id: int, action: str, text: str) -> None:
         states.pop_state(chat_id)
         ui.send(chat_id, "ℹ 新别名与原别名一致, 未做更改。")
         return
-    real_models = model_mapping.list_available_models_for(line)
+    real_models = mapping_control.list_available_models_for(line)
     if new_alias in real_models:
         ui.send(
             chat_id,
             f"❌ 新别名 <code>{ui.escape_html(new_alias)}</code> 已经是真实模型名。请换一个:",
         ); return
-    existing = model_mapping.get_ingress_map(line)
+    existing = mapping_control.get_ingress_map(line)
     if new_alias in existing:
         ui.send(
             chat_id,
@@ -300,8 +305,8 @@ def _on_alias_edit(chat_id: int, action: str, text: str) -> None:
 
     real = existing[old_alias]
     # 原子替换: 先加新的, 再删旧的 (中间状态下两条都存在, 不影响可用性)
-    model_mapping.set_mapping(line, new_alias, real)
-    model_mapping.remove_mapping(line, old_alias)
+    mapping_control.set_mapping(line, new_alias, real)
+    mapping_control.remove_mapping(line, old_alias)
     states.pop_state(chat_id)
     ui.send_result(
         chat_id,
@@ -328,11 +333,11 @@ def _start_edit_real(
         ui.answer_cb(cb_id, "会话异常"); return
     if at_line != line:
         ui.answer_cb(cb_id, "会话异常"); return
-    mp = model_mapping.get_ingress_map(line)
+    mp = mapping_control.get_ingress_map(line)
     if alias not in mp:
         ui.answer_cb(cb_id, "该映射已不存在")
         _show_line(chat_id, message_id, "-", line); return
-    if not model_mapping.list_available_models_for(line):
+    if not mapping_control.list_available_models_for(line):
         ui.answer_cb(cb_id, "无可用真实模型")
         return
     ui.answer_cb(cb_id)
@@ -344,10 +349,10 @@ def _edit_edit_real_picker(
 ) -> None:
     alias_tag = ui.resolve_code(alias_code) or ""
     alias = alias_tag.split(":", 3)[-1] if alias_tag else "?"
-    mp = model_mapping.get_ingress_map(line)
+    mp = mapping_control.get_ingress_map(line)
     current = mp.get(alias, "?")
 
-    models = model_mapping.list_available_models_for(line)
+    models = mapping_control.list_available_models_for(line)
     total = len(models)
     total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
     text = (
@@ -388,12 +393,12 @@ def _on_pick_edit_real(
         _, _, real = model_tag.split(":", 2)
     except ValueError:
         ui.answer_cb(cb_id, "会话异常"); return
-    mp = model_mapping.get_ingress_map(line)
+    mp = mapping_control.get_ingress_map(line)
     if alias not in mp:
         ui.answer_cb(cb_id, "该映射已不存在")
         _show_line(chat_id, message_id, "-", line); return
     try:
-        model_mapping.set_mapping(line, alias, real)
+        mapping_control.set_mapping(line, alias, real)
     except ValueError as exc:
         ui.answer_cb(cb_id, str(exc)); return
     ui.answer_cb(cb_id, "✅ 已更新")
@@ -440,7 +445,7 @@ def _on_alias_input(chat_id: int, action: str, text: str) -> None:
         return
 
     # 不能与真实模型重名(那是 no-op)
-    real_models = model_mapping.list_available_models_for(line)
+    real_models = mapping_control.list_available_models_for(line)
     if alias in real_models:
         ui.send(
             chat_id,
@@ -449,7 +454,7 @@ def _on_alias_input(chat_id: int, action: str, text: str) -> None:
         )
         return
     # 不能与该入口已有别名重复
-    existing = model_mapping.get_ingress_map(line)
+    existing = mapping_control.get_ingress_map(line)
     if alias in existing:
         ui.send(
             chat_id,
@@ -478,7 +483,7 @@ def _send_real_picker_for_add(
     chat_id: int, line: str, alias: str, alias_code: str, page: int,
 ) -> None:
     """发一条新消息: 让用户从真实模型按钮列表里选一个绑到 alias。"""
-    models = model_mapping.list_available_models_for(line)
+    models = mapping_control.list_available_models_for(line)
     text = _picker_text_add(line, alias, page, len(models))
     kb = _picker_kb(
         models, page,
@@ -508,7 +513,7 @@ def _start_set_default(
     chat_id: int, message_id: int, cb_id: str, line: str,
 ) -> None:
     ui.answer_cb(cb_id)
-    models = model_mapping.list_available_models_for(line)
+    models = mapping_control.list_available_models_for(line)
     if not models:
         ui.edit(
             chat_id, message_id,
@@ -525,7 +530,7 @@ def _start_set_default(
 def _edit_default_picker(
     chat_id: int, message_id: int, line: str, page: int,
 ) -> None:
-    models = model_mapping.list_available_models_for(line)
+    models = mapping_control.list_available_models_for(line)
     text = _picker_text_default(line, page, len(models))
     kb = _picker_kb(
         models, page,
@@ -542,7 +547,7 @@ def _edit_default_picker(
 
 def _picker_text_default(line: str, page: int, total: int) -> str:
     total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
-    current = model_mapping.get_default_model(line)
+    current = mapping_control.get_default_model(line)
     return (
         f"{_line_body_label(line)} · <b>设置默认模型</b>\n\n"
         f"当前: <code>{ui.escape_html(current) if current else '(未设置)'}</code>\n\n"
@@ -612,7 +617,7 @@ def _on_pick_real(
         ui.answer_cb(cb_id, "会话异常 (line 不匹配)"); return
 
     try:
-        model_mapping.set_mapping(line, alias, real)
+        mapping_control.set_mapping(line, alias, real)
     except ValueError as exc:
         ui.answer_cb(cb_id, str(exc))
         return
@@ -643,7 +648,7 @@ def _on_pick_default(
     except ValueError:
         ui.answer_cb(cb_id, "会话异常"); return
     try:
-        model_mapping.set_default(line, real)
+        mapping_control.set_default(line, real)
     except ValueError as exc:
         ui.answer_cb(cb_id, str(exc)); return
     ui.answer_cb(cb_id, "✅ 已保存")
@@ -654,7 +659,7 @@ def _on_pick_default(
 def _on_clear_default(
     chat_id: int, message_id: int, cb_id: str, line: str,
 ) -> None:
-    cleared = model_mapping.clear_default(line)
+    cleared = mapping_control.clear_default(line)
     ui.answer_cb(cb_id, "✅ 已清除" if cleared else "无默认可清")
     _show_line(chat_id, message_id, "-", line)
 
@@ -674,7 +679,7 @@ def _ask_rm(
         ui.answer_cb(cb_id, "会话异常"); return
     if at_line != line:
         ui.answer_cb(cb_id, "会话异常"); return
-    current = model_mapping.get_ingress_map(line).get(alias)
+    current = mapping_control.get_ingress_map(line).get(alias)
     if not current:
         ui.answer_cb(cb_id, "该映射已不存在")
         _show_line(chat_id, message_id, "-", line)
@@ -708,7 +713,7 @@ def _on_rm_confirm(
         ui.answer_cb(cb_id, "会话异常"); return
     if at_line != line:
         ui.answer_cb(cb_id, "会话异常"); return
-    removed = model_mapping.remove_mapping(line, alias)
+    removed = mapping_control.remove_mapping(line, alias)
     ui.answer_cb(cb_id, "✅ 已删除" if removed else "未命中")
     _show_line(chat_id, message_id, "-", line)
 
@@ -737,7 +742,7 @@ def _on_page_add(
     if at_line != line:
         ui.answer_cb(cb_id, "会话异常"); return
     ui.answer_cb(cb_id)
-    models = model_mapping.list_available_models_for(line)
+    models = mapping_control.list_available_models_for(line)
     text = _picker_text_add(line, alias, page, len(models))
     kb = _picker_kb(
         models, page,
@@ -891,7 +896,7 @@ def _scope_icon(scope_type: str, scope_key: str) -> str:
 
 
 def _metadata_item_lines(
-    binding: model_metadata.MetadataBinding, number: int, *, scoped: bool,
+    binding: mapping_control.MetadataBinding, number: int, *, scoped: bool,
     scope_labels: Mapping[str, str] | None = None,
 ) -> list[str]:
     meta = binding.metadata if isinstance(binding.metadata, Mapping) else {}
@@ -923,7 +928,7 @@ def _metadata_text(
     scope_labels: Mapping[str, str] | None = None,
 ) -> str:
     view = _META_SCOPED if view == _META_SCOPED else _META_DEFAULT
-    all_bindings = model_metadata.list_bindings()
+    all_bindings = mapping_control.list_bindings()
     defaults = sum(1 for item in all_bindings if item.scope_key is None)
     scoped_count = len(all_bindings) - defaults
     bindings = [
@@ -931,7 +936,7 @@ def _metadata_text(
         if (item.scope_key is not None) == (view == _META_SCOPED)
     ]
     page, total_pages, visible = _page_slice(bindings, page)
-    status = model_pricing.catalog_status()
+    status = mapping_control.catalog_status()
     title = "专属元数据" if view == _META_SCOPED else "默认元数据"
     lines = [
         "🧾 <b>模型元数据</b>", "",
@@ -964,7 +969,7 @@ def _metadata_kb(
     scope_labels: Mapping[str, str] | None = None,
 ) -> dict:
     view = _META_SCOPED if view == _META_SCOPED else _META_DEFAULT
-    all_bindings = model_metadata.list_bindings()
+    all_bindings = mapping_control.list_bindings()
     defaults = [item for item in all_bindings if item.scope_key is None]
     scoped = [item for item in all_bindings if item.scope_key is not None]
     bindings = scoped if view == _META_SCOPED else defaults
@@ -1093,23 +1098,9 @@ def _show_sync_result(
 
 
 def _perform_metadata_sync() -> dict[str, object]:
-    """Refresh the local bundle when possible, then sync from local data only."""
+    """Run the shared control use case from the Telegram-owned worker."""
 
-    catalog_updated = False
-    try:
-        catalog_updated = model_pricing.refresh_remote_catalog_sync()
-    except Exception as exc:
-        # A network failure must not block metadata sync.  Keep the previous
-        # last-known-good bundle and continue below.
-        print(f"[metadata] models.dev refresh failed; using local catalog: {exc}")
-
-    # On success this reloads the bundle just written above.  On failure it
-    # reloads the previous last-known-good bundle.  Missing/invalid cache leaves
-    # the already initialized bundled catalog untouched.
-    model_pricing.reload_local_catalog()
-    result: dict[str, object] = model_metadata.auto_sync_metadata()
-    result["catalog"] = "updated" if catalog_updated else "local"
-    return result
+    return mapping_control.perform_metadata_sync()
 
 
 def _start_metadata_sync_worker(target) -> None:
@@ -1130,6 +1121,7 @@ def _sync_metadata(chat_id: int, message_id: int, cb_id: str) -> None:
 
     def worker() -> None:
         global _METADATA_SYNC_RUNNING
+        mapping_control.bind_telegram_actor(chat_id)
         try:
             result = _perform_metadata_sync()
             code = _sync_result_tag(result)
@@ -1189,7 +1181,7 @@ def _show_sync_list(
     ]
     buttons: list[dict] = []
     for offset, (status, model) in enumerate(visible, start=page * _META_PAGE_SIZE + 1):
-        binding = None if status == "未匹配" else model_metadata.resolve_binding(model)
+        binding = None if status == "未匹配" else mapping_control.resolve_binding(model)
         lines.append(f"{offset}. <b>{ui.escape_html(model)}</b> · {status}")
         if binding:
             lines.append(f"   → <code>{ui.escape_html(binding.target)}</code>")
@@ -1234,9 +1226,9 @@ def _show_unmatched_info(cb_id: str, code: str) -> None:
 
 def _scope_inventory(
     scope_type: str | None = None,
-) -> list[tuple[str, str, list[model_metadata.ModelInventoryItem]]]:
-    grouped: dict[str, list[model_metadata.ModelInventoryItem]] = {}
-    for item in model_metadata.inventory_items():
+) -> list[tuple[str, str, list[mapping_control.ModelInventoryItem]]]:
+    grouped: dict[str, list[mapping_control.ModelInventoryItem]] = {}
+    for item in mapping_control.inventory_items():
         if scope_type and item.scope_type != scope_type:
             continue
         grouped.setdefault(item.scope_key, []).append(item)
@@ -1266,7 +1258,7 @@ def _show_scope_picker(
     scopes = api_scopes if kind == _SCOPE_API else oauth_scopes
     page, total_pages, visible = _page_slice(scopes, page)
     scoped_counts: dict[str, int] = {}
-    for binding in model_metadata.list_bindings():
+    for binding in mapping_control.list_bindings():
         if binding.scope_key:
             scoped_counts[binding.scope_key] = scoped_counts.get(binding.scope_key, 0) + 1
     title = "API 渠道" if kind == _SCOPE_API else "OAuth 账户"
@@ -1332,7 +1324,7 @@ def _show_scope_models(
         ui.answer_cb(cb_id, "会话已过期")
         return
     scope = str(selection.get("scope") or "")
-    items = [item for item in model_metadata.inventory_items() if item.scope_key == scope]
+    items = [item for item in mapping_control.inventory_items() if item.scope_key == scope]
     unique = {(item.client_visible_model, item.outbound_model): item for item in items}
     models = sorted(
         unique.values(), key=lambda item: (item.client_visible_model.casefold(), item.outbound_model.casefold()),
@@ -1348,7 +1340,7 @@ def _show_scope_models(
     ]
     item_buttons: list[dict] = []
     for offset, item in enumerate(visible, start=page * _META_PAGE_SIZE + 1):
-        effective = model_metadata.resolve_binding(
+        effective = mapping_control.resolve_binding(
             item.client_visible_model,
             scope_key=scope,
             outbound_model=item.outbound_model,
@@ -1406,11 +1398,11 @@ def _candidate_models(selection: Mapping[str, object]) -> list[dict[str, str]]:
     scope_hints.discard("")
     official: set[str] = set()
     for name in names | leaves:
-        target = model_pricing.canonical_official_model(name)
+        target = mapping_control.canonical_official_model(name)
         if target:
             official.add(target)
     matched: list[dict[str, str]] = []
-    for item in model_pricing.catalog_models():
+    for item in mapping_control.catalog_models():
         model_id = item["id"].lower()
         leaf = model_id.rsplit("/", 1)[-1]
         if model_id not in names and leaf not in leaves:
@@ -1442,7 +1434,7 @@ def _candidate_models(selection: Mapping[str, object]) -> list[dict[str, str]]:
 
 
 def _catalog_item_lines(item: Mapping[str, str], number: int) -> list[str]:
-    meta = model_pricing.catalog_metadata(item["key"]) or {}
+    meta = mapping_control.catalog_metadata(item["key"]) or {}
     cost = meta.get("cost") if isinstance(meta.get("cost"), Mapping) else {}
     provider = item.get("provider_name") or item.get("provider_id") or "models.dev"
     official = item.get("official") == "1"
@@ -1558,7 +1550,7 @@ def _catalog_search(query: str) -> list[dict[str, str]]:
         return []
     tokens = needle.split()
     results: list[dict[str, str]] = []
-    for item in model_pricing.catalog_models():
+    for item in mapping_control.catalog_models():
         haystacks = [
             item["key"].lower(), item["id"].lower(), item["name"].lower(),
             item["provider_id"].lower(), item["provider_name"].lower(),
@@ -1570,7 +1562,7 @@ def _catalog_search(query: str) -> list[dict[str, str]]:
         exact = needle in {item["key"].lower(), item["id"].lower(), item["name"].lower()}
         prefix = any(value.startswith(needle) for value in haystacks)
         row["rank"] = "0" if exact else "1" if prefix else "2"
-        row["official"] = "1" if model_pricing.canonical_official_model(item["id"]) == item["key"] else "0"
+        row["official"] = "1" if mapping_control.canonical_official_model(item["id"]) == item["key"] else "0"
         results.append(row)
     return sorted(results, key=lambda item: (
         int(item["rank"]), item["provider_name"].casefold(),
@@ -1672,9 +1664,9 @@ def _show_provider_picker(
     if not selection:
         ui.answer_cb(cb_id, "会话已过期")
         return
-    providers = model_pricing.catalog_providers()
+    providers = mapping_control.catalog_providers()
     model_counts: dict[str, int] = {}
-    for item in model_pricing.catalog_models():
+    for item in mapping_control.catalog_models():
         provider = item["provider_id"]
         model_counts[provider] = model_counts.get(provider, 0) + 1
     page, total_pages, visible = _page_slice(providers, page)
@@ -1724,9 +1716,9 @@ def _show_catalog_models(
     if not selection or not provider:
         ui.answer_cb(cb_id, "会话已过期")
         return
-    models = model_pricing.catalog_provider_models(provider)
+    models = mapping_control.catalog_provider_models(provider)
     provider_info = next(
-        (item for item in model_pricing.catalog_providers() if item["id"] == provider),
+        (item for item in mapping_control.catalog_providers() if item["id"] == provider),
         {"id": provider, "name": provider},
     )
     page, total_pages, visible = _page_slice(models, page)
@@ -1781,7 +1773,7 @@ def _save_binding(
     scope = str(selection.get("scope") or "").strip() or None
     outbound = str(selection.get("outbound") or "").strip() or None
     try:
-        model_metadata.set_binding(
+        mapping_control.set_binding(
             str(selection["model"]), target,
             scope_key=scope, outbound_model=outbound, source="manual",
         )
@@ -1799,10 +1791,10 @@ def _save_binding(
     _show_meta_item(chat_id, message_id, "-", detail_code)
 
 
-def _binding_from_selection(selection: dict) -> model_metadata.MetadataBinding | None:
+def _binding_from_selection(selection: dict) -> mapping_control.MetadataBinding | None:
     scope = str(selection.get("scope") or "").strip() or None
     model = str(selection.get("model") or "").strip()
-    for binding in model_metadata.list_bindings():
+    for binding in mapping_control.list_bindings():
         if binding.scope_key == scope and binding.client_visible_model == model:
             return binding
     return None
@@ -1869,7 +1861,7 @@ def _show_meta_item(chat_id: int, message_id: int, cb_id: str, code: str) -> Non
         _show_metadata(chat_id, message_id, "-")
         return
     meta = binding.metadata if isinstance(binding.metadata, Mapping) else {}
-    raw = model_pricing.catalog_model(binding.target) or {}
+    raw = mapping_control.catalog_model(binding.target) or {}
     cost = meta.get("cost") if isinstance(meta.get("cost"), Mapping) else {}
     name = str(meta.get("name") or binding.client_visible_model)
     kind = (
@@ -1965,7 +1957,7 @@ def _ask_meta_delete(chat_id: int, message_id: int, cb_id: str, code: str) -> No
         lines.append(ui.escape_html(binding.client_visible_model))
     lines.append(f"→ <code>{ui.escape_html(binding.target)}</code>")
     if binding.scope_key:
-        fallback = model_metadata.resolve_binding(binding.client_visible_model)
+        fallback = mapping_control.resolve_binding(binding.client_visible_model)
         lines.append("")
         if fallback:
             lines.extend([
@@ -1990,7 +1982,7 @@ def _meta_delete(chat_id: int, message_id: int, cb_id: str, code: str) -> None:
         ui.answer_cb(cb_id, "会话已过期")
         return
     scope = str(selection.get("scope") or "").strip() or None
-    removed = model_metadata.delete_binding(
+    removed = mapping_control.delete_binding(
         str(selection["model"]), scope_key=scope,
     )
     ui.answer_cb(cb_id, "✅ 已删除" if removed else "未命中")
@@ -2000,11 +1992,11 @@ def _meta_delete(chat_id: int, message_id: int, cb_id: str, code: str) -> None:
 
 
 def _compression_text(page: int, total_pages: int, total_models: int) -> str:
-    selected = model_metadata.get_compression_model() or "(未设置)"
-    binding = model_metadata.resolve_binding(selected) if selected != "(未设置)" else None
+    selected = mapping_control.get_compression_model() or "(未设置)"
+    binding = mapping_control.resolve_binding(selected) if selected != "(未设置)" else None
     status = binding.target if binding else "等待按实际路由解析有效绑定"
     if binding:
-        trigger = model_metadata.compact_trigger_tokens(selected)
+        trigger = mapping_control.compact_trigger_tokens(selected)
         trigger_text = f"{trigger:,} tokens" if trigger is not None else "按上下文容量"
     else:
         trigger_text = "等待按实际路由解析"
@@ -2013,20 +2005,20 @@ def _compression_text(page: int, total_pages: int, total_models: int) -> str:
         f"当前模型：<code>{ui.escape_html(selected)}</code>",
         f"默认元数据：<code>{ui.escape_html(status)}</code>",
         f"默认压缩阈值：<code>{ui.escape_html(trigger_text)}</code>",
-        f"分段目标：<code>{compact_rescue.chunk_target_tokens():,}</code> tokens", "",
+        f"分段目标：<code>{mapping_control.chunk_target_tokens():,}</code> tokens", "",
         f"<b>可选模型</b> · 第 {page + 1}/{total_pages} 页 · 共 {total_models} 个", "",
         "<i>运行时按实际 scope 解析专属绑定，未命中再用默认绑定。</i>",
     ])
 
 
 def _compression_models() -> list[str]:
-    return sorted({item.client_visible_model for item in model_metadata.inventory_items()})
+    return sorted({item.client_visible_model for item in mapping_control.inventory_items()})
 
 
 def _show_compression(chat_id: int, message_id: int, cb_id: str, page: int = 0) -> None:
     models = _compression_models()
     page, total_pages, visible = _page_slice(models, page)
-    current = model_metadata.get_compression_model()
+    current = mapping_control.get_compression_model()
     item_buttons: list[dict] = []
     for offset, model in enumerate(visible, start=page * _META_PAGE_SIZE + 1):
         code = ui.register_code(f"compact-model:{model}")
@@ -2057,7 +2049,7 @@ def _pick_compression(
     prefix = "compact-model:"
     if not isinstance(raw, str) or not raw.startswith(prefix):
         ui.answer_cb(cb_id, "会话已过期"); return
-    model_metadata.set_compression_model(raw[len(prefix):])
+    mapping_control.set_compression_model(raw[len(prefix):])
     ui.answer_cb(cb_id, "✅ 已设置压缩模型")
     _show_compression(chat_id, message_id, "-", page)
 
@@ -2065,7 +2057,7 @@ def _pick_compression(
 def _clear_compression(
     chat_id: int, message_id: int, cb_id: str, page: int = 0,
 ) -> None:
-    changed = model_metadata.clear_compression_model()
+    changed = mapping_control.clear_compression_model()
     ui.answer_cb(cb_id, "✅ 已清除" if changed else "当前未设置")
     _show_compression(chat_id, message_id, "-", page)
 
@@ -2076,6 +2068,7 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str,
                     data: str) -> bool:
     if not data.startswith("map:"):
         return False
+    mapping_control.bind_telegram_actor(chat_id)
     parts = data.split(":")
     # parts[0] == "map"
     action = parts[1] if len(parts) > 1 else ""
@@ -2320,6 +2313,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str,
 
 
 def handle_text_state(chat_id: int, action: str, text: str) -> bool:
+    if action.startswith(("map_alias_input:", "map_alias_edit:", "meta_catalog_search:")):
+        mapping_control.bind_telegram_actor(chat_id)
     if action.startswith("map_alias_input:"):
         _on_alias_input(chat_id, action, text)
         return True

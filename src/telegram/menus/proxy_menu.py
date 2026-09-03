@@ -10,11 +10,7 @@ import asyncio
 import re
 from typing import Optional
 
-from ... import config, oauth_manager
-from ...proxy import manager as pm
-from ...proxy.connector import parse_proxy_url, _mask_url
-from ...proxy.ss2022 import ss_family_label
-from ...channel import registry
+from ...management_control.proxy import proxy_control
 from .. import states, ui
 
 
@@ -37,7 +33,7 @@ def _oauth_provider_for_channel(ch) -> str:
     key = str(getattr(ch, "key", "") or "")
     if key.startswith("oauth:"):
         try:
-            return oauth_manager.provider_of(key[len("oauth:"):])
+            return proxy_control.provider_of(key[len("oauth:"):])
         except Exception:
             pass
     return "claude" if getattr(ch, "protocol", "anthropic") == "anthropic" else "openai"
@@ -69,11 +65,11 @@ def _target_sync_note(name: str) -> str:
 
 def _all_targets() -> list[tuple[str, str]]:
     """Return [(name, badge_label)] for groups + proxies + direct."""
-    pm.init()
+    proxy_control.init()
     items: list[tuple[str, str]] = []
-    for gn, members in pm.all_groups().items():
+    for gn, members in proxy_control.all_groups().items():
         items.append((gn, f"📋 {gn} ({len(members)}个){_target_sync_note(gn)}"))
-    for n, c in pm.all_connectors().items():
+    for n, c in proxy_control.all_connectors().items():
         if n == "direct":
             continue
         items.append((n, f"{_type_badge(c.type)} {n}{_target_sync_note(n)}"))
@@ -91,7 +87,7 @@ def _proxy_detail_line(c) -> str:
         server = ui.escape_html(str(getattr(c, "server", "")))
         port = ui.escape_html(str(getattr(c, "port", "")))
         cipher = str(getattr(c, "cipher", "") or "")
-        label = ss_family_label(cipher) if cipher else "SS2022"
+        label = proxy_control.ss_family_label(cipher) if cipher else "SS2022"
         if cipher:
             return (
                 f"📍 {ui.escape_html(label)} · "
@@ -100,7 +96,7 @@ def _proxy_detail_line(c) -> str:
             )
         return f"📍 {ui.escape_html(label)} · <code>{server}:{port}</code>"
     if c.type == "socks5":
-        url = ui.escape_html(_mask_url(getattr(c, "url", "")))
+        url = ui.escape_html(proxy_control.mask_url(getattr(c, "url", "")))
         return f"📍 SOCKS5 · <code>{url}</code>"
     return f"📍 <code>{ui.escape_html(c.display())}</code>"
 
@@ -164,9 +160,8 @@ def _append_stats_block(lines: list[str], ps: dict, *, prefix: str = "") -> None
 
 
 def _get_proxy_stats() -> dict[str, dict]:
-    """Fetch proxy stats as {name: stats_dict}."""
-    from ... import log_db
-    return {ps["proxy_name"]: ps for ps in log_db.proxy_stats(limit=1000)}
+    """Fetch proxy stats through the shared control."""
+    return proxy_control.get_proxy_stats()
 
 
 def _merge_group_stats(members: list[str], pstats: dict) -> dict:
@@ -258,8 +253,8 @@ def _pagination_row(current: int, total_pages: int) -> list[dict]:
 
 
 def _proxy_by_name(name: str):
-    pm.init()
-    return pm.all_connectors().get(name)
+    proxy_control.init()
+    return proxy_control.all_connectors().get(name)
 
 
 _GROUP_PAGE_SIZE = 5
@@ -274,8 +269,8 @@ def _group_payload(name: str, page: int = 1) -> str:
 
 
 def _group_by_name(name: str) -> list[str] | None:
-    pm.init()
-    groups = pm.all_groups()
+    proxy_control.init()
+    groups = proxy_control.all_groups()
     return groups.get(name)
 
 
@@ -284,10 +279,11 @@ def _group_by_name(name: str) -> list[str] | None:
 # ═══════════════════════════════════════════════════════════════════
 
 def show(chat_id: int, message_id: int, cb_id: str = "", page: int = 1) -> None:
+    proxy_control.bind_telegram_actor(chat_id)
     if cb_id:
         ui.answer_cb(cb_id)
-    pm.init()
-    conns = {n: c for n, c in pm.all_connectors().items() if n != "direct"}
+    proxy_control.init()
+    conns = {n: c for n, c in proxy_control.all_connectors().items() if n != "direct"}
     names = list(conns.keys())
     pstats = _get_proxy_stats()
 
@@ -400,9 +396,9 @@ def _add_start(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _on_add_url_input(chat_id: int, text: str) -> None:
-    pm.init()
+    proxy_control.init()
     try:
-        parsed = parse_proxy_url(text.strip())
+        parsed = proxy_control.parse_proxy_url(text.strip())
     except ValueError as exc:
         ui.send(chat_id, f"❌ {ui.escape_html(str(exc))}\n请重新输入代理地址：")
         return
@@ -414,7 +410,7 @@ def _on_add_url_input(chat_id: int, text: str) -> None:
     if name and name.lower() == "direct":
         ui.send(chat_id, "❌ <code>direct</code> 是保留名。请重新输入代理地址，或换一个 #名称：")
         return
-    if name and name.lower() in pm.all_connectors():
+    if name and name.lower() in proxy_control.all_connectors():
         ui.send(chat_id, f"❌ <code>{ui.escape_html(name.lower())}</code> 已存在。请重新输入代理地址，或换一个 #名称：")
         return
     if not name:
@@ -430,7 +426,7 @@ def _on_add_url_input(chat_id: int, text: str) -> None:
 
 
 def _on_add_name_input(chat_id: int, text: str) -> None:
-    pm.init()
+    proxy_control.init()
     st = states.get_state(chat_id) or {}
     parsed = (st.get("data") or {}).get("parsed")
     if not parsed:
@@ -444,7 +440,7 @@ def _on_add_name_input(chat_id: int, text: str) -> None:
     if name == "direct":
         ui.send(chat_id, "❌ <code>direct</code> 是保留名，请换一个：")
         return
-    if name in pm.all_connectors():
+    if name in proxy_control.all_connectors():
         ui.send(chat_id, f"❌ <code>{ui.escape_html(name)}</code> 已存在，请换一个：")
         return
     _finalize_add(chat_id, name, parsed)
@@ -457,11 +453,11 @@ def _finalize_add(chat_id: int, name: str, parsed: dict) -> None:
     progress = ui.send(chat_id, f"⏳ 正在测试 <code>{ui.escape_html(name)}</code> ...")
     msg_id = ((progress or {}).get("result") or {}).get("message_id")
 
-    pm.add_proxy(name, proxy_cfg)
-    pm.init()
+    proxy_control.add_proxy(name, proxy_cfg)
+    proxy_control.init()
 
     try:
-        test = asyncio.run(pm.test_proxy(name, timeout=10))
+        test = asyncio.run(proxy_control.test_proxy(name, timeout=10))
     except Exception as e:
         test = {"ok": False, "error": str(e)[:200]}
 
@@ -488,7 +484,7 @@ def _finalize_add(chat_id: int, name: str, parsed: dict) -> None:
 def _test_proxy(chat_id: int, message_id: int, cb_id: str, name: str, *, back_cb: str = "px:show") -> None:
     ui.answer_cb(cb_id, "测试中...")
     try:
-        r = asyncio.run(pm.test_proxy(name, timeout=10))
+        r = asyncio.run(proxy_control.test_proxy(name, timeout=10))
     except Exception as e:
         r = {"ok": False, "error": str(e)[:200]}
 
@@ -538,7 +534,7 @@ def _del_confirm_view(chat_id: int, message_id: int, cb_id: str, payload: str) -
 
 
 def _del_exec(chat_id: int, message_id: int, cb_id: str, name: str, *, page: int = 1) -> None:
-    pm.remove_proxy(name)
+    proxy_control.remove_proxy(name)
     ui.answer_cb(cb_id, f"已删除 {name}")
     show(chat_id, message_id, page=page)
 
@@ -560,8 +556,8 @@ def _del_exec_view(chat_id: int, message_id: int, cb_id: str, payload: str) -> N
 def _show_groups(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> None:
     if cb_id:
         ui.answer_cb(cb_id)
-    pm.init()
-    groups = pm.all_groups()
+    proxy_control.init()
+    groups = proxy_control.all_groups()
     group_names = list(groups.keys())
     pstats = _get_proxy_stats()
 
@@ -669,12 +665,12 @@ def _grp_add_start(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _on_grp_add_name(chat_id: int, text: str) -> None:
-    pm.init()
+    proxy_control.init()
     name = text.strip().lower()
     if not _valid_name(name):
         ui.send(chat_id, "❌ 名称格式不对，请重试：")
         return
-    if name in pm.all_groups():
+    if name in proxy_control.all_groups():
         ui.send(chat_id, f"❌ 组名 <code>{ui.escape_html(name)}</code> 已存在：")
         return
     states.set_state(chat_id, "px_grp_pick_members", {"group_name": name, "members": []})
@@ -684,7 +680,7 @@ def _on_grp_add_name(chat_id: int, text: str) -> None:
 def _send_member_picker(chat_id: int, group_name: str, current: list[str],
                         *, message_id: int = 0) -> None:
     """Show proxy picker for group members."""
-    conns = pm.all_connectors()
+    conns = proxy_control.all_connectors()
     lines = [
         f"📋 <b>代理组: {ui.escape_html(group_name)}</b>",
         "",
@@ -773,7 +769,7 @@ def _grp_save(chat_id: int, message_id: int, cb_id: str) -> None:
     if not group_name or not members:
         ui.answer_cb(cb_id, "数据不完整")
         return
-    pm.add_group(group_name, members)
+    proxy_control.add_group(group_name, members)
     states.pop_state(chat_id)
     ui.edit(chat_id, message_id,
             f"✅ 代理组 <code>{ui.escape_html(group_name)}</code> 已保存\n"
@@ -783,8 +779,8 @@ def _grp_save(chat_id: int, message_id: int, cb_id: str) -> None:
 
 def _grp_edit(chat_id: int, message_id: int, cb_id: str, gname: str, *, page: int = 1) -> None:
     ui.answer_cb(cb_id)
-    pm.init()
-    members = pm.get_group(gname) or []
+    proxy_control.init()
+    members = proxy_control.get_group_members(gname) or []
     states.set_state(chat_id, "px_grp_pick_members", {"group_name": gname, "members": members, "page": page})
     _send_member_picker(chat_id, gname, members, message_id=message_id)
 
@@ -802,7 +798,7 @@ def _grp_edit_view(chat_id: int, message_id: int, cb_id: str, payload: str) -> N
 def _grp_test(chat_id: int, message_id: int, cb_id: str, gname: str, *, back_cb: str = "px:groups") -> None:
     ui.answer_cb(cb_id, "测试中...")
     try:
-        results = asyncio.run(pm.test_group(gname, timeout=10))
+        results = asyncio.run(proxy_control.test_group(gname, timeout=10))
     except Exception as e:
         results = [{"name": gname, "ok": False, "error": str(e)[:200]}]
 
@@ -858,13 +854,13 @@ def _grp_del_exec(chat_id: int, message_id: int, cb_id: str, payload: str) -> No
         ui.answer_cb(cb_id, "短码已失效")
         _show_groups(chat_id, message_id, "", page=page)
         return
-    pm.remove_group(gname)
+    proxy_control.remove_group(gname)
     ui.answer_cb(cb_id, f"已删除组 {gname}")
     _show_groups(chat_id, message_id, "", page=page)
 
 
 def _grp_del(chat_id: int, message_id: int, cb_id: str, gname: str) -> None:
-    pm.remove_group(gname)
+    proxy_control.remove_group(gname)
     ui.answer_cb(cb_id, f"已删除组 {gname}")
     _show_groups(chat_id, message_id, "")
 
@@ -892,8 +888,8 @@ def _get_key(chat_id: int, idx: int) -> Optional[str]:
 def _show_routing(chat_id: int, message_id: int, cb_id: str) -> None:
     if cb_id:
         ui.answer_cb(cb_id)
-    pm.init()
-    r = pm.get_routing()
+    proxy_control.init()
+    r = proxy_control.get_routing_dict()
 
     default_route = r.get("default", "direct")
     direct_fallback = bool(r.get("directFallback", False))
@@ -946,8 +942,8 @@ def _show_routing(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _toggle_direct_fallback(chat_id: int, message_id: int, cb_id: str) -> None:
-    enabled = not pm.direct_fallback_enabled()
-    pm.set_direct_fallback(enabled)
+    enabled = not proxy_control.direct_fallback_enabled()
+    proxy_control.set_direct_fallback(enabled)
     ui.answer_cb(cb_id, "直连兜底已开启" if enabled else "直连兜底已关闭")
     _show_routing(chat_id, message_id, "")
 
@@ -1012,15 +1008,15 @@ def _rt_do(chat_id: int, message_id: int, cb_id: str,
     if value == "__del__":
         if ":" in context:
             section, key = context.split(":", 1)
-            pm.remove_routing(key, section=section)
+            proxy_control.remove_routing(key, section=section)
         else:
-            pm.remove_routing(context)
+            proxy_control.remove_routing(context)
     else:
         if ":" in context:
             section, key = context.split(":", 1)
-            pm.set_routing(key, value, section=section)
+            proxy_control.set_routing(key, value, section=section)
         else:
-            pm.set_routing(context, value)
+            proxy_control.set_routing(context, value)
     back_fn(chat_id, message_id, "")
 
 
@@ -1029,7 +1025,7 @@ def _rt_do(chat_id: int, message_id: int, cb_id: str,
 def _show_func_routing(chat_id: int, message_id: int, cb_id: str) -> None:
     if cb_id:
         ui.answer_cb(cb_id)
-    r = pm.get_routing()
+    r = proxy_control.get_routing_dict()
     funcs = [
         ("telegram", "📱 Telegram", None, "Bot 所有功能调用"),
         ("oauth_anthropic", ui.family_tag("anthropic", suffix=" 家族"), "anthropic", "OAuth、登录/刷新、渠道请求、测试、/v1/messages"),
@@ -1062,9 +1058,9 @@ def _show_account_routing(chat_id: int, message_id: int, cb_id: str,
                           page: int = 1) -> None:
     if cb_id:
         ui.answer_cb(cb_id)
-    r = pm.get_routing()
+    r = proxy_control.get_routing_dict()
     acct_cfg = r.get("accounts") or {}
-    chs = [c for c in registry.all_channels() if c.type == "oauth"]
+    chs = [c for c in proxy_control.all_channels() if c.type == "oauth"]
 
     keys = [c.key for c in chs]
     _set_index(chat_id, keys)
@@ -1100,9 +1096,9 @@ def _show_account_routing(chat_id: int, message_id: int, cb_id: str,
 def _show_channel_routing(chat_id: int, message_id: int, cb_id: str) -> None:
     if cb_id:
         ui.answer_cb(cb_id)
-    r = pm.get_routing()
+    r = proxy_control.get_routing_dict()
     ch_cfg = r.get("channels") or {}
-    chs = [c for c in registry.all_channels() if c.type == "api"]
+    chs = [c for c in proxy_control.all_channels() if c.type == "api"]
 
     keys = [c.key for c in chs]
     _set_index(chat_id, keys)
@@ -1136,10 +1132,10 @@ def _show_model_routing(chat_id: int, message_id: int, cb_id: str,
                         page: int = 1) -> None:
     if cb_id:
         ui.answer_cb(cb_id)
-    r = pm.get_routing()
+    r = proxy_control.get_routing_dict()
     model_cfg = r.get("models") or {}
     try:
-        models = registry.available_models()
+        models = proxy_control.available_models()
     except Exception:
         models = []
 
@@ -1206,11 +1202,11 @@ def _rt_item_pick(chat_id: int, message_id: int, cb_id: str,
 
     display = key
     if category == "a":
-        chs = {c.key: c for c in registry.all_channels() if c.type == "oauth"}
+        chs = {c.key: c for c in proxy_control.all_channels() if c.type == "oauth"}
         if key in chs:
             display = ui.channel_display_name(chs[key].key, with_family=False)
     elif category == "c":
-        chs = {c.key: c for c in registry.all_channels() if c.type == "api"}
+        chs = {c.key: c for c in proxy_control.all_channels() if c.type == "api"}
         if key in chs:
             display = chs[key].display_name
 
@@ -1230,6 +1226,7 @@ def _rt_item_pick(chat_id: int, message_id: int, cb_id: str,
 # ═══════════════════════════════════════════════════════════════════
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
+    proxy_control.bind_telegram_actor(chat_id)
     # 代理列表
     if data == "px:show":
         show(chat_id, message_id, cb_id); return True
@@ -1362,6 +1359,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
 
 
 def handle_text_state(chat_id: int, action: str, text: str) -> bool:
+    if action in {"px_add_url", "px_add_name", "px_grp_add_name"}:
+        proxy_control.bind_telegram_actor(chat_id)
     if action == "px_add_url":
         _on_add_url_input(chat_id, text); return True
     if action == "px_add_name":
