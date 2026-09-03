@@ -65,11 +65,21 @@ def test_every_python_file_added_since_p0_baseline_is_at_most_1000_lines():
             text=True,
         ).splitlines()
     )
-    current_files = {
-        path.relative_to(ROOT).as_posix()
-        for path in ROOT.rglob("*.py")
-        if ".git" not in path.parts
-    }
+    current_files = set(
+        subprocess.check_output(
+            [
+                "git",
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                "*.py",
+            ],
+            cwd=ROOT,
+            text=True,
+        ).splitlines()
+    )
     added = sorted(path for path in current_files if path not in baseline_files)
     assert added, "the P0 gate expects added Python files"
     too_large = []
