@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 
 from .base import ResponseMeta, StrictSchema
 from .mapping import MappingListMeta
@@ -110,11 +110,34 @@ class PutMetadataBindingRequest(StrictSchema):
     channelId: str | None = Field(default=None, min_length=1, max_length=500)
     outboundModel: str | None = Field(default=None, min_length=1, max_length=500)
 
+    @field_validator("accountId", mode="before")
+    @classmethod
+    def reject_extra_account_selector(cls, value, info: ValidationInfo):
+        scope = info.data.get("scope")
+        if scope in {MetadataScope.GLOBAL, MetadataScope.API}:
+            raise ValueError(f"{scope.value} scope does not accept accountId")
+        return value
+
+    @field_validator("channelId", mode="before")
+    @classmethod
+    def reject_extra_channel_selector(cls, value, info: ValidationInfo):
+        scope = info.data.get("scope")
+        if scope in {MetadataScope.GLOBAL, MetadataScope.OAUTH}:
+            raise ValueError(f"{scope.value} scope does not accept channelId")
+        return value
+
+    @field_validator("outboundModel", mode="before")
+    @classmethod
+    def reject_global_outbound_selector(cls, value, info: ValidationInfo):
+        if info.data.get("scope") is MetadataScope.GLOBAL:
+            raise ValueError("global scope does not accept outboundModel")
+        return value
+
     @model_validator(mode="after")
     def validate_scope_selector(self):
         if self.scope is MetadataScope.GLOBAL:
-            if self.accountId is not None or self.channelId is not None:
-                raise ValueError("global scope does not accept accountId/channelId")
+            if self.accountId is not None or self.channelId is not None or self.outboundModel is not None:
+                raise ValueError("global scope does not accept scoped selectors")
         elif self.scope is MetadataScope.OAUTH:
             if not self.accountId or self.channelId is not None:
                 raise ValueError("oauth scope requires only accountId")

@@ -6,8 +6,10 @@ its fixture explicitly rather than modifying global conftest/P0 fixtures.
 
 from __future__ import annotations
 
+import ast
 import copy
 import time
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -156,3 +158,82 @@ def test_openapi_matches_owned_operation_manifest(domain_client):
     }
     assert owned == OWNED_OPERATION_IDS
     assert len(owned) == 40
+
+
+def test_p5_router_operations_each_call_control_once_with_authorized_context():
+    root = Path(__file__).resolve().parents[2]
+    operations = []
+    for relative in (
+        "src/management_api/routers/mapping.py",
+        "src/management_api/routers/model_metadata.py",
+        "src/management_api/routers/load_balancing.py",
+        "src/management_api/routers/proxy.py",
+    ):
+        tree = ast.parse((root / relative).read_text(encoding="utf-8"))
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            is_operation = any(
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Attribute)
+                and isinstance(decorator.func.value, ast.Name)
+                and decorator.func.value.id == "router"
+                for decorator in node.decorator_list
+            )
+            if not is_operation:
+                continue
+            control_calls = [
+                call for call in ast.walk(node)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "control"
+            ]
+            assert len(control_calls) == 1, (relative, node.name, control_calls)
+            assert control_calls[0].args
+            first_argument = control_calls[0].args[0]
+            assert isinstance(first_argument, ast.Name)
+            assert first_argument.id == "context", (relative, node.name)
+            operations.append((relative, node.name))
+    assert len(operations) == 40
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("get", "/api/management/v1/model-mappings"),
+        ("delete", "/api/management/v1/model-mappings/example"),
+        ("get", "/api/management/v1/ingress-default-models/anthropic"),
+        ("delete", "/api/management/v1/ingress-default-models/anthropic"),
+        ("get", "/api/management/v1/compression-model"),
+        ("delete", "/api/management/v1/compression-model"),
+        ("get", "/api/management/v1/models/inventory"),
+        ("get", "/api/management/v1/model-metadata"),
+        ("get", "/api/management/v1/model-metadata/example"),
+        ("delete", "/api/management/v1/model-metadata/example/binding"),
+        ("get", "/api/management/v1/model-catalog"),
+        ("get", "/api/management/v1/load-balancing"),
+        ("get", "/api/management/v1/load-balancing/channel-order"),
+        ("get", "/api/management/v1/load-balancing/model-orders/example"),
+        ("delete", "/api/management/v1/load-balancing/model-orders/example"),
+        ("get", "/api/management/v1/proxies"),
+        ("get", "/api/management/v1/proxies/example"),
+        ("delete", "/api/management/v1/proxies/example"),
+        ("get", "/api/management/v1/proxy-groups"),
+        ("get", "/api/management/v1/proxy-groups/example"),
+        ("delete", "/api/management/v1/proxy-groups/example"),
+        ("get", "/api/management/v1/proxy-routing"),
+    ],
+)
+def test_every_p5_get_and_delete_rejects_unknown_query_parameters(
+    domain_client, method, path,
+):
+    client, _runtime, admin, *_ = domain_client
+    response = client.request(method, f"{path}?undeclared=1", headers=admin)
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+    assert response.json()["error"]["fields"] == [{
+        "path": "undeclared",
+        "code": "UNKNOWN_QUERY_PARAMETER",
+        "message": "query parameter 'undeclared' is not supported",
+    }]

@@ -6,6 +6,7 @@ import asyncio
 import re
 import threading
 from dataclasses import dataclass
+from ipaddress import ip_address
 from typing import Any, Mapping
 
 from src import config, log_db, oauth_manager
@@ -314,6 +315,30 @@ class ProxyControl(DomainControl):
                         else:
                             value[child] = new
 
+    @staticmethod
+    def _routing_references(routing: Mapping[str, Any], target: str) -> list[str]:
+        references: list[str] = []
+        for key, value in routing.items():
+            if value == target:
+                references.append(f"routing.{key}")
+            elif isinstance(value, Mapping):
+                references.extend(
+                    f"routing.{key}.{child}"
+                    for child, child_target in value.items()
+                    if child_target == target
+                )
+        return references
+
+    @staticmethod
+    def _referenced_error(references: list[str]) -> ManagementError:
+        return ManagementError(
+            ManagementErrorCode.RESOURCE_CONFLICT,
+            fields=tuple(
+                ErrorField(path, "RESOURCE_IN_USE", "resource is still referenced")
+                for path in references
+            ),
+        )
+
     def delete_proxy(
         self,
         context: ManagementContext,
@@ -324,8 +349,19 @@ class ProxyControl(DomainControl):
         actual = self._write(context, Capability.DESTRUCTIVE)
         with config.serialized_updates():
             self._check_revision(expected_revision, self._revision(), required=True)
-            if proxy_id not in self._network_snapshot()["proxies"]:
+            snapshot = self._network_snapshot()
+            if proxy_id not in snapshot["proxies"]:
                 raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+            references = [
+                f"groups.{group_id}[{index}]"
+                for group_id, members in snapshot["groups"].items()
+                if isinstance(members, list)
+                for index, member in enumerate(members)
+                if member == proxy_id
+            ]
+            references.extend(self._routing_references(snapshot["routing"], proxy_id))
+            if references:
+                raise self._referenced_error(references)
             proxy_manager.remove_proxy(proxy_id)
         self._audit(actual, "proxy.delete", proxy_id, "succeeded")
 
@@ -460,8 +496,19 @@ class ProxyControl(DomainControl):
         actual = self._write(context, Capability.DESTRUCTIVE)
         with config.serialized_updates():
             self._check_revision(expected_revision, self._revision(), required=True)
-            if group_id not in self._network_snapshot()["groups"]:
+            snapshot = self._network_snapshot()
+            if group_id not in snapshot["groups"]:
                 raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+            references = [
+                f"groups.{parent_id}[{index}]"
+                for parent_id, members in snapshot["groups"].items()
+                if parent_id != group_id and isinstance(members, list)
+                for index, member in enumerate(members)
+                if member == group_id
+            ]
+            references.extend(self._routing_references(snapshot["routing"], group_id))
+            if references:
+                raise self._referenced_error(references)
             proxy_manager.remove_group(group_id)
         self._audit(actual, "proxy_group.delete", group_id, "succeeded")
 
@@ -549,6 +596,65 @@ class ProxyControl(DomainControl):
         self._audit(actual, "proxy_routing.update", "proxy-routing", "succeeded")
         return result
 
+    @staticmethod
+    def _probe_number(raw: Mapping[str, Any], *keys: str) -> int | float | None:
+        value = next((raw[key] for key in keys if key in raw), None)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            return None
+        return value
+
+    @classmethod
+    def _public_probe_item(
+        cls,
+        raw: Any,
+        *,
+        member_name: str | None = None,
+    ) -> dict[str, Any]:
+        item = raw if isinstance(raw, Mapping) else {}
+        address = ""
+        try:
+            address = str(ip_address(str(item.get("ip") or "")))
+        except ValueError:
+            pass
+        ok = item.get("ok") is True
+        result: dict[str, Any] = {
+            "ok": ok,
+            "ip": address,
+            "latencyMilliseconds": cls._probe_number(
+                item, "latency_ms", "latencyMilliseconds"
+            ),
+            "traffic": {
+                "bytesUp": cls._probe_number(item, "bytes_up", "bytesUp") or 0,
+                "bytesDown": cls._probe_number(item, "bytes_down", "bytesDown") or 0,
+                "totalBytes": cls._probe_number(item, "total_bytes", "totalBytes") or 0,
+            },
+            "error": None if ok else {
+                "code": ManagementErrorCode.UPSTREAM_ERROR.value,
+                "message": "Proxy probe failed",
+            },
+        }
+        if member_name is not None:
+            result["name"] = member_name
+        return result
+
+    @classmethod
+    def _public_probe_results(
+        cls,
+        raw: Any,
+        *,
+        group_members: tuple[str, ...] | None,
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        if group_members is None:
+            return cls._public_probe_item(raw)
+        values = raw if isinstance(raw, list) else []
+        return [
+            cls._public_probe_item(
+                values[index] if index < len(values) else {},
+                member_name=member,
+            )
+            for index, member in enumerate(group_members)
+        ]
+
     def _start_probe(
         self,
         context: ManagementContext,
@@ -573,6 +679,9 @@ class ProxyControl(DomainControl):
         container = snapshot["groups"] if group else snapshot["proxies"]
         if target not in container:
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+        group_members = (
+            tuple(str(member) for member in container[target]) if group else None
+        )
         operation = self._operation_store.create(context, kind=kind, cancellable=False)
         self._remember_idempotency(
             context,
@@ -588,7 +697,12 @@ class ProxyControl(DomainControl):
                     proxy_manager.test_group(target, timeout=10)
                     if group else proxy_manager.test_proxy(target, timeout=10)
                 )
-                self._operation_store.succeed(operation.id, {"target": target, "results": result})
+                public_result = self._public_probe_results(
+                    result, group_members=group_members,
+                )
+                self._operation_store.succeed(
+                    operation.id, {"target": target, "results": public_result}
+                )
                 self._audit(context, kind, target, "succeeded")
             except Exception:
                 self._operation_store.fail(
@@ -597,6 +711,7 @@ class ProxyControl(DomainControl):
                     message="proxy probe failed",
                     retryable=True,
                 )
+                self._audit(context, kind, target, "failed")
 
         threading.Thread(
             target=worker,

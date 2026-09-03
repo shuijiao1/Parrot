@@ -23,6 +23,7 @@ from ..dependencies import (
 )
 from ..error_mapping import management_error_responses
 from ..schemas.base import ResponseMeta
+from ._p5_query import reject_unknown_query_parameters
 from ..schemas.load_balancing import (
     AffinityClearData,
     AffinityClearEnvelope,
@@ -115,6 +116,7 @@ def get_load_balancing(
     context: ReadContext,
     control: Annotated[LoadBalancingControl, Depends(get_load_balancing_control)],
 ) -> LoadBalancingEnvelope:
+    reject_unknown_query_parameters(request)
     return LoadBalancingEnvelope(
         data=_load_balancing(control.get(context)), meta=_meta(request)
     )
@@ -152,6 +154,7 @@ def get_channel_order(
     context: ReadContext,
     control: Annotated[LoadBalancingControl, Depends(get_load_balancing_control)],
 ) -> OrderEnvelope:
+    reject_unknown_query_parameters(request)
     return OrderEnvelope(
         data=_order(control.get_channel_order(context)), meta=_meta(request)
     )
@@ -190,6 +193,7 @@ def get_model_channel_order(
     context: ReadContext,
     control: Annotated[LoadBalancingControl, Depends(get_load_balancing_control)],
 ) -> OrderEnvelope:
+    reject_unknown_query_parameters(request)
     return OrderEnvelope(
         data=_order(control.get_model_order(context, model_id)), meta=_meta(request)
     )
@@ -225,10 +229,12 @@ def replace_model_channel_order(
 )
 def delete_model_channel_order(
     model_id: Annotated[str, Path(max_length=500)],
+    request: Request,
     context: DestroyContext,
     control: Annotated[LoadBalancingControl, Depends(get_load_balancing_control)],
     if_match: IfMatch = None,
 ) -> Response:
+    reject_unknown_query_parameters(request)
     control.delete_model_order(
         context, model_id, expected_revision=if_match
     )

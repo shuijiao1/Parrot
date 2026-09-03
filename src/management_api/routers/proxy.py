@@ -24,6 +24,7 @@ from ..dependencies import (
 )
 from ..error_mapping import management_error_responses
 from ..schemas.base import ResponseMeta
+from ._p5_query import reject_unknown_query_parameters
 from ..schemas.mapping import MappingListMeta
 from ..schemas.operations import ManagementOperationData, OperationErrorData, OperationProgressData
 from ..schemas.proxy import (
@@ -196,6 +197,9 @@ def list_proxies(
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 50,
 ) -> ProxyListEnvelope:
+    reject_unknown_query_parameters(
+        request, {"type", "query", "sort", "page", "pageSize"}
+    )
     result = control.list_proxies(
         context, type_filter=type_filter.value if type_filter else None,
         query=query, sort=sort.value, page=page, page_size=page_size,
@@ -229,6 +233,7 @@ def get_proxy(
     proxy_id: Annotated[str, Path(max_length=100)], request: Request,
     context: ReadContext, control: Annotated[ProxyControl, Depends(get_proxy_control)],
 ) -> ProxyEnvelope:
+    reject_unknown_query_parameters(request)
     return ProxyEnvelope(data=_proxy(control.get_proxy(context, proxy_id)), meta=_meta(request))
 
 
@@ -253,12 +258,14 @@ def update_proxy(
 @router.delete(
     "/proxies/{proxy_id}", operation_id="deleteProxy", tags=["management-proxy"],
     status_code=204,
-    responses={204: {"description": "Proxy and all references deleted"}, **management_error_responses(*_MUTATION_ERRORS)},
+    responses={204: {"description": "Unreferenced proxy deleted"}, **management_error_responses(*_MUTATION_ERRORS)},
 )
 def delete_proxy(
-    proxy_id: Annotated[str, Path(max_length=100)], context: DestroyContext,
+    proxy_id: Annotated[str, Path(max_length=100)], request: Request,
+    context: DestroyContext,
     control: Annotated[ProxyControl, Depends(get_proxy_control)], if_match: IfMatch = None,
 ) -> Response:
+    reject_unknown_query_parameters(request)
     control.delete_proxy(context, proxy_id, expected_revision=if_match)
     return Response(status_code=204)
 
@@ -290,6 +297,7 @@ def list_proxy_groups(
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 50,
 ) -> ProxyGroupListEnvelope:
+    reject_unknown_query_parameters(request, {"query", "sort", "page", "pageSize"})
     result = control.list_groups(
         context, query=query, sort=sort.value, page=page, page_size=page_size
     )
@@ -322,6 +330,7 @@ def get_proxy_group(
     group_id: Annotated[str, Path(max_length=100)], request: Request,
     context: ReadContext, control: Annotated[ProxyControl, Depends(get_proxy_control)],
 ) -> ProxyGroupEnvelope:
+    reject_unknown_query_parameters(request)
     return ProxyGroupEnvelope(
         data=_group(control.get_group(context, group_id)), meta=_meta(request)
     )
@@ -347,12 +356,14 @@ def update_proxy_group(
 @router.delete(
     "/proxy-groups/{group_id}", operation_id="deleteProxyGroup", tags=["management-proxy"],
     status_code=204,
-    responses={204: {"description": "Proxy group and routing references deleted"}, **management_error_responses(*_MUTATION_ERRORS)},
+    responses={204: {"description": "Unreferenced proxy group deleted"}, **management_error_responses(*_MUTATION_ERRORS)},
 )
 def delete_proxy_group(
-    group_id: Annotated[str, Path(max_length=100)], context: DestroyContext,
+    group_id: Annotated[str, Path(max_length=100)], request: Request,
+    context: DestroyContext,
     control: Annotated[ProxyControl, Depends(get_proxy_control)], if_match: IfMatch = None,
 ) -> Response:
+    reject_unknown_query_parameters(request)
     control.delete_group(context, group_id, expected_revision=if_match)
     return Response(status_code=204)
 
@@ -380,6 +391,7 @@ def get_proxy_routing(
     request: Request, context: ReadContext,
     control: Annotated[ProxyControl, Depends(get_proxy_control)],
 ) -> ProxyRoutingEnvelope:
+    reject_unknown_query_parameters(request)
     return ProxyRoutingEnvelope(
         data=_routing(control.get_routing(context)), meta=_meta(request)
     )

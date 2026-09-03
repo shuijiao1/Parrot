@@ -18,6 +18,7 @@ from ..dependencies import (
 )
 from ..error_mapping import management_error_responses
 from ..schemas.base import ResponseMeta
+from ._p5_query import reject_unknown_query_parameters
 from ..schemas.mapping import (
     CompressionModelData,
     CompressionModelEnvelope,
@@ -124,6 +125,7 @@ def list_model_mappings(
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 50,
 ) -> MappingListEnvelope:
+    reject_unknown_query_parameters(request, {"query", "sort", "page", "pageSize"})
     result = control.list_mappings(
         context,
         query=query,
@@ -174,10 +176,12 @@ def put_model_mapping(
 )
 def delete_model_mapping(
     alias: Annotated[str, Path(min_length=1, max_length=300)],
+    request: Request,
     context: DestroyContext,
     control: Annotated[MappingControl, Depends(get_mapping_control)],
     if_match: IfMatch = None,
 ) -> Response:
+    reject_unknown_query_parameters(request)
     control.delete_mapping(context, alias, expected_revision=if_match)
     return Response(status_code=204)
 
@@ -195,6 +199,7 @@ def get_ingress_default_model(
     context: ReadContext,
     control: Annotated[MappingControl, Depends(get_mapping_control)],
 ) -> IngressDefaultEnvelope:
+    reject_unknown_query_parameters(request)
     item = control.get_ingress_default(context, ingress.value)
     return IngressDefaultEnvelope(
         data=IngressDefaultData(
@@ -239,10 +244,12 @@ def put_ingress_default_model(
 )
 def delete_ingress_default_model(
     ingress: Ingress,
+    request: Request,
     context: DestroyContext,
     control: Annotated[MappingControl, Depends(get_mapping_control)],
     if_match: IfMatch = None,
 ) -> Response:
+    reject_unknown_query_parameters(request)
     control.delete_ingress_default(
         context, ingress.value, expected_revision=if_match
     )
@@ -261,6 +268,7 @@ def get_compression_model(
     context: ReadContext,
     control: Annotated[MappingControl, Depends(get_mapping_control)],
 ) -> CompressionModelEnvelope:
+    reject_unknown_query_parameters(request)
     model_id, revision = control.get_compression(context)
     return CompressionModelEnvelope(
         data=CompressionModelData(modelId=model_id, revision=revision),
@@ -299,9 +307,11 @@ def put_compression_model(
     responses={204: {"description": "Compression model cleared"}, **management_error_responses(*_MUTATION_ERRORS)},
 )
 def delete_compression_model(
+    request: Request,
     context: DestroyContext,
     control: Annotated[MappingControl, Depends(get_mapping_control)],
     if_match: IfMatch = None,
 ) -> Response:
+    reject_unknown_query_parameters(request)
     control.delete_compression(context, expected_revision=if_match)
     return Response(status_code=204)

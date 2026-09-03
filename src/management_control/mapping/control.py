@@ -376,17 +376,32 @@ class MappingControl(DomainControl):
         bindings = list(model_metadata.list_bindings())
         records: list[MetadataRecord] = []
         if scope_id:
-            models = {
-                item.client_visible_model for item in inventory
+            if scope == "global":
+                raise self._validation(
+                    "scopeId", "NOT_ALLOWED", "global scope does not accept scopeId"
+                )
+            requested_scope = self._scope_resource_type(
+                scope_id, expected_scope=scope,
+            )
+            current_outbound = {
+                item.client_visible_model: item.outbound_model
+                for item in inventory
                 if item.scope_key == scope_id
             }
+            models = set(current_outbound)
             models.update(
                 item.client_visible_model for item in bindings
                 if item.scope_key == scope_id
             )
-            requested_scope = "oauth" if scope_id.startswith("oauth:") else "api"
             for model_id in sorted(models, key=str.casefold):
-                binding = model_metadata.resolve_binding(model_id, scope_key=scope_id)
+                outbound_model = current_outbound.get(model_id)
+                binding = None
+                if outbound_model is not None:
+                    binding = model_metadata.resolve_binding(
+                        model_id,
+                        scope_key=scope_id,
+                        outbound_model=outbound_model,
+                    )
                 records.append(self._metadata_record(
                     model_id, binding, revision,
                     scope=requested_scope, scope_id=scope_id,
@@ -405,7 +420,7 @@ class MappingControl(DomainControl):
             ):
                 binding = model_metadata.resolve_binding(model_id)
                 records.append(self._metadata_record(model_id, binding, revision))
-        if scope:
+        if scope and not scope_id:
             records = [item for item in records if item.scope == scope]
         needle = (query or "").strip().casefold()
         if needle:
@@ -436,10 +451,53 @@ class MappingControl(DomainControl):
         known.update(item.client_visible_model for item in model_metadata.list_bindings())
         if model_id not in known:
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
-        binding = model_metadata.resolve_binding(model_id, scope_key=scope_id)
-        return self._metadata_record(
-            model_id, binding, self._metadata_revision(inventory)
+        requested_scope = "global"
+        outbound_model = None
+        if scope_id:
+            requested_scope = self._scope_resource_type(scope_id)
+            match = next(
+                (
+                    item for item in inventory
+                    if item.scope_key == scope_id
+                    and item.client_visible_model == model_id
+                ),
+                None,
+            )
+            if match is None:
+                raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+            outbound_model = match.outbound_model
+        binding = model_metadata.resolve_binding(
+            model_id,
+            scope_key=scope_id,
+            outbound_model=outbound_model,
         )
+        return self._metadata_record(
+            model_id,
+            binding,
+            self._metadata_revision(inventory),
+            scope=requested_scope,
+            scope_id=scope_id,
+        )
+
+    @staticmethod
+    def _scope_resource_type(
+        scope_id: str,
+        *,
+        expected_scope: str | None = None,
+    ) -> str:
+        channel = registry.get_channel(scope_id)
+        if channel is None:
+            raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+        actual_scope = str(getattr(channel, "type", "") or "")
+        if actual_scope not in {"oauth", "api"}:
+            raise MappingControl._validation(
+                "scopeId", "UNSUPPORTED_SCOPE_TYPE", "scopeId is not an OAuth or API scope"
+            )
+        if expected_scope is not None and expected_scope != actual_scope:
+            raise MappingControl._validation(
+                "scopeId", "SCOPE_TYPE_MISMATCH", "scopeId type does not match scope"
+            )
+        return actual_scope
 
     @staticmethod
     def _scope_key(
@@ -449,15 +507,31 @@ class MappingControl(DomainControl):
         channel_id: str | None,
     ) -> str | None:
         if scope == "global":
+            extra = "accountId" if account_id is not None else (
+                "channelId" if channel_id is not None else None
+            )
+            if extra:
+                raise MappingControl._validation(
+                    extra, "NOT_ALLOWED", f"global scope does not accept {extra}"
+                )
             return None
+        if scope not in {"oauth", "api"}:
+            raise MappingControl._validation(
+                "scope", "UNSUPPORTED_SCOPE", "unsupported metadata scope"
+            )
+        if scope == "oauth" and channel_id is not None:
+            raise MappingControl._validation(
+                "channelId", "NOT_ALLOWED", "oauth scope does not accept channelId"
+            )
+        if scope == "api" and account_id is not None:
+            raise MappingControl._validation(
+                "accountId", "NOT_ALLOWED", "api scope does not accept accountId"
+            )
         value = account_id if scope == "oauth" else channel_id
         field = "accountId" if scope == "oauth" else "channelId"
         if not value:
             raise MappingControl._validation(field, "REQUIRED", f"{field} is required")
-        channel = registry.get_channel(value)
-        expected_type = "oauth" if scope == "oauth" else "api"
-        if channel is None or channel.type != expected_type:
-            raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+        MappingControl._scope_resource_type(value, expected_scope=scope)
         return value
 
     def put_binding(
@@ -475,6 +549,10 @@ class MappingControl(DomainControl):
     ) -> MetadataRecord:
         actual = self._write(context)
         scope_key = self._scope_key(scope, account_id=account_id, channel_id=channel_id)
+        if scope == "global" and outbound_model is not None:
+            raise self._validation(
+                "outboundModel", "NOT_ALLOWED", "global scope does not accept outboundModel"
+            )
         target = str(target_model_id or "").strip().lower()
         if not target.startswith(provider_id.lower() + "/"):
             raise self._validation(

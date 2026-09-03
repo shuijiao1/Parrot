@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import copy
 import time
+from types import SimpleNamespace
 
 import pytest
 
-from src import model_metadata, model_pricing
+from src import config, model_metadata, model_pricing
+from src.channel import registry
 from src.tests.test_management_mapping_support import domain_client, operation_map
 
 
@@ -190,3 +193,212 @@ def test_metadata_schema_validation_and_missing_ids(domain_client):
         headers=admin,
         json={"scope": "channel", "channelId": "api:missing"},
     ).status_code == 404
+
+
+def test_scoped_metadata_uses_current_inventory_outbound_and_rejects_stale_binding(
+    domain_client, monkeypatch,
+):
+    client, _runtime, admin, *_ = domain_client
+    catalog = model_pricing.catalog_models()
+    assert len(catalog) >= 2
+    global_target, scoped_target = catalog[0]["key"], catalog[1]["key"]
+    scope_id = "api:current-channel"
+    model_id = "client-alias"
+    model_metadata.set_binding(model_id, global_target, source="test-global")
+    model_metadata.set_binding(
+        model_id,
+        scoped_target,
+        scope_key=scope_id,
+        outbound_model="old-outbound",
+        source="test-scoped",
+    )
+    channel = SimpleNamespace(key=scope_id, type="api")
+    inventory = [model_metadata.ModelInventoryItem(
+        scope_key=scope_id,
+        scope_type="api",
+        scope_label="Current channel",
+        client_visible_model=model_id,
+        outbound_model="new-outbound",
+    )]
+    monkeypatch.setattr(
+        registry, "get_channel", lambda key: channel if key == scope_id else None
+    )
+    monkeypatch.setattr(model_metadata, "inventory_items", lambda: inventory)
+
+    runtime_binding = model_metadata.resolve_binding(
+        model_id, scope_key=scope_id, outbound_model="new-outbound"
+    )
+    assert runtime_binding is not None
+    assert runtime_binding.target == global_target
+    assert runtime_binding.scope_key is None
+
+    detail = client.get(
+        f"/api/management/v1/model-metadata/{model_id}?scopeId={scope_id}",
+        headers=admin,
+    )
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["data"]["target"] == global_target
+    assert detail.json()["data"]["scope"] == "global"
+    assert detail.json()["data"]["scopeId"] is None
+    assert detail.json()["data"]["outboundModel"] is None
+
+    listed = client.get(
+        f"/api/management/v1/model-metadata?scope=api&scopeId={scope_id}",
+        headers=admin,
+    )
+    assert listed.status_code == 200, listed.text
+    assert [(item["modelId"], item["target"], item["scope"])
+            for item in listed.json()["data"]] == [
+        (model_id, global_target, "global")
+    ]
+
+
+def test_metadata_selectors_are_strict_and_never_mutate_on_rejection(
+    domain_client, monkeypatch,
+):
+    client, _runtime, admin, *_ = domain_client
+    selected = model_pricing.catalog_models()[0]
+    model_id = "selector-model"
+    model_metadata.set_binding(model_id, selected["key"], source="test")
+    scope_channels = {
+        "oauth:account": SimpleNamespace(key="oauth:account", type="oauth"),
+        "api:channel": SimpleNamespace(key="api:channel", type="api"),
+        "other:scope": SimpleNamespace(key="other:scope", type="unknown"),
+    }
+    monkeypatch.setattr(registry, "get_channel", scope_channels.get)
+    before = copy.deepcopy(config.get().get("modelBindings"))
+
+    rejected = [
+        client.put(
+            f"/api/management/v1/model-metadata/{model_id}/binding",
+            headers=admin,
+            json={
+                "scope": "global",
+                "targetModelId": selected["key"],
+                "providerId": selected["provider_id"],
+                "outboundModel": "silently-discarded-before-fix",
+            },
+        ),
+        client.put(
+            f"/api/management/v1/model-metadata/{model_id}/binding",
+            headers=admin,
+            json={
+                "scope": "global",
+                "targetModelId": selected["key"],
+                "providerId": selected["provider_id"],
+                "outboundModel": None,
+            },
+        ),
+        client.put(
+            f"/api/management/v1/model-metadata/{model_id}/binding",
+            headers=admin,
+            json={
+                "scope": "global",
+                "targetModelId": selected["key"],
+                "providerId": selected["provider_id"],
+                "accountId": None,
+            },
+        ),
+        client.delete(
+            f"/api/management/v1/model-metadata/{model_id}/binding"
+            "?scope=global&accountId=oauth:account",
+            headers=admin,
+        ),
+        client.delete(
+            f"/api/management/v1/model-metadata/{model_id}/binding"
+            "?scope=oauth&accountId=oauth:account&channelId=api:channel",
+            headers=admin,
+        ),
+        client.delete(
+            f"/api/management/v1/model-metadata/{model_id}/binding"
+            "?scope=api&channelId=api:channel&accountId=oauth:account",
+            headers=admin,
+        ),
+        client.delete(
+            f"/api/management/v1/model-metadata/{model_id}/binding"
+            "?scope=oauth&accountId=api:channel",
+            headers=admin,
+        ),
+        client.get(
+            "/api/management/v1/model-metadata"
+            "?scope=global&scopeId=api:channel",
+            headers=admin,
+        ),
+        client.get(
+            "/api/management/v1/model-metadata"
+            "?scope=oauth&scopeId=api:channel",
+            headers=admin,
+        ),
+        client.get(
+            f"/api/management/v1/model-metadata/{model_id}?scopeId=other:scope",
+            headers=admin,
+        ),
+        client.get(
+            f"/api/management/v1/model-metadata/{model_id}?scopeId=",
+            headers=admin,
+        ),
+    ]
+    for response in rejected:
+        assert response.status_code == 422, response.text
+        assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+        assert response.json()["error"]["fields"]
+    assert config.get().get("modelBindings") == before
+
+    for method, path in (
+        ("get", "/api/management/v1/model-metadata?scopeId=api:missing"),
+        ("get", f"/api/management/v1/model-metadata/{model_id}?scopeId=api:missing"),
+        (
+            "delete",
+            f"/api/management/v1/model-metadata/{model_id}/binding"
+            "?scope=api&channelId=api:missing",
+        ),
+    ):
+        missing = client.request(method, path, headers=admin)
+        assert missing.status_code == 404, missing.text
+        assert missing.json()["error"]["code"] == "RESOURCE_NOT_FOUND"
+    assert config.get().get("modelBindings") == before
+
+
+@pytest.mark.parametrize(
+    "scope,selector_field,scope_id",
+    [
+        ("oauth", "accountId", "oauth:valid-account"),
+        ("api", "channelId", "api:valid-channel"),
+    ],
+)
+def test_valid_scoped_binding_put_and_delete_remain_supported(
+    domain_client, monkeypatch, scope, selector_field, scope_id,
+):
+    client, _runtime, admin, *_ = domain_client
+    selected = model_pricing.catalog_models()[0]
+    channel = SimpleNamespace(key=scope_id, type=scope)
+    monkeypatch.setattr(
+        registry, "get_channel", lambda key: channel if key == scope_id else None
+    )
+    model_id = f"valid-{scope}-model"
+    created = client.put(
+        f"/api/management/v1/model-metadata/{model_id}/binding",
+        headers=admin,
+        json={
+            "scope": scope,
+            "targetModelId": selected["key"],
+            "providerId": selected["provider_id"],
+            selector_field: scope_id,
+            "outboundModel": "current-outbound",
+        },
+    )
+    assert created.status_code == 200, created.text
+    data = created.json()["data"]
+    assert data["scope"] == scope
+    assert data["scopeId"] == scope_id
+    assert data["outboundModel"] == "current-outbound"
+
+    deleted = client.delete(
+        f"/api/management/v1/model-metadata/{model_id}/binding"
+        f"?scope={scope}&{selector_field}={scope_id}",
+        headers={**admin, "If-Match": data["revision"]},
+    )
+    assert deleted.status_code == 204, deleted.text
+    assert model_metadata.resolve_binding(
+        model_id, scope_key=scope_id, outbound_model="current-outbound"
+    ) is None

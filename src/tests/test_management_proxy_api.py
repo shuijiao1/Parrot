@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import time
 
 import pytest
@@ -64,6 +65,14 @@ def test_proxy_openapi_typed_examples_and_write_only_secret(domain_client):
     assert create_url["writeOnly"] is True
     # Optional SecretStr is represented as anyOf in Pydantic, while writeOnly stays on the property.
     assert update_url["writeOnly"] is True
+    routing = document["components"]["schemas"]["UpdateProxyRoutingRequest"]["properties"]
+    assert routing["default"]["type"] == "string"
+    assert routing["directFallback"]["type"] == "boolean"
+    for field in ("functions", "accounts", "channels", "models"):
+        assert routing[field]["type"] == "object"
+        assert {item["type"] for item in routing[field]["additionalProperties"]["anyOf"]} == {
+            "string", "null",
+        }
     serialized = repr(document)
     assert "private-password" not in serialized
 
@@ -80,7 +89,7 @@ def _create_proxy(client, headers, name, *, password="private-password"):
     return response.json()["data"]
 
 
-def test_proxy_crud_list_filter_pagination_secret_and_reference_cascade(domain_client):
+def test_proxy_crud_list_filter_pagination_secret_and_reference_conflict(domain_client):
     client, runtime, admin, *_ = domain_client
     first = _create_proxy(client, admin, "edge-a")
     _create_proxy(client, admin, "edge-b")
@@ -125,6 +134,33 @@ def test_proxy_crud_list_filter_pagination_secret_and_reference_cascade(domain_c
     )
     assert stale.status_code == 409
     current_revision = renamed.json()["data"]["revision"]
+    before_conflict = copy.deepcopy(config.get()["network"])
+    referenced = client.delete(
+        "/api/management/v1/proxies/edge-renamed",
+        headers={**admin, "If-Match": current_revision},
+    )
+    assert referenced.status_code == 409
+    assert referenced.json()["error"]["code"] == "RESOURCE_CONFLICT"
+    assert {item["path"] for item in referenced.json()["error"]["fields"]} == {
+        "groups.primary[0]", "routing.telegram",
+    }
+    assert config.get()["network"] == before_conflict
+
+    group_detail = client.get(
+        "/api/management/v1/proxy-groups/primary", headers=admin
+    ).json()["data"]
+    assert client.patch(
+        "/api/management/v1/proxy-groups/primary",
+        headers={**admin, "If-Match": group_detail["revision"]},
+        json={"members": ["direct"]},
+    ).status_code == 200
+    assert client.patch(
+        "/api/management/v1/proxy-routing", headers=admin,
+        json={"functions": {"telegram": None}},
+    ).status_code == 200
+    current_revision = client.get(
+        "/api/management/v1/proxies/edge-renamed", headers=admin
+    ).json()["data"]["revision"]
     deleted = client.delete(
         "/api/management/v1/proxies/edge-renamed",
         headers={**admin, "If-Match": current_revision},
@@ -169,9 +205,26 @@ def test_proxy_group_rename_clear_delete_and_conflicts(domain_client):
         json={"name": "edge", "members": ["direct"]},
     )
     assert conflict.status_code == 409
-    deleted = client.delete(
+    before_conflict = copy.deepcopy(config.get()["network"])
+    referenced = client.delete(
         "/api/management/v1/proxy-groups/new-group",
         headers={**admin, "If-Match": renamed.json()["data"]["revision"]},
+    )
+    assert referenced.status_code == 409
+    assert referenced.json()["error"]["code"] == "RESOURCE_CONFLICT"
+    assert referenced.json()["error"]["fields"][0]["path"] == "routing.default"
+    assert config.get()["network"] == before_conflict
+
+    assert client.patch(
+        "/api/management/v1/proxy-routing", headers=admin,
+        json={"default": "direct"},
+    ).status_code == 200
+    revision = client.get(
+        "/api/management/v1/proxy-groups/new-group", headers=admin
+    ).json()["data"]["revision"]
+    deleted = client.delete(
+        "/api/management/v1/proxy-groups/new-group",
+        headers={**admin, "If-Match": revision},
     )
     assert deleted.status_code == 204
     assert client.get(
@@ -194,20 +247,34 @@ def _poll(client, headers, operation_id):
 
 
 def test_proxy_and_group_probe_are_fake_202_operations(domain_client, monkeypatch):
-    client, _runtime, admin, *_ = domain_client
+    client, runtime, admin, *_ = domain_client
     _create_proxy(client, admin, "edge", password="probe-secret")
     assert client.post(
         "/api/management/v1/proxy-groups", headers=admin,
-        json={"name": "primary", "members": ["edge"]},
+        json={"name": "primary", "members": ["edge", "direct"]},
     ).status_code == 201
 
     async def fake_proxy(name, *, timeout):
         assert timeout == 10
-        return {"ok": True, "ip": "203.0.113.10", "latency_ms": 12}
+        return {
+            "ok": True,
+            "ip": "203.0.113.10",
+            "latency_ms": 12,
+            "error": "ignored socks5://user:probe-secret@127.0.0.1:1080",
+        }
 
     async def fake_group(name, *, timeout):
         assert timeout == 10
-        return [{"name": "edge", "ok": True, "ip": "203.0.113.10", "latency_ms": 12}]
+        return [
+            {"name": "edge", "ok": True, "ip": "203.0.113.10", "latency_ms": 12},
+            {
+                "name": "direct",
+                "ok": False,
+                "ip": "",
+                "latency_ms": 7,
+                "error": "socks5://user:probe-secret@127.0.0.1:1080 failed",
+            },
+        ]
 
     monkeypatch.setattr(proxy_manager, "test_proxy", fake_proxy)
     monkeypatch.setattr(proxy_manager, "test_group", fake_group)
@@ -220,6 +287,21 @@ def test_proxy_and_group_probe_are_fake_202_operations(domain_client, monkeypatc
         terminal = _poll(client, admin, response.json()["data"]["id"])
         assert terminal["status"] == "succeeded"
         assert "probe-secret" not in repr(terminal)
+        assert "latency_ms" not in repr(terminal)
+        results = terminal["result"]["results"]
+        if isinstance(results, list):
+            assert [item["name"] for item in results] == ["edge", "direct"]
+            assert [item["latencyMilliseconds"] for item in results] == [12, 7]
+            assert results[1]["error"] == {
+                "code": "UPSTREAM_ERROR", "message": "Proxy probe failed",
+            }
+            results = results[0]
+        assert results["latencyMilliseconds"] == 12
+        assert results["traffic"] == {
+            "bytesUp": 0, "bytesDown": 0, "totalBytes": 0,
+        }
+        assert results["error"] is None
+    assert "probe-secret" not in repr(runtime.state_store.audit_snapshot())
 
 
 def test_proxy_probe_idempotency_replay_and_payload_conflict(domain_client, monkeypatch):
@@ -249,6 +331,55 @@ def test_proxy_probe_idempotency_replay_and_payload_conflict(domain_client, monk
     assert conflict.json()["error"]["code"] == "STATE_CONFLICT"
     _poll(client, admin, first.json()["data"]["id"])
     assert calls == [("edge-a", 10)]
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["default", "directFallback", "functions", "accounts", "channels", "models"],
+)
+def test_proxy_routing_explicit_null_is_422_and_does_not_mutate(
+    domain_client, field,
+):
+    client, _runtime, admin, *_ = domain_client
+    before = copy.deepcopy(config.get().get("network"))
+    response = client.patch(
+        "/api/management/v1/proxy-routing", headers=admin, json={field: None}
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+    assert response.json()["error"]["fields"][0]["path"] == field
+    assert config.get().get("network") == before
+
+
+def test_proxy_probe_exception_never_leaks_submitted_credential(
+    domain_client, monkeypatch,
+):
+    client, runtime, admin, *_ = domain_client
+    marker = "submitted-probe-marker-DO-NOT-LEAK"
+    _create_proxy(client, admin, "edge", password=marker)
+
+    async def failing_proxy(_name, *, timeout):
+        assert timeout == 10
+        raise RuntimeError(
+            f"connector failed via socks5://user:{marker}@127.0.0.1:1080"
+        )
+
+    monkeypatch.setattr(proxy_manager, "test_proxy", failing_proxy)
+    started = client.post(
+        "/api/management/v1/proxies/edge/actions/test", headers=admin
+    )
+    assert started.status_code == 202
+    assert marker not in started.text
+    terminal = _poll(client, admin, started.json()["data"]["id"])
+    assert terminal["status"] == "failed"
+    assert terminal["result"] is None
+    assert terminal["error"] == {
+        "code": "UPSTREAM_ERROR",
+        "message": "UPSTREAM_ERROR",
+        "retryable": True,
+    }
+    assert marker not in repr(terminal)
+    assert marker not in repr(runtime.state_store.audit_snapshot())
 
 
 def test_proxy_validation_missing_and_unknown_target(domain_client):

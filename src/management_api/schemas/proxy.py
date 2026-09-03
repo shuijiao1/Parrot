@@ -149,12 +149,14 @@ class ProxyRoutingEnvelope(StrictSchema):
 
 
 class UpdateProxyRoutingRequest(StrictSchema):
-    default: str | None = Field(default=None, min_length=1, max_length=100)
-    directFallback: bool | None = None
-    functions: dict[str, str | None] | None = None
-    accounts: dict[str, str | None] | None = None
-    channels: dict[str, str | None] | None = None
-    models: dict[str, str | None] | None = None
+    # A None default marks an omitted sparse-PATCH field internally.  The public
+    # types deliberately exclude null, while mapping values keep null=delete.
+    default: str = Field(default=None, min_length=1, max_length=100)
+    directFallback: bool = None
+    functions: dict[str, str | None] = None
+    accounts: dict[str, str | None] = None
+    channels: dict[str, str | None] = None
+    models: dict[str, str | None] = None
 
     @model_validator(mode="after")
     def require_change(self):

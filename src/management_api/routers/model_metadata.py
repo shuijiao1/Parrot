@@ -24,6 +24,7 @@ from ..dependencies import (
 )
 from ..error_mapping import management_error_responses
 from ..schemas.base import ResponseMeta
+from ._p5_query import reject_unknown_query_parameters
 from ..schemas.mapping import MappingListMeta
 from ..schemas.model_metadata import (
     CatalogData,
@@ -228,6 +229,9 @@ def list_model_inventory(
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 50,
 ) -> ModelInventoryListEnvelope:
+    reject_unknown_query_parameters(
+        request, {"provider", "family", "query", "sort", "page", "pageSize"}
+    )
     result = control.list_inventory(
         context, provider=provider, family=family, query=query,
         sort=sort.value, page=page, page_size=page_size,
@@ -242,19 +246,22 @@ def list_model_inventory(
     operation_id="listModelMetadata",
     tags=["management-model-metadata"],
     response_model=ModelMetadataListEnvelope,
-    responses={**_success(200, [_METADATA_EXAMPLE]), **management_error_responses(*_COMMON_ERRORS)},
+    responses={**_success(200, [_METADATA_EXAMPLE]), **management_error_responses(*_RESOURCE_ERRORS)},
 )
 def list_model_metadata(
     request: Request,
     context: ReadContext,
     control: Annotated[MappingControl, Depends(get_metadata_control)],
     scope: MetadataScope | None = None,
-    scope_id: Annotated[str | None, Query(alias="scopeId", max_length=500)] = None,
+    scope_id: Annotated[str | None, Query(alias="scopeId", min_length=1, max_length=500)] = None,
     query: Annotated[str | None, Query(max_length=300)] = None,
     sort: MetadataSort = MetadataSort.MODEL_ID,
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 50,
 ) -> ModelMetadataListEnvelope:
+    reject_unknown_query_parameters(
+        request, {"scope", "scopeId", "query", "sort", "page", "pageSize"}
+    )
     result = control.list_metadata(
         context, scope=scope.value if scope else None, scope_id=scope_id,
         query=query, sort=sort.value, page=page, page_size=page_size,
@@ -276,8 +283,9 @@ def get_model_metadata(
     request: Request,
     context: ReadContext,
     control: Annotated[MappingControl, Depends(get_metadata_control)],
-    scope_id: Annotated[str | None, Query(alias="scopeId", max_length=500)] = None,
+    scope_id: Annotated[str | None, Query(alias="scopeId", min_length=1, max_length=500)] = None,
 ) -> ModelMetadataEnvelope:
+    reject_unknown_query_parameters(request, {"scopeId"})
     return ModelMetadataEnvelope(
         data=_metadata(control.get_metadata(context, model_id, scope_id=scope_id)),
         meta=_meta(request),
@@ -321,13 +329,15 @@ def put_model_metadata_binding(
 )
 def delete_model_metadata_binding(
     model_id: Annotated[str, Path(max_length=500)],
+    request: Request,
     context: DestroyContext,
     control: Annotated[MappingControl, Depends(get_metadata_control)],
     scope: MetadataScope = MetadataScope.GLOBAL,
-    account_id: Annotated[str | None, Query(alias="accountId", max_length=500)] = None,
-    channel_id: Annotated[str | None, Query(alias="channelId", max_length=500)] = None,
+    account_id: Annotated[str | None, Query(alias="accountId", min_length=1, max_length=500)] = None,
+    channel_id: Annotated[str | None, Query(alias="channelId", min_length=1, max_length=500)] = None,
     if_match: IfMatch = None,
 ) -> Response:
+    reject_unknown_query_parameters(request, {"scope", "accountId", "channelId"})
     control.delete_binding_control(
         context, model_id,
         scope=scope.value,
@@ -379,6 +389,9 @@ def search_model_catalog(
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 50,
 ) -> CatalogListEnvelope:
+    reject_unknown_query_parameters(
+        request, {"provider", "query", "sort", "page", "pageSize"}
+    )
     result = control.search_catalog(
         context, provider=provider, query=query, sort=sort.value,
         page=page, page_size=page_size,
