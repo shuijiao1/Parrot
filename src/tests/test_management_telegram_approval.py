@@ -77,6 +77,31 @@ def test_mauth_dispatch_uses_callback_from_id_and_bypasses_legacy_menus(monkeypa
     assert recorder.calls[0][1]["show_alert"] is True
 
 
+def test_mauth_duplicate_decision_is_not_reported_as_success(monkeypatch):
+    recorder = Recorder()
+    monkeypatch.setattr(ui, "api", recorder)
+    ui.configure("fake-telegram-token", [42])
+    bot.configure_management_approval_handler(
+        lambda approval_id, telegram_user_id, approved: "alreadyDecided"
+    )
+    try:
+        bot._handle_callback(
+            {
+                "id": "duplicate-callback-id",
+                "from": {"id": 42},
+                "message": {"chat": {"id": 42}, "message_id": 10},
+                "data": "mauth:a:map_fake_public_id",
+            }
+        )
+    finally:
+        bot.configure_management_approval_handler(None)
+    assert [method for method, _ in recorder.calls] == ["answerCallbackQuery"]
+    answer = recorder.calls[0][1]
+    assert answer["show_alert"] is True
+    assert answer["text"] == "登录批准已处理，不能重复决定"
+    assert "已批准登录" not in answer["text"]
+
+
 def test_mauth_fails_closed_without_management_handler(monkeypatch):
     recorder = Recorder()
     monkeypatch.setattr(ui, "api", recorder)

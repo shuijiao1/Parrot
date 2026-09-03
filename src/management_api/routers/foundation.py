@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, Request, Response, status
+from fastapi import APIRouter, Body, Depends, Header, Path, Request, Response, status
 
 from src.management_auth import (
     ApprovalError,
@@ -24,9 +25,9 @@ from ..dependencies import (
     management_request_id,
     require_capability,
 )
+from ..error_mapping import management_error_responses
 from ..schemas import (
     DataEnvelope,
-    ErrorEnvelope,
     ManagementCapabilitiesData,
     ManagementKeyGrant,
     ManagementMetadataData,
@@ -44,12 +45,132 @@ from ..schemas.operations import OperationErrorData, OperationProgressData
 
 
 router = APIRouter()
-_ERROR_RESPONSES = {
-    401: {"model": ErrorEnvelope, "description": "Management authentication failed"},
-    403: {"model": ErrorEnvelope, "description": "Capability or Origin denied"},
-    422: {"model": ErrorEnvelope, "description": "Typed request validation failed"},
-    503: {"model": ErrorEnvelope, "description": "Management service is unavailable"},
+
+_SESSION_GRANT_EXAMPLES = {
+    "managementKey": {
+        "summary": "Exchange a configured management key",
+        "value": {"grantType": "managementKey", "managementKey": "<write-only>"},
+    },
+    "telegramApproval": {
+        "summary": "Exchange an approved Telegram challenge",
+        "value": {
+            "grantType": "telegramApproval",
+            "approvalId": "approval-example",
+            "exchangeSecret": "<write-only>",
+        },
+    },
 }
+_APPROVAL_CREATE_EXAMPLES = {
+    "browser": {
+        "summary": "Request browser login approval",
+        "value": {"clientName": "admin-console", "deviceSummary": "desktop-browser"},
+    }
+}
+_SESSION_EXAMPLE = {
+    "data": {
+        "sessionId": "session-example",
+        "subjectId": "administrator",
+        "authMethod": "managementKey",
+        "roles": ["administrator"],
+        "capabilities": ["management.read", "management.write"],
+        "issuedAt": "2026-01-02T03:04:05Z",
+        "expiresAt": "2026-02-01T03:04:05Z",
+        "idleExpiresAt": "2026-01-05T03:04:05Z",
+    },
+    "meta": {"requestId": "request-example"},
+}
+_SESSION_CREATED_EXAMPLE = {
+    "data": {
+        "credential": "<one-time-write-only>",
+        "session": _SESSION_EXAMPLE["data"],
+    },
+    "meta": {"requestId": "request-example"},
+}
+_APPROVAL_CREATED_EXAMPLE = {
+    "data": {
+        "approvalId": "approval-example",
+        "exchangeSecret": "<one-time-write-only>",
+        "expiresAt": "2026-01-02T03:07:05Z",
+        "pollAfterSeconds": 2,
+    },
+    "meta": {"requestId": "request-example"},
+}
+_APPROVAL_STATUS_EXAMPLE = {
+    "data": {
+        "approvalId": "approval-example",
+        "status": "pending",
+        "expiresAt": "2026-01-02T03:07:05Z",
+        "pollAfterSeconds": 2,
+    },
+    "meta": {"requestId": "request-example"},
+}
+_METADATA_EXAMPLE = {
+    "data": {
+        "apiVersion": "v1",
+        "applicationVersion": "1.0.0",
+        "supportedCapabilities": ["management.read", "management.write"],
+        "enums": [
+            {"name": "authMethod", "values": ["managementKey", "telegramApproval"]}
+        ],
+        "documentationUrl": "/docs",
+    },
+    "meta": {"requestId": "request-example"},
+}
+_CAPABILITIES_EXAMPLE = {
+    "data": {
+        "domains": [
+            {
+                "domain": "management",
+                "capabilities": ["management.read"],
+                "actions": ["session.revoke", "operation.get", "operation.cancel"],
+                "providers": [],
+                "presets": [],
+                "protocols": [],
+                "modes": [],
+            }
+        ]
+    },
+    "meta": {"requestId": "request-example"},
+}
+_OPERATION_EXAMPLE = {
+    "data": {
+        "id": "operation-example",
+        "kind": "domain.refresh",
+        "status": "queued",
+        "progress": None,
+        "createdAt": "2026-01-02T03:04:05Z",
+        "startedAt": None,
+        "finishedAt": None,
+        "result": None,
+        "error": None,
+        "cancellable": True,
+    },
+    "meta": {"requestId": "request-example"},
+}
+
+
+def _success_response(http_status: int, example: dict) -> dict[int, dict]:
+    return {
+        http_status: {
+            "description": "Successful Response",
+            "content": {"application/json": {"example": example}},
+        }
+    }
+
+
+def _no_content_response(description: str) -> dict[int, dict]:
+    return {
+        204: {
+            "description": description,
+            "headers": {
+                "X-Request-Id": {
+                    "description": "Stable request correlation identifier",
+                    "schema": {"type": "string"},
+                    "example": "request-example",
+                }
+            },
+        }
+    }
 
 
 def _meta(request: Request) -> ResponseMeta:
@@ -105,10 +226,19 @@ def _operation_data(operation: ManagementOperation) -> ManagementOperationData:
     tags=["management-auth"],
     status_code=status.HTTP_201_CREATED,
     response_model=DataEnvelope[SessionCredentialData],
-    responses=_ERROR_RESPONSES,
+    responses={
+        **_success_response(201, _SESSION_CREATED_EXAMPLE),
+        **management_error_responses(
+            ManagementErrorCode.AUTHENTICATION_FAILED,
+            ManagementErrorCode.ORIGIN_DENIED,
+            ManagementErrorCode.VALIDATION_FAILED,
+            ManagementErrorCode.RATE_LIMITED,
+            ManagementErrorCode.SERVICE_NOT_READY,
+        ),
+    },
 )
 async def create_management_session(
-    grant: SessionGrant,
+    grant: Annotated[SessionGrant, Body(openapi_examples=_SESSION_GRANT_EXAMPLES)],
     request: Request,
     response: Response,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
@@ -150,7 +280,15 @@ async def create_management_session(
     operation_id="getCurrentManagementSession",
     tags=["management-auth"],
     response_model=DataEnvelope[SessionSummary],
-    responses=_ERROR_RESPONSES,
+    responses={
+        **_success_response(200, _SESSION_EXAMPLE),
+        **management_error_responses(
+            ManagementErrorCode.SESSION_REQUIRED,
+            ManagementErrorCode.SESSION_EXPIRED,
+            ManagementErrorCode.ORIGIN_DENIED,
+            ManagementErrorCode.SERVICE_NOT_READY,
+        ),
+    },
 )
 async def get_current_management_session(
     request: Request,
@@ -166,7 +304,15 @@ async def get_current_management_session(
     operation_id="revokeCurrentManagementSession",
     tags=["management-auth"],
     status_code=status.HTTP_204_NO_CONTENT,
-    responses=_ERROR_RESPONSES,
+    responses={
+        **_no_content_response("Management session revoked"),
+        **management_error_responses(
+            ManagementErrorCode.SESSION_REQUIRED,
+            ManagementErrorCode.SESSION_EXPIRED,
+            ManagementErrorCode.ORIGIN_DENIED,
+            ManagementErrorCode.SERVICE_NOT_READY,
+        ),
+    },
 )
 async def revoke_current_management_session(
     request: Request,
@@ -186,17 +332,30 @@ async def revoke_current_management_session(
     tags=["management-auth"],
     status_code=status.HTTP_201_CREATED,
     response_model=DataEnvelope[TelegramApprovalCreatedData],
-    responses=_ERROR_RESPONSES,
+    responses={
+        **_success_response(201, _APPROVAL_CREATED_EXAMPLE),
+        **management_error_responses(
+            ManagementErrorCode.ORIGIN_DENIED,
+            ManagementErrorCode.VALIDATION_FAILED,
+            ManagementErrorCode.RATE_LIMITED,
+            ManagementErrorCode.SERVICE_NOT_READY,
+            ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+        ),
+    },
 )
 async def create_telegram_approval(
-    body: TelegramApprovalCreateRequest,
+    body: Annotated[
+        TelegramApprovalCreateRequest,
+        Body(openapi_examples=_APPROVAL_CREATE_EXAMPLES),
+    ],
     request: Request,
     response: Response,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
 ) -> DataEnvelope[TelegramApprovalCreatedData]:
     request_id = management_request_id(request)
     try:
-        issued = runtime.approvals.create(
+        issued = await asyncio.to_thread(
+            runtime.approvals.create,
             client_name=body.clientName,
             source_address=request.client.host if request.client else "unknown",
             device_summary=body.deviceSummary,
@@ -228,10 +387,18 @@ async def create_telegram_approval(
     operation_id="getTelegramApproval",
     tags=["management-auth"],
     response_model=DataEnvelope[TelegramApprovalStatusData],
-    responses=_ERROR_RESPONSES,
+    responses={
+        **_success_response(200, _APPROVAL_STATUS_EXAMPLE),
+        **management_error_responses(
+            ManagementErrorCode.AUTHENTICATION_FAILED,
+            ManagementErrorCode.ORIGIN_DENIED,
+            ManagementErrorCode.VALIDATION_FAILED,
+            ManagementErrorCode.SERVICE_NOT_READY,
+        ),
+    },
 )
 async def get_telegram_approval(
-    approvalId: str,
+    approvalId: Annotated[str, Path(min_length=8, max_length=128)],
     request: Request,
     response: Response,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
@@ -261,7 +428,17 @@ async def get_telegram_approval(
     operation_id="getManagementMetadata",
     tags=["management-discovery"],
     response_model=DataEnvelope[ManagementMetadataData],
-    responses=_ERROR_RESPONSES,
+    responses={
+        **_success_response(200, _METADATA_EXAMPLE),
+        **management_error_responses(
+            ManagementErrorCode.INVALID_REQUEST,
+            ManagementErrorCode.SESSION_REQUIRED,
+            ManagementErrorCode.SESSION_EXPIRED,
+            ManagementErrorCode.ORIGIN_DENIED,
+            ManagementErrorCode.CAPABILITY_DENIED,
+            ManagementErrorCode.SERVICE_NOT_READY,
+        ),
+    },
 )
 async def get_management_metadata(
     request: Request,
@@ -292,7 +469,17 @@ async def get_management_metadata(
     operation_id="getManagementCapabilities",
     tags=["management-discovery"],
     response_model=DataEnvelope[ManagementCapabilitiesData],
-    responses=_ERROR_RESPONSES,
+    responses={
+        **_success_response(200, _CAPABILITIES_EXAMPLE),
+        **management_error_responses(
+            ManagementErrorCode.INVALID_REQUEST,
+            ManagementErrorCode.SESSION_REQUIRED,
+            ManagementErrorCode.SESSION_EXPIRED,
+            ManagementErrorCode.ORIGIN_DENIED,
+            ManagementErrorCode.CAPABILITY_DENIED,
+            ManagementErrorCode.SERVICE_NOT_READY,
+        ),
+    },
 )
 async def get_management_capabilities(
     request: Request,
@@ -321,10 +508,22 @@ async def get_management_capabilities(
     operation_id="getManagementOperation",
     tags=["management-operations"],
     response_model=DataEnvelope[ManagementOperationData],
-    responses=_ERROR_RESPONSES,
+    responses={
+        **_success_response(200, _OPERATION_EXAMPLE),
+        **management_error_responses(
+            ManagementErrorCode.INVALID_REQUEST,
+            ManagementErrorCode.SESSION_REQUIRED,
+            ManagementErrorCode.SESSION_EXPIRED,
+            ManagementErrorCode.ORIGIN_DENIED,
+            ManagementErrorCode.CAPABILITY_DENIED,
+            ManagementErrorCode.OPERATION_NOT_FOUND,
+            ManagementErrorCode.VALIDATION_FAILED,
+            ManagementErrorCode.SERVICE_NOT_READY,
+        ),
+    },
 )
 async def get_management_operation(
-    operationId: str,
+    operationId: Annotated[str, Path(min_length=4, max_length=128)],
     request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
     context: Annotated[ManagementContext, Depends(get_management_context)],
@@ -338,10 +537,23 @@ async def get_management_operation(
     operation_id="cancelManagementOperation",
     tags=["management-operations"],
     status_code=status.HTTP_204_NO_CONTENT,
-    responses=_ERROR_RESPONSES,
+    responses={
+        **_no_content_response("Management operation cancelled"),
+        **management_error_responses(
+            ManagementErrorCode.INVALID_REQUEST,
+            ManagementErrorCode.INVALID_OPERATION_STATE,
+            ManagementErrorCode.SESSION_REQUIRED,
+            ManagementErrorCode.SESSION_EXPIRED,
+            ManagementErrorCode.ORIGIN_DENIED,
+            ManagementErrorCode.CAPABILITY_DENIED,
+            ManagementErrorCode.OPERATION_NOT_FOUND,
+            ManagementErrorCode.VALIDATION_FAILED,
+            ManagementErrorCode.SERVICE_NOT_READY,
+        ),
+    },
 )
 async def cancel_management_operation(
-    operationId: str,
+    operationId: Annotated[str, Path(min_length=4, max_length=128)],
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
     context: Annotated[ManagementContext, Depends(get_management_context)],
 ) -> Response:

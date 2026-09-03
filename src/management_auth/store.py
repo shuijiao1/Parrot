@@ -276,7 +276,8 @@ class ManagementStateStore:
             if row is None:
                 return "notFound"
             if row["status"] != "pending":
-                return str(row["status"])
+                status = str(row["status"])
+                return "alreadyDecided" if status in {"approved", "denied"} else status
             cursor = self._conn.execute(
                 "UPDATE approvals SET status=?,decided_by=?,decided_at=? "
                 "WHERE approval_id=? AND status='pending' AND expires_at>?",
@@ -284,7 +285,10 @@ class ManagementStateStore:
             )
             if cursor.rowcount != 1:
                 row = self._approval_row(approval_id, now)
-                return str(row["status"]) if row else "notFound"
+                if row is None:
+                    return "notFound"
+                status = str(row["status"])
+                return "alreadyDecided" if status in {"approved", "denied"} else status
             return target
 
     def deny_pending_approval(self, approval_id: str) -> None:

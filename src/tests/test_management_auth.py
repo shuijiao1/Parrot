@@ -297,9 +297,14 @@ def test_telegram_approval_is_browser_bound_one_time_and_atomic(tmp_path):
     assert approvals.decide(
         issued.approval_id, telegram_user_id=42, approved=True,
     ) is ApprovalStatus.APPROVED
-    assert approvals.decide(
-        issued.approval_id, telegram_user_id=42, approved=False,
-    ) is ApprovalStatus.APPROVED
+    with pytest.raises(ApprovalError) as repeated_decision:
+        approvals.decide(
+            issued.approval_id, telegram_user_id=42, approved=False,
+        )
+    assert repeated_decision.value.reason == "alreadyDecided"
+    assert approvals.get(
+        issued.approval_id, issued.exchange_secret,
+    ).status is ApprovalStatus.APPROVED
 
     successes = []
     failures = []
@@ -343,6 +348,9 @@ def test_approval_denial_expiry_cross_challenge_and_secret_replay(tmp_path):
         request_id="denied",
     )
     approvals.decide(denied.approval_id, telegram_user_id=42, approved=False)
+    with pytest.raises(ApprovalError) as repeated_denial:
+        approvals.decide(denied.approval_id, telegram_user_id=42, approved=False)
+    assert repeated_denial.value.reason == "alreadyDecided"
     with pytest.raises(SessionAuthenticationError) as denied_exchange:
         sessions.create_from_telegram_approval(
             approval_id=denied.approval_id,

@@ -80,6 +80,44 @@ def test_management_initialization_and_shutdown_are_isolated(tmp_path, monkeypat
     assert server.tgbot._management_approval_handler is None
 
 
+def test_server_metadata_links_to_served_fastapi_documentation(
+    tmp_path, monkeypatch,
+):
+    values = settings(tmp_path)
+    monkeypatch.setattr(server.config, "management_settings", lambda: values)
+    holder = FastAPI()
+    runtime = server._initialize_management_runtime(holder)
+    assert isinstance(runtime, ManagementRuntime)
+    issued = runtime.sessions.create_from_management_key(
+        values["managementKey"],
+        source="composition-test",
+        request_id="documentation-test",
+    )
+
+    original_runtime = server.app.state.management_runtime
+    server.drain.reset_for_tests()
+    server.app.state.management_runtime = runtime
+    try:
+        client = TestClient(server.app)
+        metadata = client.get(
+            "/api/management/v1/meta",
+            headers={"Authorization": f"Bearer {issued.credential}"},
+        )
+        assert metadata.status_code == 200
+        documentation_url = metadata.json()["data"]["documentationUrl"]
+        assert documentation_url == "/docs"
+        documentation = client.get(documentation_url)
+        assert documentation.status_code == 200
+        assert "/openapi.json" in documentation.text
+        openapi = client.get("/openapi.json")
+        assert openapi.status_code == 200
+        assert "/api/management/v1/meta" in openapi.json()["paths"]
+    finally:
+        server.app.state.management_runtime = original_runtime
+        server._close_management_runtime(holder)
+        server.drain.reset_for_tests()
+
+
 def test_management_initialization_failure_stays_fail_closed_and_inference_health_works(
     monkeypatch,
 ):

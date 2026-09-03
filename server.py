@@ -49,7 +49,13 @@ from src.management_api import (
     create_management_router,
     install_management_error_handlers,
 )
-from src.management_auth import ApprovalService, ManagementStateStore, SessionPolicy, SessionService
+from src.management_auth import (
+    ApprovalError,
+    ApprovalService,
+    ManagementStateStore,
+    SessionPolicy,
+    SessionService,
+)
 from src.management_control import OperationRegistry, OperationStore, StoreAuditSink
 from src.protocols import errors as protocol_errors
 from src.openai.codex_constants import codex_cli_version
@@ -165,16 +171,21 @@ def _initialize_management_runtime(app: FastAPI) -> ManagementRuntime | None:
             state_store=store,
             allowed_origins=frozenset(settings["allowedOrigins"]),
             application_version=__version__,
-            documentation_url="/docs/13-management-control-api-refactor.md",
+            documentation_url="/docs",
         )
         app.state.management_runtime = runtime
 
         def decide(approval_id: str, telegram_user_id: int, approved: bool) -> str:
-            return runtime.approvals.decide(
-                approval_id,
-                telegram_user_id=telegram_user_id,
-                approved=approved,
-            ).value
+            try:
+                return runtime.approvals.decide(
+                    approval_id,
+                    telegram_user_id=telegram_user_id,
+                    approved=approved,
+                ).value
+            except ApprovalError as exc:
+                if exc.reason == "alreadyDecided":
+                    return exc.reason
+                raise
 
         tgbot.configure_management_approval_handler(decide)
         print("[management] control plane ready")

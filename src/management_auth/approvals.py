@@ -213,4 +213,6 @@ class ApprovalService:
             result=status,
             request_id=request_id,
         )
+        if status == "alreadyDecided":
+            raise ApprovalError("alreadyDecided")
         return ApprovalStatus(status)

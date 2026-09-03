@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import re
+import threading
 import time
 from pathlib import Path
 
@@ -8,11 +11,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
 from src.management_api import (
+    MANAGEMENT_ERROR_STATUS,
     ManagementOriginMiddleware,
     ManagementRuntime,
     create_management_router,
     install_management_error_handlers,
+    management_error_responses,
 )
+from src.management_api.routers import foundation as foundation_router
 from src.management_auth import (
     ApprovalService,
     AuthMethod,
@@ -22,6 +28,7 @@ from src.management_auth import (
 )
 from src.management_control import (
     ManagementContext,
+    ManagementErrorCode,
     OperationRegistry,
     OperationStore,
     StoreAuditSink,
@@ -39,6 +46,76 @@ EXPECTED_OPERATIONS = {
     "getManagementCapabilities",
     "getManagementOperation",
     "cancelManagementOperation",
+}
+EXPECTED_ERROR_CODES = {
+    "createManagementSession": {
+        401: {"AUTHENTICATION_FAILED"},
+        403: {"ORIGIN_DENIED"},
+        422: {"VALIDATION_FAILED"},
+        429: {"RATE_LIMITED"},
+        503: {"SERVICE_NOT_READY"},
+    },
+    "getCurrentManagementSession": {
+        401: {"SESSION_REQUIRED", "SESSION_EXPIRED"},
+        403: {"ORIGIN_DENIED"},
+        503: {"SERVICE_NOT_READY"},
+    },
+    "revokeCurrentManagementSession": {
+        401: {"SESSION_REQUIRED", "SESSION_EXPIRED"},
+        403: {"ORIGIN_DENIED"},
+        503: {"SERVICE_NOT_READY"},
+    },
+    "createTelegramApproval": {
+        403: {"ORIGIN_DENIED"},
+        422: {"VALIDATION_FAILED"},
+        429: {"RATE_LIMITED"},
+        503: {"SERVICE_NOT_READY", "DEPENDENCY_UNAVAILABLE"},
+    },
+    "getTelegramApproval": {
+        401: {"AUTHENTICATION_FAILED"},
+        403: {"ORIGIN_DENIED"},
+        422: {"VALIDATION_FAILED"},
+        503: {"SERVICE_NOT_READY"},
+    },
+    "getManagementMetadata": {
+        400: {"INVALID_REQUEST"},
+        401: {"SESSION_REQUIRED", "SESSION_EXPIRED"},
+        403: {"ORIGIN_DENIED", "CAPABILITY_DENIED"},
+        503: {"SERVICE_NOT_READY"},
+    },
+    "getManagementCapabilities": {
+        400: {"INVALID_REQUEST"},
+        401: {"SESSION_REQUIRED", "SESSION_EXPIRED"},
+        403: {"ORIGIN_DENIED", "CAPABILITY_DENIED"},
+        503: {"SERVICE_NOT_READY"},
+    },
+    "getManagementOperation": {
+        400: {"INVALID_REQUEST"},
+        401: {"SESSION_REQUIRED", "SESSION_EXPIRED"},
+        403: {"ORIGIN_DENIED", "CAPABILITY_DENIED"},
+        404: {"OPERATION_NOT_FOUND"},
+        422: {"VALIDATION_FAILED"},
+        503: {"SERVICE_NOT_READY"},
+    },
+    "cancelManagementOperation": {
+        400: {"INVALID_REQUEST", "INVALID_OPERATION_STATE"},
+        401: {"SESSION_REQUIRED", "SESSION_EXPIRED"},
+        403: {"ORIGIN_DENIED", "CAPABILITY_DENIED"},
+        404: {"OPERATION_NOT_FOUND"},
+        422: {"VALIDATION_FAILED"},
+        503: {"SERVICE_NOT_READY"},
+    },
+}
+SUCCESS_STATUS = {
+    "createManagementSession": 201,
+    "getCurrentManagementSession": 200,
+    "revokeCurrentManagementSession": 204,
+    "createTelegramApproval": 201,
+    "getTelegramApproval": 200,
+    "getManagementMetadata": 200,
+    "getManagementCapabilities": 200,
+    "getManagementOperation": 200,
+    "cancelManagementOperation": 204,
 }
 
 
@@ -121,6 +198,39 @@ def bearer(credential: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {credential}"}
 
 
+def management_operations(document: dict) -> dict[str, dict]:
+    return {
+        operation["operationId"]: operation
+        for path, item in document["paths"].items()
+        if path.startswith("/api/management/v1")
+        for method, operation in item.items()
+        if method.lower() in {"get", "post", "delete", "patch", "put"}
+    }
+
+
+def example_values(node) -> list[object]:
+    found = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "example":
+                found.append(value)
+            elif key == "examples":
+                if isinstance(value, list):
+                    found.extend(value)
+                elif isinstance(value, dict):
+                    for example in value.values():
+                        if isinstance(example, dict) and "value" in example:
+                            found.append(example["value"])
+                        else:
+                            found.append(example)
+            else:
+                found.extend(example_values(value))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(example_values(value))
+    return found
+
+
 def test_openapi_has_exact_p0_operation_ids_typed_schemas_and_security(tmp_path):
     app, _, _ = build_app(tmp_path)
     document = app.openapi()
@@ -150,6 +260,63 @@ def test_openapi_has_exact_p0_operation_ids_typed_schemas_and_security(tmp_path)
     assert schemas["SessionCredentialData"]["properties"]["credential"]["writeOnly"] is True
     assert "additionalProperties': False" in serialized
     assert "pms_" not in serialized and "pmk_" not in serialized and "max_" not in serialized
+
+
+def test_openapi_examples_enum_and_route_specific_error_contract(tmp_path):
+    app, _, _ = build_app(tmp_path)
+    document = app.openapi()
+    operations = management_operations(document)
+    assert set(operations) == EXPECTED_OPERATIONS
+
+    for operation_id, operation in operations.items():
+        examples = example_values(operation)
+        assert examples, f"{operation_id} has no machine-readable example"
+        serialized_examples = json.dumps(examples, ensure_ascii=False)
+        assert re.search(
+            r"(?i)(pmk_|pms_|max_|sk-[a-z0-9]|bearer\s+[a-z0-9._-]{8,})",
+            serialized_examples,
+        ) is None
+
+        success_status = SUCCESS_STATUS[operation_id]
+        if operation_id in {"createManagementSession", "createTelegramApproval"}:
+            media = operation["requestBody"]["content"]["application/json"]
+            assert media["examples"]
+        if success_status == 204:
+            success = operation["responses"]["204"]
+            assert success["headers"]["X-Request-Id"]["example"]
+        else:
+            success = operation["responses"][str(success_status)]
+            assert success["content"]["application/json"]["example"]
+
+        expected = EXPECTED_ERROR_CODES[operation_id]
+        assert set(operation["responses"]) == {
+            str(success_status), *(str(value) for value in expected)
+        }
+        for http_status, expected_codes in expected.items():
+            response = operation["responses"][str(http_status)]
+            assert response["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/ErrorEnvelope"
+            }
+            examples_by_code = response["content"]["application/json"]["examples"]
+            assert set(examples_by_code) == expected_codes
+            for code, example in examples_by_code.items():
+                assert example["value"]["error"]["code"] == code
+                assert MANAGEMENT_ERROR_STATUS[ManagementErrorCode(code)] == http_status
+
+    schemas = document["components"]["schemas"]
+    assert schemas["ErrorDetailSchema"]["properties"]["code"] == {
+        "$ref": "#/components/schemas/ManagementErrorCode"
+    }
+    assert set(schemas["ManagementErrorCode"]["enum"]) == {
+        code.value for code in ManagementErrorCode
+    }
+
+    assert set(MANAGEMENT_ERROR_STATUS) == set(ManagementErrorCode)
+    reusable = management_error_responses(
+        ManagementErrorCode.INVALID_REQUEST,
+        ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+    )
+    assert set(reusable) == {400, 503}
 
 
 def test_management_key_grant_bearer_session_revoke_and_replay(tmp_path):
@@ -215,6 +382,42 @@ def test_auth_failure_validation_envelope_unknown_fields_and_capability(tmp_path
         denied = client.get("/api/management/v1/meta", headers=bearer(restricted.credential))
         assert denied.status_code == 403
         assert denied.json()["error"]["code"] == "CAPABILITY_DENIED"
+
+
+def test_telegram_approval_create_runs_sync_notifier_off_event_loop(
+    tmp_path, monkeypatch,
+):
+    app, runtime, notifier = build_app(tmp_path)
+    calls = []
+
+    async def tracked_to_thread(function, /, *args, **kwargs):
+        loop_thread = threading.get_ident()
+        worker_threads = []
+        results = []
+
+        def invoke():
+            worker_threads.append(threading.get_ident())
+            results.append(function(*args, **kwargs))
+
+        worker = threading.Thread(target=invoke)
+        worker.start()
+        worker.join()
+        calls.append((function, loop_thread, worker_threads[0]))
+        return results[0]
+
+    monkeypatch.setattr(foundation_router.asyncio, "to_thread", tracked_to_thread)
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/management/v1/auth/telegram-approvals",
+            json={"clientName": "thread-boundary", "deviceSummary": "test-device"},
+        )
+    assert created.status_code == 201
+    assert len(calls) == 1
+    function, loop_thread, worker_thread = calls[0]
+    assert function.__self__ is runtime.approvals
+    assert function.__name__ == "create"
+    assert worker_thread != loop_thread
+    assert notifier.notifications
 
 
 def test_telegram_grant_polling_binding_consumption_and_no_store(tmp_path):
@@ -338,6 +541,35 @@ def test_management_origin_policy_overrides_broad_cors_but_cli_bearer_works(tmp_
         )
         assert preflight.status_code == 204
         assert preflight.headers["access-control-allow-origin"] == "https://admin.example.test"
+
+        for method in ("PATCH", "PUT"):
+            mutation_preflight = client.options(
+                "/api/management/v1/future-resource",
+                headers={
+                    "Origin": "https://admin.example.test",
+                    "Access-Control-Request-Method": method,
+                    "Access-Control-Request-Headers": "Authorization, If-Match",
+                },
+            )
+            assert mutation_preflight.status_code == 204
+            assert method in mutation_preflight.headers["access-control-allow-methods"]
+            assert "If-Match" in mutation_preflight.headers["access-control-allow-headers"]
+
+        for method, headers in (
+            ("TRACE", "Authorization"),
+            ("PATCH", "Authorization, X-Unknown-Header"),
+        ):
+            rejected_preflight = client.options(
+                "/api/management/v1/future-resource",
+                headers={
+                    "Origin": "https://admin.example.test",
+                    "Access-Control-Request-Method": method,
+                    "Access-Control-Request-Headers": headers,
+                },
+            )
+            assert rejected_preflight.status_code == 403
+            assert rejected_preflight.json()["error"]["code"] == "ORIGIN_DENIED"
+            assert "access-control-allow-origin" not in rejected_preflight.headers
 
         cli_token = create_session(client)
         cli = client.get("/api/management/v1/meta", headers=bearer(cli_token))

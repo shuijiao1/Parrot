@@ -14,8 +14,16 @@ from .error_mapping import error_response
 
 _PREFIX = "/api/management/v1"
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
-_ALLOWED_METHODS = {"GET", "POST", "DELETE", "OPTIONS"}
-_ALLOWED_HEADERS = {"authorization", "content-type", "idempotency-key", "x-request-id"}
+_ALLOWED_METHODS = {"GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"}
+_ALLOWED_HEADERS = {
+    "authorization",
+    "content-type",
+    "idempotency-key",
+    "if-match",
+    "x-request-id",
+}
+_ALLOWED_METHODS_HEADER = b"GET, POST, PATCH, PUT, DELETE, OPTIONS"
+_ALLOWED_HEADERS_HEADER = b"Authorization, Content-Type, Idempotency-Key, If-Match, X-Request-Id"
 
 
 def _header(scope: Scope, name: bytes) -> str | None:
@@ -73,11 +81,8 @@ class ManagementOriginMiddleware:
                 return
             headers = [
                 (b"access-control-allow-origin", origin.encode("latin-1")),
-                (b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS"),
-                (
-                    b"access-control-allow-headers",
-                    b"Authorization, Content-Type, Idempotency-Key, X-Request-Id",
-                ),
+                (b"access-control-allow-methods", _ALLOWED_METHODS_HEADER),
+                (b"access-control-allow-headers", _ALLOWED_HEADERS_HEADER),
                 (b"access-control-max-age", b"600"),
                 (b"vary", b"Origin"),
                 (b"cache-control", b"no-store"),

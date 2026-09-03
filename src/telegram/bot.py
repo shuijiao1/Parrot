@@ -280,6 +280,7 @@ def _handle_callback(cb: dict) -> None:
             "denied": "❌ 已拒绝登录",
             "expired": "登录批准已过期",
             "consumed": "登录批准已使用",
+            "alreadyDecided": "登录批准已处理，不能重复决定",
         }
         ui.answer_cb(cb_id, messages.get(result, "登录批准状态未变更"), show_alert=True)
         return

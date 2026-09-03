@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Mapping
+from types import MappingProxyType
+
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -10,9 +14,10 @@ from fastapi.responses import JSONResponse
 from src.management_control import ErrorField, ManagementError, ManagementErrorCode
 
 from .dependencies import management_request_id
+from .schemas import ErrorEnvelope
 
 
-_STATUS_BY_CODE: dict[ManagementErrorCode, int] = {
+MANAGEMENT_ERROR_STATUS: Mapping[ManagementErrorCode, int] = MappingProxyType({
     ManagementErrorCode.INVALID_REQUEST: 400,
     ManagementErrorCode.CONFIRMATION_REQUIRED: 400,
     ManagementErrorCode.INVALID_OPERATION_STATE: 400,
@@ -35,12 +40,66 @@ _STATUS_BY_CODE: dict[ManagementErrorCode, int] = {
     ManagementErrorCode.SERVICE_NOT_READY: 503,
     ManagementErrorCode.DEPENDENCY_UNAVAILABLE: 503,
     ManagementErrorCode.UPSTREAM_TIMEOUT: 504,
-}
+})
+
+
+def _error_example(code: ManagementErrorCode) -> dict:
+    error = ManagementError(
+        code,
+        retryable=code
+        in {
+            ManagementErrorCode.RATE_LIMITED,
+            ManagementErrorCode.OPERATION_ALREADY_RUNNING,
+            ManagementErrorCode.SERVICE_NOT_READY,
+            ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+            ManagementErrorCode.UPSTREAM_TIMEOUT,
+        },
+    )
+    return {
+        "error": {
+            "code": code.value,
+            "message": error.message,
+            "fields": [],
+            "retryable": error.retryable,
+            "requestId": "request-example",
+            "operationId": None,
+        }
+    }
+
+
+def management_error_responses(
+    *codes: ManagementErrorCode,
+) -> dict[int, dict]:
+    """Build reusable OpenAPI responses from the frozen error/status table."""
+    grouped: dict[int, list[ManagementErrorCode]] = defaultdict(list)
+    for code in codes:
+        if not isinstance(code, ManagementErrorCode):
+            raise TypeError("management error responses require ManagementErrorCode values")
+        grouped[MANAGEMENT_ERROR_STATUS[code]].append(code)
+    return {
+        status: {
+            "model": ErrorEnvelope,
+            "description": "Management API error: "
+            + ", ".join(code.value for code in status_codes),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        code.value: {
+                            "summary": code.value,
+                            "value": _error_example(code),
+                        }
+                        for code in status_codes
+                    }
+                }
+            },
+        }
+        for status, status_codes in grouped.items()
+    }
 
 
 def error_response(error: ManagementError, *, request_id: str) -> JSONResponse:
     response = JSONResponse(
-        status_code=_STATUS_BY_CODE[error.code],
+        status_code=MANAGEMENT_ERROR_STATUS[error.code],
         content={
             "error": {
                 "code": error.code.value,

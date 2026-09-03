@@ -6,6 +6,8 @@ from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict
 
+from src.management_control import ManagementErrorCode
+
 
 class StrictSchema(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -30,7 +32,7 @@ class ErrorFieldSchema(StrictSchema):
 
 
 class ErrorDetailSchema(StrictSchema):
-    code: str
+    code: ManagementErrorCode
     message: str
     fields: list[ErrorFieldSchema]
     retryable: bool

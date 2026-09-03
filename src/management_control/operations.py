@@ -358,12 +358,30 @@ class OperationRegistry:
         operation = self._store.create(context, kind=kind, cancellable=cancellable)
         try:
             starter(operation.id, context, payload)
-        except Exception:
+        except ManagementError as exc:
+            self._store.fail(
+                operation.id,
+                code=exc.code,
+                message=exc.message,
+                retryable=exc.retryable,
+            )
+            raise ManagementError(
+                exc.code,
+                exc.message,
+                fields=exc.fields,
+                retryable=exc.retryable,
+                operation_id=operation.id,
+            ) from exc
+        except Exception as exc:
             self._store.fail(
                 operation.id,
                 code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
                 message="Operation could not be scheduled",
                 retryable=True,
             )
-            raise
+            raise ManagementError(
+                ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                retryable=True,
+                operation_id=operation.id,
+            ) from exc
         return operation

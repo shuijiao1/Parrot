@@ -179,3 +179,68 @@ def test_registry_delegates_to_existing_starter_without_creating_a_worker():
     assert store.get(context(), operation.id).status is OperationStatus.QUEUED
     with pytest.raises(ValueError):
         registry.register("domain.existing", existing_starter)
+
+
+def test_registry_maps_unstable_starter_exception_and_marks_operation_failed():
+    store = OperationStore()
+    registry = OperationRegistry(store)
+    original = RuntimeError("provider scheduling internals")
+
+    def broken_starter(operation_id, ctx, payload):
+        raise original
+
+    registry.register("domain.broken", broken_starter)
+    with pytest.raises(ManagementError) as caught:
+        registry.create(
+            context(),
+            kind="domain.broken",
+            payload={"resourceId": "r-1"},
+            cancellable=True,
+        )
+    error = caught.value
+    assert error.code is ManagementErrorCode.DEPENDENCY_UNAVAILABLE
+    assert error.retryable is True
+    assert error.operation_id is not None
+    assert error.__cause__ is original
+    assert "scheduling internals" not in str(error)
+
+    operation = store.get(context(), error.operation_id)
+    assert operation.status is OperationStatus.FAILED
+    assert operation.cancellable is False
+    assert operation.error is not None
+    assert operation.error.code is ManagementErrorCode.DEPENDENCY_UNAVAILABLE
+    assert operation.error.retryable is True
+    assert "scheduling internals" not in repr(operation)
+
+
+def test_registry_preserves_stable_starter_error_with_created_operation_id():
+    store = OperationStore()
+    registry = OperationRegistry(store)
+    original = ManagementError(
+        ManagementErrorCode.UPSTREAM_TIMEOUT,
+        retryable=True,
+        operation_id="unrelated-operation",
+    )
+
+    def stable_failure(operation_id, ctx, payload):
+        raise original
+
+    registry.register("domain.timeout", stable_failure)
+    with pytest.raises(ManagementError) as caught:
+        registry.create(
+            context(),
+            kind="domain.timeout",
+            payload=None,
+            cancellable=False,
+        )
+    error = caught.value
+    assert error.code is ManagementErrorCode.UPSTREAM_TIMEOUT
+    assert error.retryable is True
+    assert error.operation_id not in {None, "unrelated-operation"}
+    assert error.__cause__ is original
+
+    operation = store.get(context(), error.operation_id)
+    assert operation.status is OperationStatus.FAILED
+    assert operation.error is not None
+    assert operation.error.code is ManagementErrorCode.UPSTREAM_TIMEOUT
+    assert operation.error.retryable is True
