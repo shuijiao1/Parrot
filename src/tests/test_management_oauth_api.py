@@ -144,6 +144,12 @@ def test_oauth_openapi_matches_owned_manifest_and_declares_security_and_secrets(
     serialized = json.dumps({key: operations[key] for key in operations}, ensure_ascii=False)
     assert "access-secret-in-storage" not in serialized
     assert "refresh-secret-in-storage" not in serialized
+    conflict_schema = schemas["OAuthReplaceConflictData"]
+    assert conflict_schema["properties"]["replacePlanToken"]["writeOnly"] is True
+    assert (
+        schemas["ReplaceOAuthDefaultModelsRequest"]["properties"]["models"]["maxItems"]
+        == 200
+    )
 
 
 def test_every_oauth_route_rejects_missing_session_and_missing_capability(tmp_path):
@@ -201,7 +207,8 @@ def test_account_read_update_reorder_and_delete_contract(tmp_path):
         assert detail.status_code == 200, detail.text
         revision = detail.json()["data"]["account"]["revision"]
         assert detail.json()["data"]["credentialConfigured"] is True
-        assert detail.json()["data"]["runtimeErrors"][0]["permanent"] is True
+        assert detail.json()["data"]["runtimeErrors"][0]["cooldownPermanent"] is True
+        assert detail.json()["data"]["runtimeErrors"][0]["cooldownUntil"] is None
         assert "access-secret-in-storage" not in detail.text
         assert "refresh-secret-in-storage" not in detail.text
 
@@ -274,8 +281,8 @@ def test_account_creation_identity_conflict_plan_and_secret_non_echo(tmp_path):
         )
         assert conflict.status_code == 409, conflict.text
         assert conflict.json()["error"]["code"] == "IDENTITY_CONFLICT"
-        fields = {item["path"]: item for item in conflict.json()["error"]["fields"]}
-        token = fields["replacePlanToken"]["message"]
+        token = conflict.json()["conflict"]["replacePlanToken"]
+        assert "replacePlanToken" not in repr(conflict.json()["error"])
         replaced = request(
             client, "POST", "/oauth/accounts",
             {"credential": replacement_credential, "replacePlanToken": token},
@@ -410,12 +417,36 @@ def test_models_settings_preferences_defaults_actions_and_operations(tmp_path):
         )
         assert updated.status_code == 200, updated.text
         assert backend.account_disabled_models(ACCOUNT_ID) == {"gpt-alpha", "gpt-beta"}
+        cursor_id = "cursor:cursor-api-subject"
+        backend.accounts.append({
+            "_id": cursor_id,
+            "provider": "cursor",
+            "type": "cursor",
+            "subject": "cursor-api-subject",
+            "email": "cursor@example.test",
+            "access_token": "cursor-access",
+            "refresh_token": "cursor-refresh",
+            "enabled": True,
+            "models": ["cursor-max"],
+            "model_records": [{
+                "id": "cursor-max",
+                "name": "Cursor Max",
+                "contextWindow": 128000,
+                "contextWindowMaxMode": 200000,
+            }],
+        })
         settings_update = request(
+            client, "PATCH", f"/oauth/accounts/{cursor_id}/models/settings",
+            {"modelId": "cursor-max", "maxContextDefault": False}, headers,
+        )
+        assert settings_update.status_code == 200, settings_update.text
+        assert backend.cursor_max_context_default(cursor_id, "cursor-max") is False
+        wrong_provider = request(
             client, "PATCH", f"/oauth/accounts/{ACCOUNT_ID}/models/settings",
             {"modelId": "gpt-alpha", "maxContextDefault": False}, headers,
         )
-        assert settings_update.status_code == 200, settings_update.text
-        assert backend.cursor_max_context_default(ACCOUNT_ID, "gpt-alpha") is False
+        assert wrong_provider.status_code == 422
+        assert wrong_provider.json()["error"]["fields"][0]["path"] == "modelId"
         invalid_model = request(
             client, "PATCH", f"/oauth/accounts/{ACCOUNT_ID}/models",
             {"modelIds": ["unknown"], "disabled": True}, headers,

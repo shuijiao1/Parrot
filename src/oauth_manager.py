@@ -3055,11 +3055,16 @@ def find_exact_identity(entry: dict) -> tuple[str, dict] | None:
     return incoming_key, copy.deepcopy(matches[0])
 
 
-def replace_exact_identity(expected_account_key: str, entry: dict) -> dict:
+def replace_exact_identity(
+    expected_account_key: str,
+    entry: dict,
+    *,
+    expected_account: dict | None = None,
+) -> dict:
     """Atomically replace credentials/profile for one unchanged OAuth identity.
 
-    No delete, rename, state cleanup, log migration or LB publication occurs.  A
-    stale confirmation therefore fails closed instead of becoming an add/rename.
+    ``expected_account`` is an optional exact-snapshot CAS for Management API
+    callers. Legacy/TG callers omit it and retain their historical behavior.
     """
     provider = _normalize_provider(entry.get("provider"))
     incoming = copy.deepcopy(entry)
@@ -3087,6 +3092,9 @@ def replace_exact_identity(expected_account_key: str, entry: dict) -> dict:
                 return
             index = indexes[0]
             current = accounts[index]
+            if expected_account is not None and current != expected_account:
+                result["status"] = "revision_conflict"
+                return
             current_key = _canonical_key(current)
             if (
                 current_key != expected_account_key
@@ -3133,7 +3141,65 @@ def replace_exact_identity(expected_account_key: str, entry: dict) -> dict:
             accounts[index] = replacement
             result.update(status="replaced", index=index, account=copy.deepcopy(replacement))
 
-        config.update(mutate)
+        if expected_account is None:
+            config.update(mutate)
+        else:
+            config.update(mutate, skip_if_unchanged=True)
+    return result
+
+
+def mutate_account_if_unchanged(
+    expected_account_key: str,
+    expected_account: dict,
+    mutator,
+) -> dict:
+    """Apply one exact-account mutation under the serialized config CAS boundary."""
+    result = {"status": "missing", "account_key": expected_account_key}
+
+    def mutate(cfg):
+        matches = [
+            account for account in cfg.get("oauthAccounts", [])
+            if _canonical_key(account) == expected_account_key
+        ]
+        if len(matches) != 1:
+            result["status"] = "identity_conflict" if matches else "missing"
+            return
+        account = matches[0]
+        if account != expected_account:
+            result["status"] = "revision_conflict"
+            return
+        mutator(account)
+        if _canonical_key(account) != expected_account_key:
+            raise ValueError("conditional OAuth mutation changed canonical identity")
+        result.update(status="updated", account=copy.deepcopy(account))
+
+    config.update(mutate, skip_if_unchanged=True)
+    return result
+
+
+def reorder_accounts_if_unchanged(expected_order: list[str], wanted_order: list[str]) -> dict:
+    """CAS reorder the complete canonical account set without losing additions."""
+    result = {"status": "revision_conflict"}
+
+    def mutate(cfg):
+        accounts = list(cfg.get("oauthAccounts") or [])
+        current = [_canonical_key(account) for account in accounts]
+        if current != list(expected_order):
+            return
+        wanted = list(wanted_order)
+        if (
+            len(current) != len(set(current))
+            or len(wanted) != len(current)
+            or len(wanted) != len(set(wanted))
+            or set(wanted) != set(current)
+        ):
+            result["status"] = "resource_conflict"
+            return
+        by_id = {_canonical_key(account): account for account in accounts}
+        cfg["oauthAccounts"] = [by_id[account_id] for account_id in wanted]
+        result["status"] = "updated"
+
+    config.update(mutate, skip_if_unchanged=True)
     return result
 
 
@@ -3486,6 +3552,23 @@ def _add_account_serialized(entry: dict) -> None:
 def delete_account(account_key: str) -> None:
     with config.serialized_updates():
         _delete_account_serialized(account_key)
+
+
+def delete_account_if_unchanged(account_key: str, expected_account: dict) -> dict:
+    """Delete one exact canonical account only while its snapshot is unchanged."""
+    with config.serialized_updates():
+        matches = [
+            account for account in config.get().get("oauthAccounts", [])
+            if _canonical_key(account) == account_key
+        ]
+        if not matches:
+            return {"status": "missing", "account_key": account_key}
+        if len(matches) != 1:
+            return {"status": "identity_conflict", "account_key": account_key}
+        if matches[0] != expected_account:
+            return {"status": "revision_conflict", "account_key": account_key}
+        _delete_account_serialized(account_key)
+    return {"status": "deleted", "account_key": account_key}
 
 
 def _delete_account_serialized(account_key: str) -> None:

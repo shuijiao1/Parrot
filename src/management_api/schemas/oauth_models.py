@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import Field
 
 from .base import StrictSchema
@@ -12,7 +14,7 @@ class OAuthModelData(StrictSchema):
     modelId: str
     name: str
     disabled: bool
-    cooldownUntil: int | None = None
+    cooldownUntil: datetime | None = None
     cooldownPermanent: bool
     metadataSource: str | None = None
     contextWindow: int | None = None

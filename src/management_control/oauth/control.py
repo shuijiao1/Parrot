@@ -4,28 +4,33 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
-import json
 import secrets
 from concurrent.futures import Executor, ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Callable, Iterable
 
 from src.management_auth.policy import CapabilityDenied, authorize
-from src.management_auth.principal import Capability
+from src.management_auth.principal import AuthMethod, Capability
 from src.management_control.context import AuditSink, ManagementContext, audit_record
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
 from src.management_control.operations import ManagementOperation, OperationStore
 
+from .account_mutations import OAuthAccountMutationControlMixin
 from .backend import OAuthBackend
 from .compat import OAuthCompatibilityControlMixin
+from .contracts import (
+    audit_failures,
+    invalid_account,
+    public_value,
+    revision as _revision,
+    sanitize_text,
+    utc_datetime,
+)
 from .default_models import OAuthDefaultModelsControlMixin
 from .flows import OAuthFlowService
 from .legacy_ops import OAuthLegacyOperationsControlMixin
 from .models import (
     CchMode,
-    CompleteOAuthLoginCommand,
-    CreateOAuthAccountCommand,
     OAuthAccountDetail,
     OAuthAccountFilter,
     OAuthAccountPage,
@@ -51,18 +56,12 @@ from .models import (
     PageMeta,
     PageSpec,
     TelegramOAuthPreferences,
-    UpdateOAuthAccountCommand,
 )
 from .plans import OneShotPlanStore
 from .queries import OAuthQueryControlMixin
 
 
 _LONG_ACTION_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="oauth-control")
-
-
-def _revision(value: object) -> str:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _page(items: list, spec: PageSpec) -> tuple[list, PageMeta]:
@@ -79,6 +78,7 @@ def _page(items: list, spec: PageSpec) -> tuple[list, PageMeta]:
 
 
 class OAuthControl(
+    OAuthAccountMutationControlMixin,
     OAuthCompatibilityControlMixin,
     OAuthDefaultModelsControlMixin,
     OAuthLegacyOperationsControlMixin,
@@ -122,10 +122,22 @@ class OAuthControl(
     def _audit(self, context: ManagementContext, action: str, target: str, result: str = "succeeded") -> None:
         if self._audit_sink is not None:
             self._audit_sink.record(
-                audit_record(context, action=action, target=target, result=result, occurred_at=self._clock())
+                audit_record(
+                    context,
+                    action=sanitize_text(action),
+                    target=sanitize_text(target),
+                    result=sanitize_text(result),
+                    occurred_at=self._clock(),
+                )
             )
 
     def _account(self, account_id: str) -> dict:
+        account = self.backend.get_account_exact(account_id)
+        if not isinstance(account, dict):
+            raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+        return account
+
+    def _legacy_account(self, account_id: str) -> dict:
         account = self.backend.get_account(account_id)
         if not isinstance(account, dict):
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
@@ -175,7 +187,7 @@ class OAuthControl(
         reason: str | None = None,
     ) -> None:
         self._require(context, Capability.WRITE)
-        self._account(account_id)
+        self._legacy_account(account_id)
         self.backend.set_enabled(account_id, enabled, reason=reason)
         self._audit(context, "oauth.account.enable", account_id)
 
@@ -186,13 +198,13 @@ class OAuthControl(
         value: int,
     ) -> None:
         self._require(context, Capability.WRITE)
-        self._account(account_id)
+        self._legacy_account(account_id)
         self.backend.update_max_concurrent(account_id, value)
         self._audit(context, "oauth.account.max-concurrent", account_id)
 
     def reset_quota_now(self, context: ManagementContext, account_id: str) -> dict:
         self._require(context, Capability.DESTRUCTIVE)
-        self._account(account_id)
+        self._legacy_account(account_id)
         result = self.backend.reset_quota(account_id)
         self._audit(context, "oauth.quota.reset", account_id)
         return result
@@ -204,7 +216,7 @@ class OAuthControl(
         idempotency_key: str,
     ) -> dict:
         self._require(context, Capability.DESTRUCTIVE)
-        self._account(account_id)
+        self._legacy_account(account_id)
         result = asyncio.run(
             self.backend.redeem_openai_reset_credit(account_id, idempotency_key)
         )
@@ -220,15 +232,15 @@ class OAuthControl(
         return OAuthAccountSummary(
             account_id=account_id,
             provider=provider,
-            display_name=str(account.get("label") or account.get("email") or account_id),
-            identity=str(account.get("email") or account_id.partition(":")[2]),
+            display_name=sanitize_text(account.get("label") or account.get("email") or account_id),
+            identity=sanitize_text(account.get("email") or account_id.partition(":")[2]),
             enabled=bool(account.get("enabled", True)),
-            disabled_reason=str(reason) if reason else None,
-            disabled_until=str(account.get("disabled_until")) if account.get("disabled_until") else None,
+            disabled_reason=sanitize_text(reason) if reason else None,
+            disabled_until=utc_datetime(account.get("disabled_until")),
             max_concurrent=max(0, int(account.get("maxConcurrent") or 0)),
             available=bool(account.get("enabled", True)) and not reason,
             quota_limited=reason == "quota",
-            invalid=reason == "auth_error",
+            invalid=invalid_account(account),
             model_count=len(models),
             disabled_model_count=len(disabled),
             credential_configured=bool(
@@ -290,7 +302,7 @@ class OAuthControl(
                     name=name,
                     used_percent=used_float,
                     remaining_percent=max(0.0, 100.0 - used_float) if used_float is not None else None,
-                    resets_at=str(row.get(reset_key)) if row.get(reset_key) else None,
+                    resets_at=utc_datetime(row.get(reset_key)),
                 )
             )
         month_start = self._clock().astimezone(timezone.utc).replace(
@@ -308,17 +320,17 @@ class OAuthControl(
             runtime_errors.append(
                 OAuthRuntimeError(
                     model_id=str(entry.get("model")) if entry.get("model") else None,
-                    message=str(entry.get("last_error")) if entry.get("last_error") else None,
-                    cooldown_until=int(until) if isinstance(until, (int, float)) else None,
-                    permanent=until == -1,
+                    message=sanitize_text(entry.get("last_error")) if entry.get("last_error") else None,
+                    cooldown_until=utc_datetime(until),
+                    cooldown_permanent=until == -1,
                 )
             )
         return OAuthAccountDetail(
             account=summary,
-            workspace_id=str(account.get("workspace_id") or account.get("project_id") or account.get("subject") or "") or None,
-            workspace_name=str(account.get("workspace_name") or account.get("cursor_profile_name") or "") or None,
-            plan_type=str(account.get("plan_type") or "") or None,
-            expires_at=str(account.get("expired") or "") or None,
+            workspace_id=sanitize_text(account.get("workspace_id") or account.get("project_id") or account.get("subject")) if (account.get("workspace_id") or account.get("project_id") or account.get("subject")) else None,
+            workspace_name=sanitize_text(account.get("workspace_name") or account.get("cursor_profile_name")) if (account.get("workspace_name") or account.get("cursor_profile_name")) else None,
+            plan_type=sanitize_text(account.get("plan_type")) if account.get("plan_type") else None,
+            expires_at=utc_datetime(account.get("expired")),
             usage_windows=tuple(windows),
             local_stats=OAuthLocalStats(
                 request_count=int(stats.get("total") or 0),
@@ -328,118 +340,8 @@ class OAuthControl(
             ),
             runtime_errors=tuple(runtime_errors),
             credential_configured=bool(account.get("refresh_token") or account.get("access_token")),
-            last_model_sync=str(account.get("last_model_sync") or "") or None,
+            last_model_sync=utc_datetime(account.get("last_model_sync")),
         )
-
-    def create_account(
-        self, context: ManagementContext, command: CreateOAuthAccountCommand,
-    ) -> OAuthMutationResult:
-        self._require(context, Capability.SECRETS_WRITE)
-        try:
-            entry = self._flows.credential_entry(command.credential)
-        except ManagementError:
-            raise
-        except Exception as exc:
-            raise ManagementError(
-                ManagementErrorCode.UPSTREAM_ERROR, retryable=True,
-            ) from exc
-        required = [field for field in ("email", "access_token", "refresh_token") if not entry.get(field)]
-        if required:
-            raise ManagementError(
-                ManagementErrorCode.VALIDATION_FAILED,
-                fields=[ErrorField(field, "REQUIRED", "Field is required") for field in required],
-            )
-        existing = self.backend.find_exact_identity(entry)
-        if existing is not None:
-            account_id, snapshot = existing
-            if not command.replace_plan_token:
-                token, _ = self._replace_plans.create(
-                    actor_subject_id=context.actor.subject_id,
-                    kind="replace",
-                    revision=_revision(snapshot),
-                    payload=copy.deepcopy(entry),
-                )
-                raise ManagementError(
-                    ManagementErrorCode.IDENTITY_CONFLICT,
-                    fields=(
-                        ErrorField("accountId", "EXACT_IDENTITY", account_id),
-                        ErrorField("replacePlanToken", "CONFIRMATION_REQUIRED", token),
-                    ),
-                )
-            plan = self._replace_plans.consume(
-                command.replace_plan_token,
-                actor_subject_id=context.actor.subject_id,
-                kind="replace",
-            )
-            if plan.revision != _revision(snapshot) or plan.payload != entry:
-                raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
-            result = self.backend.replace_exact_identity(account_id, entry)
-            if result.get("status") != "replaced":
-                raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
-            self._audit(context, "oauth.account.replace", account_id)
-            return OAuthMutationResult(account_id=account_id, revision=_revision(result.get("account") or entry), status="replaced")
-        if command.replace_plan_token:
-            raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
-        result = self.backend.add_account_if_absent(entry)
-        if result.get("status") != "added":
-            raise ManagementError(ManagementErrorCode.IDENTITY_CONFLICT)
-        account_id = str(result.get("account_key") or self.backend.account_id(entry))
-        self._audit(context, "oauth.account.create", account_id)
-        return OAuthMutationResult(account_id=account_id, revision=_revision(self._account(account_id)), status="created")
-
-    def update_account(
-        self,
-        context: ManagementContext,
-        account_id: str,
-        command: UpdateOAuthAccountCommand,
-        *,
-        expected_revision: str | None = None,
-    ) -> OAuthAccountDetail:
-        self._require(context, Capability.WRITE)
-        current = self._account(account_id)
-        if expected_revision and expected_revision != _revision(current):
-            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
-        if command.display_name is not None:
-            self.backend.update_account_display_name(account_id, command.display_name)
-        if command.enabled is not None:
-            self.backend.set_enabled(account_id, command.enabled)
-        if command.max_concurrent is not None:
-            self.backend.update_max_concurrent(account_id, command.max_concurrent)
-        self._audit(context, "oauth.account.update", account_id)
-        return self.get_account(context, account_id)
-
-    def delete_account(
-        self,
-        context: ManagementContext,
-        account_id: str,
-        *,
-        expected_revision: str | None = None,
-    ) -> None:
-        self._require(context, Capability.DESTRUCTIVE)
-        account = self._account(account_id)
-        if expected_revision is not None and expected_revision != _revision(account):
-            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
-        self.backend.delete_account(account_id)
-        self._audit(context, "oauth.account.delete", account_id)
-
-    def reorder_accounts(
-        self,
-        context: ManagementContext,
-        account_ids: Iterable[str],
-        *,
-        expected_revision: str | None = None,
-    ) -> str:
-        self._require(context, Capability.WRITE)
-        configured = [self.backend.account_id(account) for account in self.backend.list_accounts()]
-        order = list(account_ids)
-        if len(order) != len(set(order)) or set(order) != set(configured):
-            raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT)
-        current_revision = _revision(configured)
-        if expected_revision is not None and expected_revision != current_revision:
-            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
-        self.backend.reorder_accounts(order)
-        self._audit(context, "oauth.account.reorder", "oauthAccounts")
-        return _revision(order)
 
     def reorder_accounts_preserving_unlisted(
         self,
@@ -450,6 +352,7 @@ class OAuthControl(
         self.backend.reorder_accounts_preserving_unlisted(list(account_ids))
         self._audit(context, "oauth.account.reorder", "oauthAccounts")
 
+    @audit_failures("oauth.login.start", target_arg="provider")
     def start_login_flow(self, context: ManagementContext, provider: OAuthProvider) -> OAuthLoginFlow:
         self._require(context, Capability.SECRETS_WRITE)
         try:
@@ -463,35 +366,7 @@ class OAuthControl(
         self._audit(context, "oauth.login.start", provider.value)
         return flow
 
-    def complete_login_flow(
-        self, context: ManagementContext, flow_id: str, command: CompleteOAuthLoginCommand,
-    ) -> OAuthMutationResult:
-        self._require(context, Capability.SECRETS_WRITE)
-        completed = self._flows.complete(context.actor.subject_id, flow_id, command)
-        return self.create_account(
-            context,
-            CreateOAuthAccountCommand(
-                credential=self._entry_as_manual(completed.entry),
-                replace_plan_token=command.replace_plan_token,
-            ),
-        )
-
-    @staticmethod
-    def _entry_as_manual(entry: dict):
-        from .models import ManualCredential
-
-        return ManualCredential(
-            provider=OAuthProvider(str(entry.get("provider") or entry.get("type") or "claude")),
-            email=str(entry.get("email") or ""),
-            access_token=str(entry.get("access_token") or ""),
-            refresh_token=str(entry.get("refresh_token") or ""),
-            display_name=entry.get("label"),
-            identity_subject=entry.get("subject") or entry.get("sub"),
-            workspace_id=entry.get("workspace_id") or entry.get("chatgpt_account_id"),
-            project_id=entry.get("project_id"),
-            expires_at=entry.get("expired"),
-        )
-
+    @audit_failures("oauth.import.preview", target="oauthImport")
     def preview_import(
         self, context: ManagementContext, *, format: str, payload: str, filename: str = "",
     ) -> OAuthImportPreview:
@@ -519,8 +394,8 @@ class OAuthControl(
                 OAuthImportCandidate(
                     candidate_id=candidate_id,
                     provider=OAuthProvider(self.backend.provider_of(entry)),
-                    identity=identity,
-                    display_name=str(entry.get("label") or entry.get("email") or identity),
+                    identity=sanitize_text(identity),
+                    display_name=sanitize_text(entry.get("label") or entry.get("email") or identity),
                     conflict_account_id=existing[0] if existing else None,
                 )
             )
@@ -537,6 +412,7 @@ class OAuthControl(
             expires_at=plan.expires_at,
         )
 
+    @audit_failures("oauth.import.commit", target="oauthImport")
     def commit_import(
         self, context: ManagementContext, import_id: str, decisions: Iterable[OAuthImportDecision],
     ) -> OAuthImportCommitResult:
@@ -575,6 +451,7 @@ class OAuthControl(
     def list_invalid_accounts(self, context: ManagementContext, *, page: PageSpec) -> OAuthAccountPage:
         return self.list_accounts(context, account_filter=OAuthAccountFilter.INVALID, page=page)
 
+    @audit_failures("oauth.invalid.delete-plan", target="oauthAccounts")
     def plan_invalid_deletion(
         self, context: ManagementContext, account_ids: Iterable[str] | None,
     ) -> OAuthDeletionPlan:
@@ -596,6 +473,7 @@ class OAuthControl(
         )
         return OAuthDeletionPlan(token, tuple(selected), plan.expires_at, revision)
 
+    @audit_failures("oauth.invalid.delete", target="oauthAccounts")
     def delete_invalid_accounts(self, context: ManagementContext, plan_token: str) -> int:
         self._require(context, Capability.DESTRUCTIVE)
         plan = self._delete_plans.consume(
@@ -614,6 +492,7 @@ class OAuthControl(
         self._audit(context, "oauth.invalid.delete", str(len(plan.payload)))
         return len(plan.payload)
 
+    @audit_failures("oauth.token.refresh", target_arg="account_id")
     def refresh_token(self, context: ManagementContext, account_id: str) -> OAuthMutationResult:
         self._require(context, Capability.WRITE)
         self._account(account_id)
@@ -637,10 +516,12 @@ class OAuthControl(
         def run() -> None:
             try:
                 store.mark_running(operation.id)
-                result = worker()
+                result = public_value(worker(), camel_case_keys=True)
                 store.succeed(operation.id, result)
+                self._audit(context, kind, operation.id, "succeeded")
             except ManagementError as exc:
-                store.fail(operation.id, code=exc.code, message=exc.message, retryable=exc.retryable)
+                store.fail(operation.id, code=exc.code, message=exc.code.value, retryable=exc.retryable)
+                self._audit(context, kind, operation.id, "failed")
             except Exception:
                 store.fail(
                     operation.id,
@@ -648,6 +529,7 @@ class OAuthControl(
                     message=ManagementErrorCode.UPSTREAM_ERROR.value,
                     retryable=True,
                 )
+                self._audit(context, kind, operation.id, "failed")
 
         self._executor.submit(run)
         self._audit(context, kind, operation.id, "queued")
@@ -671,6 +553,7 @@ class OAuthControl(
             results.append({"accountId": account_id, "status": "refreshed"})
         return {"accounts": results, "total": len(results)}
 
+    @audit_failures("oauth.usage.refresh", target_arg="account_id")
     def refresh_usage(
         self, context: ManagementContext, account_id: str, store: OperationStore,
     ) -> ManagementOperation:
@@ -680,6 +563,7 @@ class OAuthControl(
             context, store, kind="oauth.usage.refresh", worker=lambda: self._refresh_usage_worker([account_id]),
         )
 
+    @audit_failures("oauth.usage.refresh-all", target="oauthAccounts")
     def refresh_all_usage(self, context: ManagementContext, store: OperationStore) -> ManagementOperation:
         self._require(context, Capability.WRITE)
         account_ids = [self.backend.account_id(account) for account in self.backend.list_accounts()]
@@ -687,6 +571,7 @@ class OAuthControl(
             context, store, kind="oauth.usage.refresh-all", worker=lambda: self._refresh_usage_worker(account_ids),
         )
 
+    @audit_failures("oauth.quota.reset-plan", target_arg="account_id")
     def plan_quota_reset(
         self, context: ManagementContext, account_id: str,
     ) -> OAuthQuotaResetPlan:
@@ -695,7 +580,7 @@ class OAuthControl(
         provider = OAuthProvider(self.backend.provider_of(account))
         if provider in {OAuthProvider.CURSOR, OAuthProvider.XAI, OAuthProvider.ANTIGRAVITY}:
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
-        row = self.backend.quota_load(account_id) or {}
+        row = copy.deepcopy(self.backend.quota_load(account_id) or {})
         credit_count = row.get("openai_reset_credit_count")
         token, plan = self._quota_plans.create(
             actor_subject_id=context.actor.subject_id,
@@ -704,52 +589,80 @@ class OAuthControl(
             payload={
                 "account_id": account_id,
                 "provider": provider.value,
+                "quota_revision": _revision(row),
+                "credit_observation": copy.deepcopy(credit_count),
                 "idempotency_key": secrets.token_urlsafe(24),
             },
         )
-        return OAuthQuotaResetPlan(
+        result = OAuthQuotaResetPlan(
             token,
             account_id,
             provider,
             int(credit_count) if isinstance(credit_count, (int, float)) else None,
             plan.expires_at,
         )
+        self._audit(context, "oauth.quota.reset-plan", account_id)
+        return result
 
-    def reset_quota(self, context: ManagementContext, plan_token: str) -> OAuthMutationResult:
+    def reset_quota(
+        self, context: ManagementContext, account_id: str, plan_token: str,
+    ) -> OAuthMutationResult:
         self._require(context, Capability.DESTRUCTIVE)
-        plan = self._quota_plans.consume(
-            plan_token, actor_subject_id=context.actor.subject_id, kind="quota-reset",
-        )
-        account_id = str(plan.payload["account_id"])
-        account = self._account(account_id)
-        if _revision(account) != plan.revision:
-            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
         try:
-            if plan.payload["provider"] == "openai":
-                asyncio.run(self.backend.redeem_openai_reset_credit(
-                    account_id, str(plan.payload["idempotency_key"]),
-                ))
-            else:
-                self.backend.reset_quota(account_id)
-        except Exception as exc:
-            raise ManagementError(
-                ManagementErrorCode.UPSTREAM_ERROR, retryable=True,
-            ) from exc
+            # Exact URL identity and every observation are checked before the
+            # one-shot consume and before local/remote quota side effects.
+            account = self._account(account_id)
+            plan = self._quota_plans.inspect(
+                plan_token, actor_subject_id=context.actor.subject_id, kind="quota-reset",
+            )
+            if str(plan.payload["account_id"]) != account_id:
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            if _revision(account) != plan.revision:
+                raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+            row = copy.deepcopy(self.backend.quota_load(account_id) or {})
+            if (
+                _revision(row) != plan.payload["quota_revision"]
+                or row.get("openai_reset_credit_count") != plan.payload["credit_observation"]
+            ):
+                raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+            self._quota_plans.consume(
+                plan_token, actor_subject_id=context.actor.subject_id, kind="quota-reset",
+            )
+            try:
+                if plan.payload["provider"] == "openai":
+                    asyncio.run(self.backend.redeem_openai_reset_credit(
+                        account_id, str(plan.payload["idempotency_key"]),
+                    ))
+                else:
+                    self.backend.reset_quota(account_id)
+            except Exception as exc:
+                raise ManagementError(
+                    ManagementErrorCode.UPSTREAM_ERROR, retryable=True,
+                ) from exc
+            result = OAuthMutationResult(
+                account_id, _revision(self._account(account_id)), "reset",
+            )
+        except BaseException:
+            self._audit(context, "oauth.quota.reset", account_id, "failed")
+            raise
         self._audit(context, "oauth.quota.reset", account_id)
-        return OAuthMutationResult(account_id, _revision(self._account(account_id)), "reset")
+        return result
 
+    @audit_failures("oauth.errors.clear", target_arg="account_id")
     def clear_errors(self, context: ManagementContext, account_id: str) -> None:
         self._require(context, Capability.WRITE)
         self._account(account_id)
         self.backend.clear_errors(account_id)
         self._audit(context, "oauth.errors.clear", account_id)
 
+    @audit_failures("oauth.affinity.clear", target_arg="account_id")
     def clear_affinity(self, context: ManagementContext, account_id: str) -> None:
         self._require(context, Capability.WRITE)
         self._account(account_id)
         self.backend.clear_affinity(account_id)
         self._audit(context, "oauth.affinity.clear", account_id)
 
+    @audit_failures("oauth.errors.clear-all", target="oauthAccounts")
     def clear_all_errors(self, context: ManagementContext) -> int:
         self._require(context, Capability.DESTRUCTIVE)
         count = self.backend.clear_all_errors()
@@ -772,14 +685,14 @@ class OAuthControl(
             models.append(
                 OAuthModel(
                     model_id=model_id,
-                    name=str(record.get("name") or model_id),
+                    name=sanitize_text(record.get("name") or model_id),
                     disabled=model_id in disabled,
-                    cooldown_until=int(until) if isinstance(until, (int, float)) else None,
+                    cooldown_until=utc_datetime(until),
                     cooldown_permanent=until == -1,
-                    metadata_source=str(record.get("metadataSource") or selection.get("source") or "") or None,
+                    metadata_source=sanitize_text(record.get("metadataSource") or selection.get("source")) if (record.get("metadataSource") or selection.get("source")) else None,
                     context_window=int(record.get("contextWindow") or record.get("context_window") or 0) or None,
                     max_context_window=int(record.get("contextWindowMaxMode") or record.get("context_window_max_mode") or 0) or None,
-                    service_tier=str(record.get("serviceTier") or record.get("service_tier") or "") or None,
+                    service_tier=sanitize_text(record.get("serviceTier") or record.get("service_tier")) if (record.get("serviceTier") or record.get("service_tier")) else None,
                     max_context_default=(
                         self.backend.cursor_max_context_default(account, model_id)
                         if self.backend.provider_of(account) == "cursor"
@@ -800,19 +713,38 @@ class OAuthControl(
         expected_revision: str | None = None,
     ) -> OAuthModelPage:
         self._require(context, Capability.WRITE)
-        account = self._account(account_id)
-        if expected_revision and expected_revision != _revision(account):
-            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
-        selection = self.backend.account_model_selection(account)
-        visible = set(selection.get("models") or [])
-        requested = set(model_ids)
-        if not requested or not requested.issubset(visible):
-            raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
-        current = set(selection.get("disabled_models") or [])
-        wanted = current | requested if disabled else current - requested
-        self.backend.set_account_disabled_models(account_id, wanted, visible_models=visible)
+        try:
+            account = copy.deepcopy(self._account(account_id))
+            if expected_revision and expected_revision != _revision(account):
+                raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+            selection = self.backend.account_model_selection(account)
+            visible = set(selection.get("models") or [])
+            requested_list = list(model_ids)
+            fields = [
+                ErrorField(f"modelIds[{index}]", "UNKNOWN_MODEL", "Model is not visible")
+                for index, model_id in enumerate(requested_list)
+                if model_id not in visible
+            ]
+            if not requested_list or fields:
+                raise ManagementError(
+                    ManagementErrorCode.VALIDATION_FAILED, fields=fields,
+                )
+            requested = set(requested_list)
+            current = set(selection.get("disabled_models") or [])
+            wanted = current | requested if disabled else current - requested
+            outcome = self.backend.update_account_models_conditional(
+                account_id,
+                account,
+                visible_models=visible,
+                disabled_models=wanted,
+            )
+            self._raise_conditional_status(outcome)
+            result = self.list_models(context, account_id, page=PageSpec())
+        except BaseException:
+            self._audit(context, "oauth.models.update", account_id, "failed")
+            raise
         self._audit(context, "oauth.models.update", account_id)
-        return self.list_models(context, account_id, page=PageSpec())
+        return result
 
     def update_model_settings(
         self,
@@ -824,16 +756,48 @@ class OAuthControl(
         expected_revision: str | None = None,
     ) -> OAuthModelPage:
         self._require(context, Capability.WRITE)
-        account = self._account(account_id)
-        if expected_revision and expected_revision != _revision(account):
-            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
         try:
-            self.backend.set_cursor_max_context_default(account_id, model_id, max_context_default)
-        except ValueError as exc:
-            raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE) from exc
+            account = copy.deepcopy(self._account(account_id))
+            if expected_revision and expected_revision != _revision(account):
+                raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+            selection = self.backend.account_model_selection(account)
+            if self.backend.provider_of(account) != "cursor":
+                raise ManagementError(
+                    ManagementErrorCode.UNSUPPORTED_VALUE,
+                    fields=(ErrorField("modelId", "WRONG_PROVIDER", "Cursor account required"),),
+                )
+            visible = set(selection.get("models") or [])
+            record = next((
+                item for item in selection.get("records") or []
+                if str(item.get("id") or "") == model_id
+            ), None)
+            normal = int((record or {}).get("contextWindow") or (record or {}).get("context_window") or 0)
+            maximum = int((record or {}).get("contextWindowMaxMode") or (record or {}).get("context_window_max_mode") or 0)
+            if model_id not in visible or record is None:
+                raise ManagementError(
+                    ManagementErrorCode.VALIDATION_FAILED,
+                    fields=(ErrorField("modelId", "UNKNOWN_MODEL", "Model is not visible"),),
+                )
+            if maximum <= normal:
+                raise ManagementError(
+                    ManagementErrorCode.UNSUPPORTED_VALUE,
+                    fields=(ErrorField("modelId", "UNSUPPORTED_TIER", "Model has no Max Context tier"),),
+                )
+            outcome = self.backend.update_cursor_model_setting_conditional(
+                account_id,
+                account,
+                model_id=model_id,
+                enabled=max_context_default,
+            )
+            self._raise_conditional_status(outcome)
+            result = self.list_models(context, account_id, page=PageSpec())
+        except BaseException:
+            self._audit(context, "oauth.models.settings.update", account_id, "failed")
+            raise
         self._audit(context, "oauth.models.settings.update", account_id)
-        return self.list_models(context, account_id, page=PageSpec())
+        return result
 
+    @audit_failures("oauth.models.sync", target_arg="account_id")
     def sync_models(
         self, context: ManagementContext, account_id: str, store: OperationStore,
     ) -> ManagementOperation:
@@ -841,7 +805,23 @@ class OAuthControl(
         self._account(account_id)
 
         def worker() -> dict:
-            return asyncio.run(self.backend.refresh_account_models(account_id))
+            result = asyncio.run(self.backend.refresh_account_models(account_id))
+            action = str((result or {}).get("action") or "error")
+            if action != "updated":
+                if action == "timeout":
+                    raise ManagementError(
+                        ManagementErrorCode.UPSTREAM_TIMEOUT, retryable=True,
+                    )
+                if action == "network_disabled":
+                    raise ManagementError(
+                        ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
+                    )
+                if action == "stale":
+                    raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+                raise ManagementError(
+                    ManagementErrorCode.UPSTREAM_ERROR, retryable=True,
+                )
+            return result
 
         return self._start_operation(context, store, kind="oauth.models.sync", worker=worker)
 
@@ -862,21 +842,53 @@ class OAuthControl(
         expected_revision: str | None = None,
     ) -> OAuthSettings:
         self._require(context, Capability.WRITE)
-        current = self.get_settings(context)
-        if expected_revision and expected_revision != current.revision:
-            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
-        if interval_seconds is not None and not 10 <= interval_seconds <= 86400:
-            raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
-        if threshold_percent is not None and not 1 <= threshold_percent <= 100:
-            raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
-        self.backend.update_settings(
-            quota_enabled=quota_enabled,
-            interval_seconds=interval_seconds,
-            threshold_percent=threshold_percent,
-            cch_mode=cch_mode.value if cch_mode else None,
-        )
+        if context.actor.auth_method is AuthMethod.TELEGRAM_ADMIN:
+            # Preserve the frozen Telegram setter path, including fake/domain
+            # callback behavior.  Management API requests use the atomic CAS
+            # path below even when If-Match is omitted.
+            current = self.get_settings(context)
+            if expected_revision and expected_revision != current.revision:
+                raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+            if interval_seconds is not None and not 10 <= interval_seconds <= 86400:
+                raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
+            if threshold_percent is not None and not 1 <= threshold_percent <= 100:
+                raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
+            self.backend.update_settings(
+                quota_enabled=quota_enabled,
+                interval_seconds=interval_seconds,
+                threshold_percent=threshold_percent,
+                cch_mode=cch_mode.value if cch_mode else None,
+            )
+            self._audit(context, "oauth.settings.update", "oauthSettings")
+            return self.get_settings(context)
+        try:
+            current = self.get_settings(context)
+            if expected_revision and expected_revision != current.revision:
+                raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+            if interval_seconds is not None and not 10 <= interval_seconds <= 86400:
+                raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
+            if threshold_percent is not None and not 1 <= threshold_percent <= 100:
+                raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
+            expected = (
+                current.quota_monitor_enabled,
+                current.quota_monitor_interval_seconds,
+                current.quota_monitor_threshold_percent,
+                current.cch_mode.value,
+            )
+            outcome = self.backend.update_settings_conditional(
+                expected,
+                quota_enabled=quota_enabled,
+                interval_seconds=interval_seconds,
+                threshold_percent=threshold_percent,
+                cch_mode=cch_mode.value if cch_mode else None,
+            )
+            self._raise_conditional_status(outcome)
+            result = self.get_settings(context)
+        except BaseException:
+            self._audit(context, "oauth.settings.update", "oauthSettings", "failed")
+            raise
         self._audit(context, "oauth.settings.update", "oauthSettings")
-        return self.get_settings(context)
+        return result
 
     def get_telegram_preferences(self, context: ManagementContext) -> TelegramOAuthPreferences:
         self._require(context, Capability.READ)
@@ -892,12 +904,41 @@ class OAuthControl(
         expected_revision: str | None = None,
     ) -> TelegramOAuthPreferences:
         self._require(context, Capability.WRITE)
-        current = self.get_telegram_preferences(context)
-        if expected_revision and expected_revision != current.revision:
-            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
-        self.backend.update_preferences(
-            usage_display_mode=usage_display_mode.value if usage_display_mode else None,
-            quota_progress_bar=quota_progress_bar,
-        )
+        if context.actor.auth_method is AuthMethod.TELEGRAM_ADMIN:
+            current = self.get_telegram_preferences(context)
+            if expected_revision and expected_revision != current.revision:
+                raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+            self.backend.update_preferences(
+                usage_display_mode=(
+                    usage_display_mode.value if usage_display_mode else None
+                ),
+                quota_progress_bar=quota_progress_bar,
+            )
+            self._audit(
+                context, "oauth.telegram-preferences.update",
+                "telegramOAuthPreferences",
+            )
+            return self.get_telegram_preferences(context)
+        try:
+            current = self.get_telegram_preferences(context)
+            if expected_revision and expected_revision != current.revision:
+                raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+            expected = (
+                current.usage_display_mode.value,
+                current.quota_progress_bar,
+            )
+            outcome = self.backend.update_preferences_conditional(
+                expected,
+                usage_display_mode=usage_display_mode.value if usage_display_mode else None,
+                quota_progress_bar=quota_progress_bar,
+            )
+            self._raise_conditional_status(outcome)
+            result = self.get_telegram_preferences(context)
+        except BaseException:
+            self._audit(
+                context, "oauth.telegram-preferences.update",
+                "telegramOAuthPreferences", "failed",
+            )
+            raise
         self._audit(context, "oauth.telegram-preferences.update", "telegramOAuthPreferences")
-        return self.get_telegram_preferences(context)
+        return result

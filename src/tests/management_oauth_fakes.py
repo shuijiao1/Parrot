@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass
+from threading import RLock
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from src.management_control.oauth import OAuthBackend, OAuthControl
@@ -87,15 +88,43 @@ class InMemoryOAuthBackend(OAuthBackend):
         }
         self.affinity_cleared = []
         self.last_reset_idempotency_key = None
+        self.sync_result = {"action": "updated", "models": 2}
+        self.provider_exchange_count = 0
+        self.default_references = {
+            "openai": {"apiKeys": [], "mappings": [], "defaults": [], "would_empty_keys": []}
+        }
+        self._lock = RLock()
+        self.interleave_once = None
+
+    def _find_exact(self, account_id: str):
+        return next((item for item in self.accounts if self.account_id(item) == account_id), None)
 
     def _find(self, account_id: str):
-        return next((item for item in self.accounts if self.account_id(item) == account_id), None)
+        exact = self._find_exact(account_id)
+        if exact is not None:
+            return exact
+        # Mirror production legacy aliases so API tests cannot accidentally pass
+        # by using an unrealistically strict fake.
+        matches = [
+            item for item in self.accounts
+            if item.get("email") == account_id
+            or f"{self.provider_of(item)}:{item.get('email')}" == account_id
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _interleave(self):
+        callback, self.interleave_once = self.interleave_once, None
+        if callback is not None:
+            callback()
 
     def list_accounts(self):
         return self.accounts
 
     def get_account(self, account_id):
         return self._find(account_id)
+
+    def get_account_exact(self, account_id):
+        return self._find_exact(account_id)
 
     def account_id(self, account):
         if account.get("_id"):
@@ -136,7 +165,7 @@ class InMemoryOAuthBackend(OAuthBackend):
         return {"status": "added", "account_key": account_id}
 
     def replace_exact_identity(self, account_id, entry):
-        current = self._find(account_id)
+        current = self._find_exact(account_id)
         if current is None or self.account_id(entry) != account_id:
             return {"status": "missing", "account_key": account_id}
         protected = {
@@ -148,6 +177,49 @@ class InMemoryOAuthBackend(OAuthBackend):
         current.update(copy.deepcopy(entry), **protected)
         current["_id"] = account_id
         return {"status": "replaced", "account_key": account_id, "account": copy.deepcopy(current)}
+
+    def replace_exact_identity_conditional(self, account_id, entry, expected_account):
+        with self._lock:
+            self._interleave()
+            current = self._find_exact(account_id)
+            if current is None:
+                return {"status": "missing"}
+            if current != expected_account:
+                return {"status": "revision_conflict"}
+            return self.replace_exact_identity(account_id, entry)
+
+    def delete_account_conditional(self, account_id, expected_account):
+        with self._lock:
+            self._interleave()
+            current = self._find_exact(account_id)
+            if current is None:
+                return {"status": "missing"}
+            if current != expected_account:
+                return {"status": "revision_conflict"}
+            self.delete_account(account_id)
+            return {"status": "deleted"}
+
+    def update_account_conditional(
+        self, account_id, expected_account, *, display_name=None,
+        enabled=None, max_concurrent=None,
+    ):
+        with self._lock:
+            self._interleave()
+            current = self._find_exact(account_id)
+            if current is None:
+                return {"status": "missing"}
+            if current != expected_account:
+                return {"status": "revision_conflict"}
+            if display_name is not None:
+                current["label"] = display_name
+            if enabled is not None:
+                current["enabled"] = bool(enabled)
+                current["disabled_reason"] = None if enabled else "user"
+                current["disabled_until"] = None
+                current.pop("quota_observation", None)
+            if max_concurrent is not None:
+                current["maxConcurrent"] = max(0, int(max_concurrent))
+            return {"status": "updated", "account": copy.deepcopy(current)}
 
     def delete_account(self, account_id):
         account = self._find(account_id)
@@ -172,6 +244,17 @@ class InMemoryOAuthBackend(OAuthBackend):
             account["label"] = display_name
         else:
             account.pop("label", None)
+
+    def reorder_accounts_conditional(self, expected_account_ids, account_ids):
+        with self._lock:
+            self._interleave()
+            current = [self.account_id(item) for item in self.accounts]
+            if current != list(expected_account_ids):
+                return {"status": "revision_conflict"}
+            if len(account_ids) != len(set(account_ids)) or set(account_ids) != set(current):
+                return {"status": "resource_conflict"}
+            self.reorder_accounts(account_ids)
+            return {"status": "updated"}
 
     def reorder_accounts(self, account_ids):
         by_id = {self.account_id(item): item for item in self.accounts}
@@ -235,9 +318,13 @@ class InMemoryOAuthBackend(OAuthBackend):
     def account_model_selection(self, account_or_id):
         account = account_or_id if isinstance(account_or_id, dict) else self._find(account_or_id)
         values = list(account.get("models") or [])
+        records = account.get("model_records") or [
+            {"id": value, "name": value.upper(), "contextWindow": 128000}
+            for value in values
+        ]
         return {
             "models": values,
-            "records": [{"id": value, "name": value.upper(), "contextWindow": 128000} for value in values],
+            "records": copy.deepcopy(records),
             "disabled_models": set(account.get("disabled_models") or []),
             "source": "fake",
         }
@@ -245,6 +332,20 @@ class InMemoryOAuthBackend(OAuthBackend):
     def account_disabled_models(self, account_or_id):
         account = account_or_id if isinstance(account_or_id, dict) else self._find(account_or_id)
         return set(account.get("disabled_models") or [])
+
+    def update_account_models_conditional(
+        self, account_id, expected_account, *, visible_models, disabled_models,
+    ):
+        with self._lock:
+            self._interleave()
+            current = self._find_exact(account_id)
+            if current is None:
+                return {"status": "missing"}
+            if current != expected_account:
+                return {"status": "revision_conflict"}
+            hidden = set(current.get("disabled_models") or []) - set(visible_models)
+            current["disabled_models"] = sorted(hidden | set(disabled_models))
+            return {"status": "updated", "account": copy.deepcopy(current)}
 
     def set_account_disabled_models(self, account_id, models, *, visible_models=None):
         value = set(models)
@@ -261,6 +362,19 @@ class InMemoryOAuthBackend(OAuthBackend):
         account = account_or_id if isinstance(account_or_id, dict) else self._find(account_or_id)
         return model_id not in set(account.get("cursor_max_context_disabled_models") or [])
 
+    def update_cursor_model_setting_conditional(
+        self, account_id, expected_account, *, model_id, enabled,
+    ):
+        with self._lock:
+            self._interleave()
+            account = self._find_exact(account_id)
+            if account is None:
+                return {"status": "missing"}
+            if account != expected_account:
+                return {"status": "revision_conflict"}
+            self.set_cursor_max_context_default(account_id, model_id, enabled)
+            return {"status": "updated", "account": copy.deepcopy(account)}
+
     def set_cursor_max_context_default(self, account_id, model_id, enabled):
         account = self._find(account_id)
         disabled = set(account.get("cursor_max_context_disabled_models") or [])
@@ -269,8 +383,10 @@ class InMemoryOAuthBackend(OAuthBackend):
         return enabled
 
     async def refresh_account_models(self, account_id):
-        self._find(account_id)["last_model_sync"] = "2026-01-01T00:00:00Z"
-        return {"action": "updated", "models": 2}
+        result = copy.deepcopy(self.sync_result)
+        if result.get("action") == "updated":
+            self._find(account_id)["last_model_sync"] = "2026-01-01T00:00:00Z"
+        return result
 
     def reset_quota(self, account_id):
         self.quota.pop(account_id, None)
@@ -281,7 +397,27 @@ class InMemoryOAuthBackend(OAuthBackend):
         return {"outcome": "reset", "available_count": 0}
 
     def get_settings(self):
-        return tuple(self.settings)
+        values = list(self.settings)
+        values[3] = values[3] if values[3] in {"disabled", "dynamic"} else "disabled"
+        return tuple(values)
+
+    def update_settings_conditional(
+        self, expected, *, quota_enabled=None, interval_seconds=None,
+        threshold_percent=None, cch_mode=None,
+    ):
+        with self._lock:
+            self._interleave()
+            normalized = list(self.settings)
+            normalized[3] = normalized[3] if normalized[3] in {"disabled", "dynamic"} else "disabled"
+            if tuple(normalized) != tuple(expected):
+                return {"status": "revision_conflict"}
+            self.update_settings(
+                quota_enabled=quota_enabled,
+                interval_seconds=interval_seconds,
+                threshold_percent=threshold_percent,
+                cch_mode=cch_mode,
+            )
+            return {"status": "updated"}
 
     def update_settings(self, *, quota_enabled=None, interval_seconds=None, threshold_percent=None, cch_mode=None):
         if quota_enabled is not None: self.settings[0] = quota_enabled
@@ -290,7 +426,22 @@ class InMemoryOAuthBackend(OAuthBackend):
         if cch_mode is not None: self.settings[3] = cch_mode
 
     def get_preferences(self):
-        return tuple(self.preferences)
+        values = list(self.preferences)
+        values[0] = values[0] if values[0] in {"used", "remaining"} else "used"
+        return tuple(values)
+
+    def update_preferences_conditional(
+        self, expected, *, usage_display_mode=None, quota_progress_bar=None,
+    ):
+        with self._lock:
+            self._interleave()
+            if self.get_preferences() != tuple(expected):
+                return {"status": "revision_conflict"}
+            self.update_preferences(
+                usage_display_mode=usage_display_mode,
+                quota_progress_bar=quota_progress_bar,
+            )
+            return {"status": "updated"}
 
     def update_preferences(self, *, usage_display_mode=None, quota_progress_bar=None):
         if usage_display_mode is not None: self.preferences[0] = usage_display_mode
@@ -303,7 +454,34 @@ class InMemoryOAuthBackend(OAuthBackend):
         return [f"{family}-static"]
 
     def scan_default_model_references(self, family, removed):
-        return {"apiKeys": [], "mappings": [], "defaults": [], "would_empty_keys": []}
+        state = copy.deepcopy(self.default_references.get(
+            family, {"apiKeys": [], "mappings": [], "defaults": [], "would_empty_keys": []},
+        ))
+        for item in state["apiKeys"]:
+            item["hits"] = [model for model in item.get("hits", []) if model in removed]
+        state["apiKeys"] = [item for item in state["apiKeys"] if item["hits"]]
+        state["mappings"] = [item for item in state["mappings"] if item.get("real") in removed]
+        state["defaults"] = [item for item in state["defaults"] if item.get("value") in removed]
+        return state
+
+    def default_models_state(self, family):
+        models = self.default_models(family)
+        return {
+            "models": models,
+            "references": self.scan_default_model_references(family, set(models)),
+        }
+
+    def replace_default_models_conditional(
+        self, family, models, removed, *, cleanup, expected_state,
+    ):
+        with self._lock:
+            self._interleave()
+            if self.default_models_state(family) != expected_state:
+                return {"status": "revision_conflict", "summary": {}}
+            summary = self.replace_default_models(
+                family, models, removed, cleanup=cleanup,
+            )
+            return {"status": "updated", "summary": summary}
 
     def replace_default_models(self, family, models, removed, *, cleanup):
         self.defaults[family] = list(models)
@@ -333,6 +511,7 @@ class InMemoryOAuthBackend(OAuthBackend):
         return "https://openai.example.test/authorize?" + urlencode({"state": state})
 
     def openai_exchange_code(self, code, verifier):
+        self.provider_exchange_count += 1
         return {"access_token": "flow-access-secret", "refresh_token": "flow-refresh-secret", "id_token": "flow-id-token", "expires_in": 3600}
 
     def openai_decode_id_token(self, token):

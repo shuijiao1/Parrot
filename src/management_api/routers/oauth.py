@@ -18,6 +18,7 @@ from src.management_control.oauth import (
     OAuthFamily,
     OAuthImportDecision,
     OAuthProvider,
+    OAuthReplaceRequired,
     PageSpec,
     UpdateOAuthAccountCommand,
 )
@@ -77,16 +78,18 @@ from .oauth_support import (
     credential,
     detail,
     get_oauth_control_dependency,
+    identity_conflict_response,
     meta,
     models,
     operation_envelope,
     page_meta,
     responses,
     summary,
+    StrictOAuthQueryRoute,
 )
 
 
-router = APIRouter(tags=["management-oauth"])
+router = APIRouter(tags=["management-oauth"], route_class=StrictOAuthQueryRoute)
 
 ReadContext = Annotated[ManagementContext, Depends(require_capability(Capability.READ))]
 WriteContext = Annotated[ManagementContext, Depends(require_capability(Capability.WRITE))]
@@ -142,13 +145,16 @@ def create_oauth_account(
     context: SecretContext,
     control: Control,
 ) -> DataEnvelope[OAuthMutationData]:
-    result = control.create_account(
-        context,
-        CreateOAuthAccountCommand(
-            credential=credential(body.credential),
-            replace_plan_token=body.replacePlanToken.get_secret_value() if body.replacePlanToken else None,
-        ),
-    )
+    try:
+        result = control.create_account(
+            context,
+            CreateOAuthAccountCommand(
+                credential=credential(body.credential),
+                replace_plan_token=body.replacePlanToken.get_secret_value() if body.replacePlanToken else None,
+            ),
+        )
+    except OAuthReplaceRequired as error:
+        return identity_conflict_response(error, request)
     return DataEnvelope(
         data=OAuthMutationData(accountId=result.account_id, revision=result.revision, status=result.status),
         meta=meta(request),
@@ -273,7 +279,10 @@ async def complete_oauth_login_flow(
         completed=body.completed,
         replace_plan_token=body.replacePlanToken.get_secret_value() if body.replacePlanToken else None,
     )
-    result = await asyncio.to_thread(control.complete_login_flow, context, flowId, command)
+    try:
+        result = await asyncio.to_thread(control.complete_login_flow, context, flowId, command)
+    except OAuthReplaceRequired as error:
+        return identity_conflict_response(error, request)
     return DataEnvelope(
         data=OAuthMutationData(accountId=result.account_id, revision=result.revision, status=result.status),
         meta=meta(request),
@@ -497,9 +506,9 @@ def reset_oauth_quota(
     context: DestructiveContext,
     control: Control,
 ) -> DataEnvelope[OAuthMutationData]:
-    result = control.reset_quota(context, body.planToken.get_secret_value())
-    if result.account_id != accountId:
-        raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+    result = control.reset_quota(
+        context, accountId, body.planToken.get_secret_value(),
+    )
     return DataEnvelope(
         data=OAuthMutationData(accountId=result.account_id, revision=result.revision, status=result.status),
         meta=meta(request),

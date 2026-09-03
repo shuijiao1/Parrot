@@ -51,7 +51,7 @@ class OAuthCompatibilityControlMixin:
         visible_models: Iterable[str] | None = None,
     ) -> set[str]:
         self._require(context, Capability.WRITE)
-        self._account(account_id)
+        self._legacy_account(account_id)
         result = self.backend.set_account_disabled_models(
             account_id, models, visible_models=visible_models,
         )
@@ -66,7 +66,7 @@ class OAuthCompatibilityControlMixin:
         disabled: bool,
     ) -> bool:
         self._require(context, Capability.WRITE)
-        self._account(account_id)
+        self._legacy_account(account_id)
         result = self.backend.set_account_model_disabled(account_id, model_id, disabled)
         self._audit(context, "oauth.models.update", account_id)
         return result
@@ -80,7 +80,7 @@ class OAuthCompatibilityControlMixin:
         visible_models: Iterable[str] | None = None,
     ) -> set[str]:
         self._require(context, Capability.WRITE)
-        self._account(account_id)
+        self._legacy_account(account_id)
         result = self.backend.set_cursor_disabled_models(
             account_id, models, visible_models=visible_models,
         )
@@ -95,7 +95,7 @@ class OAuthCompatibilityControlMixin:
         enabled: bool,
     ) -> bool:
         self._require(context, Capability.WRITE)
-        self._account(account_id)
+        self._legacy_account(account_id)
         result = self.backend.set_cursor_max_context_default(account_id, model_id, enabled)
         self._audit(context, "oauth.models.settings.update", account_id)
         return result
@@ -107,7 +107,7 @@ class OAuthCompatibilityControlMixin:
         model_id: str,
     ) -> None:
         self._require(context, Capability.WRITE)
-        self._account(account_id)
+        self._legacy_account(account_id)
         self.backend.clear_errors(account_id, model_id)
         self._audit(context, "oauth.errors.clear", account_id)
 

@@ -1,5 +1,6 @@
 """OAuth Management Control public surface."""
 
+from .account_mutations import OAuthReplaceRequired
 from .backend import OAuthBackend
 from .control import OAuthControl
 from .models import (
@@ -42,6 +43,7 @@ __all__ = [
     "OAuthFamily",
     "OAuthImportDecision",
     "OAuthProvider",
+    "OAuthReplaceRequired",
     "OAuthUsageDisplayMode",
     "PageSpec",
     "RefreshTokenCredential",

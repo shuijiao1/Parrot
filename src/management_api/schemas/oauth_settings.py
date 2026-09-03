@@ -57,7 +57,9 @@ class OAuthDefaultModelsData(StrictSchema):
 
 
 class ReplaceOAuthDefaultModelsRequest(StrictSchema):
-    models: list[str] = Field(max_length=200)
+    # Publish the business limit in OpenAPI while letting the control layer
+    # return the stable indexed TOO_MANY_MODELS error contract.
+    models: list[str] = Field(json_schema_extra={"maxItems": 200})
     cleanupReferences: bool = False
 
 

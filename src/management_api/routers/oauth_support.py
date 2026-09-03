@@ -2,26 +2,35 @@
 
 from __future__ import annotations
 
-from fastapi import Request
+import json
+from threading import RLock
+from typing import Annotated
+from weakref import WeakKeyDictionary
 
-from src.management_control import ManagementErrorCode
+from fastapi import Depends, Request
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
+
+from src.management_control import ErrorField, ManagementError, ManagementErrorCode
 from src.management_control.oauth import (
     JsonCredential,
     ManualCredential,
     OAuthControl,
+    OAuthReplaceRequired,
     RefreshTokenCredential,
-    get_oauth_control,
 )
+from src.management_control.oauth.contracts import public_value, sanitize_text
 from src.management_control.operations import ManagementOperation
 
-from ..dependencies import management_request_id
-from ..error_mapping import management_error_responses
+from ..dependencies import ManagementRuntime, get_management_runtime, management_request_id
+from ..error_mapping import error_response, management_error_responses
 from ..schemas.base import ResponseMeta
 from ..schemas.oauth import (
     JsonOAuthCredential,
     ManualOAuthCredential,
     OAuthAccountDetailData,
     OAuthAccountSummaryData,
+    OAuthIdentityConflictEnvelope,
     OAuthLocalStatsData,
     OAuthOperationEnvelope,
     OAuthPageMeta,
@@ -101,14 +110,93 @@ def responses(code: int, data: object, *extra: ManagementErrorCode) -> dict:
                 },
             }
         }
-    return {
+    result = {
         **success,
         **management_error_responses(*COMMON_ERRORS, *extra),
     }
+    if ManagementErrorCode.IDENTITY_CONFLICT in extra:
+        result[409] = {
+            "model": OAuthIdentityConflictEnvelope,
+            "description": "Exact OAuth identity conflict with typed one-shot replace plan",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": {
+                            "code": "IDENTITY_CONFLICT",
+                            "message": "IDENTITY_CONFLICT",
+                            "fields": [{
+                                "path": "accountId",
+                                "code": "EXACT_IDENTITY",
+                                "message": "openai:admin@example.invalid:workspace-example",
+                            }],
+                            "retryable": False,
+                            "requestId": "request-example",
+                            "operationId": None,
+                        },
+                        "conflict": {
+                            "accountId": "openai:admin@example.invalid:workspace-example",
+                            "replacePlanToken": "<one-time-write-only>",
+                        },
+                    }
+                }
+            },
+        }
+    return result
 
 
-def get_oauth_control_dependency() -> OAuthControl:
-    return get_oauth_control()
+def identity_conflict_response(
+    error: OAuthReplaceRequired, request: Request,
+) -> JSONResponse:
+    request_id = management_request_id(request)
+    base = error_response(error, request_id=request_id)
+    payload = json.loads(base.body)
+    payload["conflict"] = {
+        "accountId": error.account_id,
+        "replacePlanToken": error.plan_token,
+    }
+    response = JSONResponse(status_code=409, content=payload)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Request-Id"] = request_id
+    return response
+
+
+_RUNTIME_CONTROLS: WeakKeyDictionary[object, OAuthControl] = WeakKeyDictionary()
+_RUNTIME_CONTROLS_LOCK = RLock()
+
+
+class StrictOAuthQueryRoute(APIRoute):
+    """Reject undeclared query keys before auth/control dependencies run."""
+
+    def get_route_handler(self):
+        original = super().get_route_handler()
+        allowed = {str(field.alias) for field in self.dependant.query_params}
+
+        async def strict_handler(request: Request):
+            unknown = sorted(set(request.query_params) - allowed)
+            if unknown:
+                raise ManagementError(
+                    ManagementErrorCode.VALIDATION_FAILED,
+                    fields=tuple(
+                        ErrorField(name, "extra_forbidden", "Unknown query parameter")
+                        for name in unknown
+                    ),
+                )
+            return await original(request)
+
+        return strict_handler
+
+
+def get_oauth_control_dependency(
+    runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
+) -> OAuthControl:
+    """Return one flow/plan-preserving control bound to this runtime audit sink."""
+    key = runtime.audit_sink
+    with _RUNTIME_CONTROLS_LOCK:
+        control = _RUNTIME_CONTROLS.get(key)
+        if control is None:
+            control = OAuthControl(audit_sink=key)
+            _RUNTIME_CONTROLS[key] = control
+        return control
 
 
 def meta(request: Request) -> ResponseMeta:
@@ -170,9 +258,9 @@ def detail(value) -> OAuthAccountDetailData:
         runtimeErrors=[
             OAuthRuntimeErrorData(
                 modelId=item.model_id,
-                message=item.message,
+                message=sanitize_text(item.message) if item.message else None,
                 cooldownUntil=item.cooldown_until,
-                permanent=item.permanent,
+                cooldownPermanent=item.cooldown_permanent,
             )
             for item in value.runtime_errors
         ],
@@ -193,7 +281,7 @@ def operation(value: ManagementOperation) -> ManagementOperationData:
     if value.error is not None:
         error = OperationErrorData(
             code=value.error.code,
-            message=value.error.message,
+            message=sanitize_text(value.error.message),
             retryable=value.error.retryable,
         )
     return ManagementOperationData(
@@ -204,7 +292,7 @@ def operation(value: ManagementOperation) -> ManagementOperationData:
         createdAt=value.created_at,
         startedAt=value.started_at,
         finishedAt=value.finished_at,
-        result=value.result,
+        result=public_value(value.result),
         error=error,
         cancellable=value.cancellable,
     )

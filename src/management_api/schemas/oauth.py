@@ -13,7 +13,7 @@ from src.management_control.oauth.models import (
     OAuthProvider,
 )
 
-from .base import StrictSchema
+from .base import ErrorDetailSchema, StrictSchema
 from .operations import ManagementOperationData
 
 
@@ -32,7 +32,7 @@ class OAuthAccountSummaryData(StrictSchema):
     identity: str
     enabled: bool
     disabledReason: str | None = None
-    disabledUntil: str | None = None
+    disabledUntil: datetime | None = None
     maxConcurrent: int
     available: bool
     quotaLimited: bool
@@ -57,7 +57,7 @@ class OAuthUsageWindowData(StrictSchema):
     name: str
     usedPercent: float | None = None
     remainingPercent: float | None = None
-    resetsAt: str | None = None
+    resetsAt: datetime | None = None
 
 
 class OAuthLocalStatsData(StrictSchema):
@@ -70,8 +70,8 @@ class OAuthLocalStatsData(StrictSchema):
 class OAuthRuntimeErrorData(StrictSchema):
     modelId: str | None = None
     message: str | None = None
-    cooldownUntil: int | None = None
-    permanent: bool
+    cooldownUntil: datetime | None = None
+    cooldownPermanent: bool
 
 
 class OAuthAccountDetailData(StrictSchema):
@@ -79,12 +79,12 @@ class OAuthAccountDetailData(StrictSchema):
     workspaceId: str | None = None
     workspaceName: str | None = None
     planType: str | None = None
-    expiresAt: str | None = None
+    expiresAt: datetime | None = None
     usageWindows: list[OAuthUsageWindowData]
     localStats: OAuthLocalStatsData
     runtimeErrors: list[OAuthRuntimeErrorData]
     credentialConfigured: bool
-    lastModelSync: str | None = None
+    lastModelSync: datetime | None = None
 
 
 class ManualOAuthCredential(StrictSchema):
@@ -142,6 +142,16 @@ class OAuthMutationData(StrictSchema):
     accountId: str
     revision: str
     status: str
+
+
+class OAuthReplaceConflictData(StrictSchema):
+    accountId: str
+    replacePlanToken: str = Field(json_schema_extra={"writeOnly": True})
+
+
+class OAuthIdentityConflictEnvelope(StrictSchema):
+    error: ErrorDetailSchema
+    conflict: OAuthReplaceConflictData
 
 
 class StartOAuthLoginFlowRequest(StrictSchema):

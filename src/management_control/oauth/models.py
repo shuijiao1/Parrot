@@ -75,7 +75,7 @@ class OAuthAccountSummary:
     identity: str
     enabled: bool
     disabled_reason: str | None
-    disabled_until: str | None
+    disabled_until: datetime | None
     max_concurrent: int
     available: bool
     quota_limited: bool
@@ -98,7 +98,7 @@ class OAuthUsageWindow:
     name: str
     used_percent: float | None
     remaining_percent: float | None
-    resets_at: str | None
+    resets_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,8 +113,8 @@ class OAuthLocalStats:
 class OAuthRuntimeError:
     model_id: str | None
     message: str | None
-    cooldown_until: int | None
-    permanent: bool
+    cooldown_until: datetime | None
+    cooldown_permanent: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,12 +123,12 @@ class OAuthAccountDetail:
     workspace_id: str | None
     workspace_name: str | None
     plan_type: str | None
-    expires_at: str | None
+    expires_at: datetime | None
     usage_windows: tuple[OAuthUsageWindow, ...]
     local_stats: OAuthLocalStats
     runtime_errors: tuple[OAuthRuntimeError, ...]
     credential_configured: bool
-    last_model_sync: str | None
+    last_model_sync: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,7 +257,7 @@ class OAuthModel:
     model_id: str
     name: str
     disabled: bool
-    cooldown_until: int | None
+    cooldown_until: datetime | None
     cooldown_permanent: bool
     metadata_source: str | None
     context_window: int | None

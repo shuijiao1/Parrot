@@ -158,6 +158,14 @@ class OAuthFlowService:
         if plan is None or provider is None:
             raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
         payload = plan.payload
+        self._validate_submission(provider, payload, command)
+        # Atomic reservation follows side-effect-free validation and precedes
+        # provider exchange. Exactly one concurrent completer can proceed.
+        self._flows.consume(
+            flow_id,
+            actor_subject_id=actor_subject_id,
+            kind=f"login:{provider.value}",
+        )
         try:
             entry = self._complete_provider(provider, payload, command)
         except ManagementError:
@@ -167,12 +175,36 @@ class OAuthFlowService:
                 ManagementErrorCode.UPSTREAM_ERROR,
                 retryable=True,
             ) from exc
-        self._flows.consume(
-            flow_id,
-            actor_subject_id=actor_subject_id,
-            kind=f"login:{provider.value}",
-        )
         return CompletedCredential(entry=entry, source=f"{provider.value} login")
+
+    def _validate_submission(
+        self,
+        provider: OAuthProvider,
+        payload: dict,
+        command: CompleteOAuthLoginCommand,
+    ) -> None:
+        if provider is OAuthProvider.CURSOR:
+            if command.completed is not True:
+                raise ManagementError(ManagementErrorCode.INVALID_REQUEST)
+            return
+        source = command.callback_url or command.code
+        if provider is OAuthProvider.ANTIGRAVITY:
+            parsed = self.backend.antigravity_parse_callback(source or "")
+            code, received_state = parsed.get("code") or "", parsed.get("state") or ""
+        else:
+            code, received_state = _extract_code_state(source)
+            if command.state:
+                received_state = command.state
+        if not code:
+            raise ManagementError(
+                ManagementErrorCode.VALIDATION_FAILED,
+                fields=[ErrorField("code", "REQUIRED", "Authorization code is required")],
+            )
+        expected_state = str(payload.get("state") or "")
+        if expected_state and (
+            not received_state or not secrets.compare_digest(received_state, expected_state)
+        ):
+            raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
 
     def _complete_provider(
         self,

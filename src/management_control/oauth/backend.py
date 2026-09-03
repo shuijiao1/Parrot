@@ -46,6 +46,14 @@ class OAuthBackend:
     def get_account(self, account_id: str) -> dict | None:
         return oauth_manager.get_account(account_id)
 
+    def get_account_exact(self, account_id: str) -> dict | None:
+        """Management IDs accept only exact canonical equality, never TG aliases."""
+        matches = [
+            account for account in oauth_manager.list_accounts()
+            if oauth_manager.get_account_key(account) == account_id
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     def account_id(self, account: dict) -> str:
         return oauth_manager.get_account_key(account)
 
@@ -73,8 +81,87 @@ class OAuthBackend:
     def replace_exact_identity(self, account_id: str, entry: dict) -> dict:
         return oauth_manager.replace_exact_identity(account_id, entry)
 
+    def replace_exact_identity_conditional(
+        self, account_id: str, entry: dict, expected_account: dict,
+    ) -> dict:
+        return oauth_manager.replace_exact_identity(
+            account_id, entry, expected_account=expected_account,
+        )
+
     def delete_account(self, account_id: str) -> None:
         oauth_manager.delete_account(account_id)
+
+    def delete_account_conditional(self, account_id: str, expected_account: dict) -> dict:
+        return oauth_manager.delete_account_if_unchanged(account_id, expected_account)
+
+    def update_account_conditional(
+        self,
+        account_id: str,
+        expected_account: dict,
+        *,
+        display_name: str | None = None,
+        enabled: bool | None = None,
+        max_concurrent: int | None = None,
+    ) -> dict:
+        def mutate(account: dict) -> None:
+            if display_name is not None:
+                if display_name:
+                    account["label"] = display_name
+                else:
+                    account.pop("label", None)
+            if enabled is not None:
+                account["enabled"] = bool(enabled)
+                account["disabled_reason"] = None if enabled else "user"
+                account["disabled_until"] = None
+                account.pop("quota_observation", None)
+            if max_concurrent is not None:
+                account["maxConcurrent"] = max(0, int(max_concurrent or 0))
+
+        return oauth_manager.mutate_account_if_unchanged(
+            account_id, expected_account, mutate,
+        )
+
+    def update_account_models_conditional(
+        self,
+        account_id: str,
+        expected_account: dict,
+        *,
+        visible_models: set[str],
+        disabled_models: set[str],
+    ) -> dict:
+        def mutate(account: dict) -> None:
+            hidden = oauth_manager.account_disabled_models(account) - visible_models
+            field = (
+                "cursor_disabled_models"
+                if oauth_manager.provider_of(account) == "cursor"
+                else "disabledModels"
+            )
+            account[field] = sorted(hidden | disabled_models)
+
+        return oauth_manager.mutate_account_if_unchanged(
+            account_id, expected_account, mutate,
+        )
+
+    def update_cursor_model_setting_conditional(
+        self,
+        account_id: str,
+        expected_account: dict,
+        *,
+        model_id: str,
+        enabled: bool,
+    ) -> dict:
+        def mutate(account: dict) -> None:
+            disabled = oauth_manager.cursor_max_context_disabled_models(account)
+            if enabled:
+                disabled.discard(model_id)
+            else:
+                disabled.add(model_id)
+            account["cursor_max_context_disabled_models"] = sorted(disabled)
+            account.pop("cursor_max_context_models", None)
+
+        return oauth_manager.mutate_account_if_unchanged(
+            account_id, expected_account, mutate,
+        )
 
     def set_enabled(
         self,
@@ -202,6 +289,13 @@ class OAuthBackend:
             account_id, idempotency_key=idempotency_key,
         )
 
+    def reorder_accounts_conditional(
+        self, expected_account_ids: list[str], account_ids: list[str],
+    ) -> dict:
+        return oauth_manager.reorder_accounts_if_unchanged(
+            expected_account_ids, account_ids,
+        )
+
     def reorder_accounts(self, account_ids: list[str]) -> None:
         wanted = list(account_ids)
 
@@ -248,15 +342,51 @@ class OAuthBackend:
 
         config.update(mutate)
 
-    def get_settings(self) -> tuple[bool, int, float, str]:
-        cfg = config.get()
+    @staticmethod
+    def _settings_from(cfg: dict) -> tuple[bool, int, float, str]:
         quota = cfg.get("quotaMonitor") or {}
+        raw_mode = str(cfg.get("cchMode") or "disabled").strip().lower()
+        # Frozen TG treats every historical/non-dynamic value (including
+        # ``static``) as disabled.  Keep that fallback at the API boundary.
+        mode = raw_mode if raw_mode in {"disabled", "dynamic"} else "disabled"
         return (
             bool(quota.get("enabled", False)),
             int(quota.get("intervalSeconds", 60) or 60),
             float(quota.get("disableThresholdPercent", 95) or 95),
-            str(cfg.get("cchMode") or "disabled"),
+            mode,
         )
+
+    def get_settings(self) -> tuple[bool, int, float, str]:
+        return self._settings_from(config.get())
+
+    def update_settings_conditional(
+        self,
+        expected: tuple[bool, int, float, str],
+        *,
+        quota_enabled: bool | None = None,
+        interval_seconds: int | None = None,
+        threshold_percent: float | None = None,
+        cch_mode: str | None = None,
+    ) -> dict:
+        result = {"status": "revision_conflict"}
+
+        def mutate(cfg: dict) -> None:
+            if self._settings_from(cfg) != expected:
+                return
+            quota = cfg.setdefault("quotaMonitor", {})
+            if quota_enabled is not None:
+                quota["enabled"] = bool(quota_enabled)
+            if interval_seconds is not None:
+                quota["intervalSeconds"] = int(interval_seconds)
+            if threshold_percent is not None:
+                quota["disableThresholdPercent"] = float(threshold_percent)
+                quota["resumeThresholdPercent"] = float(threshold_percent)
+            if cch_mode is not None:
+                cfg["cchMode"] = cch_mode
+            result["status"] = "updated"
+
+        config.update(mutate, skip_if_unchanged=True)
+        return result
 
     def update_settings(
         self,
@@ -280,12 +410,35 @@ class OAuthBackend:
 
         config.update(mutate)
 
+    @staticmethod
+    def _preferences_from(cfg: dict) -> tuple[str, bool]:
+        raw_mode = str(cfg.get("oauthUsageDisplayMode") or "used").strip().lower()
+        mode = raw_mode if raw_mode in {"used", "remaining"} else "used"
+        return mode, bool(cfg.get("quotaProgressBar", True))
+
     def get_preferences(self) -> tuple[str, bool]:
-        cfg = config.get()
-        return (
-            str(cfg.get("oauthUsageDisplayMode") or "used"),
-            bool(cfg.get("quotaProgressBar", True)),
-        )
+        return self._preferences_from(config.get())
+
+    def update_preferences_conditional(
+        self,
+        expected: tuple[str, bool],
+        *,
+        usage_display_mode: str | None = None,
+        quota_progress_bar: bool | None = None,
+    ) -> dict:
+        result = {"status": "revision_conflict"}
+
+        def mutate(cfg: dict) -> None:
+            if self._preferences_from(cfg) != expected:
+                return
+            if usage_display_mode is not None:
+                cfg["oauthUsageDisplayMode"] = usage_display_mode
+            if quota_progress_bar is not None:
+                cfg["quotaProgressBar"] = bool(quota_progress_bar)
+            result["status"] = "updated"
+
+        config.update(mutate, skip_if_unchanged=True)
+        return result
 
     def update_preferences(
         self,
@@ -315,8 +468,10 @@ class OAuthBackend:
     def static_default_models(self, family: str) -> list[str]:
         return self._models_from(config.DEFAULT_CONFIG, family)
 
-    def scan_default_model_references(self, family: str, removed: set[str]) -> dict:
-        cfg = config.get()
+    @staticmethod
+    def _scan_default_model_references_from(
+        cfg: dict, family: str, removed: set[str],
+    ) -> dict:
         ingresses = _FAMILY_INGRESSES[family]
         api_keys: list[dict] = []
         would_empty: list[str] = []
@@ -333,7 +488,8 @@ class OAuthBackend:
                     would_empty.append(name)
         mappings: list[dict] = []
         for ingress in ingresses:
-            for alias, real in sorted(((cfg.get("modelMapping") or {}).get(ingress) or {}).items()):
+            line = ((cfg.get("modelMapping") or {}).get(ingress) or {})
+            for alias, real in sorted(line.items()):
                 if isinstance(real, str) and real in removed:
                     mappings.append({"ingress": ingress, "alias": alias, "real": real})
         defaults = [
@@ -349,6 +505,78 @@ class OAuthBackend:
             "would_empty_keys": would_empty,
         }
 
+    def _default_models_state_from(self, cfg: dict, family: str) -> dict:
+        models = self._models_from(cfg, family)
+        return {
+            "models": models,
+            "references": self._scan_default_model_references_from(
+                cfg, family, set(models),
+            ),
+        }
+
+    def default_models_state(self, family: str) -> dict:
+        return self._default_models_state_from(config.get(), family)
+
+    def scan_default_model_references(self, family: str, removed: set[str]) -> dict:
+        return self._scan_default_model_references_from(config.get(), family, removed)
+
+    @staticmethod
+    def _replace_default_models_in(
+        cfg: dict,
+        family: str,
+        models: list[str],
+        removed: set[str],
+        *,
+        cleanup: bool,
+        summary: dict,
+    ) -> None:
+        path = _FAMILY_CONFIG_PATHS[family]
+        ingresses = _FAMILY_INGRESSES[family]
+        if len(path) == 1:
+            cfg[path[0]] = list(models)
+        else:
+            cfg.setdefault(path[0], {})[path[1]] = list(models)
+        if not cleanup or not removed:
+            return
+        for name, entry in (cfg.get("apiKeys") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            allowed = entry.get("allowedModels") or []
+            if not isinstance(allowed, list) or not allowed:
+                continue
+            kept = [model for model in allowed if model not in removed]
+            removed_here = [model for model in allowed if model in removed]
+            if not removed_here:
+                continue
+            if not kept:
+                summary["keys_skipped_empty"].append(name)
+            else:
+                entry["allowedModels"] = kept
+                summary["keys_cleaned"].append({"name": name, "removed": removed_here})
+        mappings = cfg.get("modelMapping") or {}
+        for ingress in ingresses:
+            line = mappings.get(ingress)
+            if not isinstance(line, dict):
+                continue
+            for alias in list(line):
+                if line.get(alias) in removed:
+                    del line[alias]
+                    summary["mappings_removed"].append({"ingress": ingress, "alias": alias})
+        defaults = cfg.get("ingressDefaultModel") or {}
+        for ingress in ingresses:
+            if defaults.get(ingress) in removed:
+                del defaults[ingress]
+                summary["defaults_cleared"].append(ingress)
+
+    @staticmethod
+    def _empty_default_summary() -> dict:
+        return {
+            "keys_cleaned": [],
+            "keys_skipped_empty": [],
+            "mappings_removed": [],
+            "defaults_cleared": [],
+        }
+
     def replace_default_models(
         self,
         family: str,
@@ -357,54 +585,34 @@ class OAuthBackend:
         *,
         cleanup: bool,
     ) -> dict:
-        summary = {
-            "keys_cleaned": [],
-            "keys_skipped_empty": [],
-            "mappings_removed": [],
-            "defaults_cleared": [],
-        }
-        path = _FAMILY_CONFIG_PATHS[family]
-        ingresses = _FAMILY_INGRESSES[family]
+        summary = self._empty_default_summary()
+        config.update(lambda cfg: self._replace_default_models_in(
+            cfg, family, models, removed, cleanup=cleanup, summary=summary,
+        ))
+        return summary
+
+    def replace_default_models_conditional(
+        self,
+        family: str,
+        models: list[str],
+        removed: set[str],
+        *,
+        cleanup: bool,
+        expected_state: dict,
+    ) -> dict:
+        summary = self._empty_default_summary()
+        result = {"status": "revision_conflict", "summary": summary}
 
         def mutate(cfg: dict) -> None:
-            if len(path) == 1:
-                cfg[path[0]] = list(models)
-            else:
-                cfg.setdefault(path[0], {})[path[1]] = list(models)
-            if not cleanup or not removed:
+            if self._default_models_state_from(cfg, family) != expected_state:
                 return
-            for name, entry in (cfg.get("apiKeys") or {}).items():
-                if not isinstance(entry, dict):
-                    continue
-                allowed = entry.get("allowedModels") or []
-                if not isinstance(allowed, list) or not allowed:
-                    continue
-                kept = [model for model in allowed if model not in removed]
-                removed_here = [model for model in allowed if model in removed]
-                if not removed_here:
-                    continue
-                if not kept:
-                    summary["keys_skipped_empty"].append(name)
-                else:
-                    entry["allowedModels"] = kept
-                    summary["keys_cleaned"].append({"name": name, "removed": removed_here})
-            mappings = cfg.get("modelMapping") or {}
-            for ingress in ingresses:
-                line = mappings.get(ingress)
-                if not isinstance(line, dict):
-                    continue
-                for alias in list(line):
-                    if line.get(alias) in removed:
-                        del line[alias]
-                        summary["mappings_removed"].append({"ingress": ingress, "alias": alias})
-            defaults = cfg.get("ingressDefaultModel") or {}
-            for ingress in ingresses:
-                if defaults.get(ingress) in removed:
-                    del defaults[ingress]
-                    summary["defaults_cleared"].append(ingress)
+            self._replace_default_models_in(
+                cfg, family, models, removed, cleanup=cleanup, summary=summary,
+            )
+            result["status"] = "updated"
 
-        config.update(mutate)
-        return summary
+        config.update(mutate, skip_if_unchanged=True)
+        return result
 
     def xai_models_url(self) -> str:
         cfg = config.get().get("xaiOAuth") or {}

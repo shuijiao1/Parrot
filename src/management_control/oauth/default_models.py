@@ -7,7 +7,7 @@ from typing import Iterable
 
 from src.management_auth.principal import Capability
 from src.management_control.context import ManagementContext
-from src.management_control.errors import ManagementError, ManagementErrorCode
+from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
 from src.management_control.operations import ManagementOperation, OperationStore
 
 from .models import (
@@ -59,8 +59,9 @@ class OAuthDefaultModelsControlMixin:
 
     def get_default_models(self, context: ManagementContext, family: OAuthFamily) -> OAuthDefaultModels:
         self._require(context, Capability.READ)
-        models = self.backend.default_models(family.value)
-        references = self.backend.scan_default_model_references(family.value, set(models))
+        state = self.backend.default_models_state(family.value)
+        models = state["models"]
+        references = state["references"]
         flat: list[OAuthDefaultModelReference] = []
         for item in references["apiKeys"]:
             flat.extend(OAuthDefaultModelReference("apiKey", item["name"], model) for model in item["hits"])
@@ -73,7 +74,7 @@ class OAuthDefaultModelsControlMixin:
             for item in references["defaults"]
         )
         return OAuthDefaultModels(
-            family, tuple(models), tuple(flat), self._value_revision(models),
+            family, tuple(models), tuple(flat), self._value_revision(state),
         )
 
     def replace_default_models(
@@ -86,31 +87,62 @@ class OAuthDefaultModelsControlMixin:
         expected_revision: str | None = None,
     ) -> OAuthDefaultModelsResult:
         self._require(context, Capability.WRITE)
-        values = list(models)
-        if len(values) > 200 or len(values) != len(set(values)) or any(
-            not value or any(char in value for char in ("\\", " ", "\x00")) for value in values
-        ):
-            raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
-        current = self.backend.default_models(family.value)
-        if expected_revision and expected_revision != self._value_revision(current):
-            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
-        removed = set(current) - set(values)
-        summary = self.replace_default_models_raw(
-            context,
-            family,
-            values,
-            removed,
-            cleanup_references=cleanup_references,
-        )
-        return OAuthDefaultModelsResult(
-            family=family,
-            models=tuple(values),
-            cleaned_api_keys=tuple(item["name"] for item in summary["keys_cleaned"]),
-            skipped_api_keys=tuple(summary["keys_skipped_empty"]),
-            removed_mappings=tuple(f"{item['ingress']}:{item['alias']}" for item in summary["mappings_removed"]),
-            cleared_defaults=tuple(summary["defaults_cleared"]),
-            revision=self._value_revision(values),
-        )
+        try:
+            values = list(models)
+            fields = [
+                ErrorField(f"models[{index}]", "INVALID_MODEL", "Invalid model ID")
+                for index, value in enumerate(values)
+                if not value or any(char in value for char in ("\\", " ", "\x00"))
+            ]
+            seen: set[str] = set()
+            for index, value in enumerate(values):
+                if value in seen:
+                    fields.append(ErrorField(
+                        f"models[{index}]", "DUPLICATE_MODEL", "Duplicate model ID",
+                    ))
+                seen.add(value)
+            if len(values) > 200:
+                fields.append(ErrorField(
+                    "models[200]", "TOO_MANY_MODELS",
+                    "At most 200 models are allowed",
+                ))
+            if fields:
+                raise ManagementError(
+                    ManagementErrorCode.VALIDATION_FAILED, fields=fields,
+                )
+            current_state = self.backend.default_models_state(family.value)
+            current = current_state["models"]
+            current_revision = self._value_revision(current_state)
+            if expected_revision and expected_revision != current_revision:
+                raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+            removed = set(current) - set(values)
+            if (removed or cleanup_references) and not expected_revision:
+                raise ManagementError(ManagementErrorCode.CONFIRMATION_REQUIRED)
+            outcome = self.backend.replace_default_models_conditional(
+                family.value,
+                values,
+                removed,
+                cleanup=cleanup_references,
+                expected_state=current_state,
+            )
+            if outcome.get("status") != "updated":
+                raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+            summary = outcome["summary"]
+            new_state = self.backend.default_models_state(family.value)
+            result = OAuthDefaultModelsResult(
+                family=family,
+                models=tuple(values),
+                cleaned_api_keys=tuple(item["name"] for item in summary["keys_cleaned"]),
+                skipped_api_keys=tuple(summary["keys_skipped_empty"]),
+                removed_mappings=tuple(f"{item['ingress']}:{item['alias']}" for item in summary["mappings_removed"]),
+                cleared_defaults=tuple(summary["defaults_cleared"]),
+                revision=self._value_revision(new_state),
+            )
+        except BaseException:
+            self._audit(context, "oauth.default-models.replace", family.value, "failed")
+            raise
+        self._audit(context, "oauth.default-models.replace", family.value)
+        return result
 
     def discover_default_models(
         self, context: ManagementContext, family: OAuthFamily, store: OperationStore,
