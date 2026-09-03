@@ -19,6 +19,7 @@ from src.management_control.apikey import (
     ApiKeyView,
 )
 
+from ._strict_query import reject_unknown_query_parameters
 from ..dependencies import (
     ManagementRuntime,
     get_management_runtime,
@@ -56,6 +57,10 @@ from ..schemas.apikey import (
 
 
 router = APIRouter(tags=["api-keys"])
+
+_API_KEY_LIST_QUERY_PARAMETERS = frozenset(
+    {"page", "pageSize", "enabled", "source", "name", "sort"}
+)
 
 _EMPTY_USAGE = {
     "total": 0,
@@ -259,6 +264,7 @@ def list_api_keys(
     name: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
     sort: ApiKeySort = ApiKeySort.ORDER_ASC,
 ) -> ApiKeyListEnvelope:
+    reject_unknown_query_parameters(request, _API_KEY_LIST_QUERY_PARAMETERS)
     result = control.list_api_keys(
         context,
         page=page,
@@ -312,6 +318,7 @@ def create_api_key(
     context: Annotated[ManagementContext, Depends(require_capability(Capability.SECRETS_WRITE))],
     control: Annotated[ApiKeyControl, Depends(get_api_key_control)],
 ) -> ApiKeySecretEnvelope:
+    reject_unknown_query_parameters(request)
     result = control.create_api_key(
         context,
         name=body.name,
@@ -340,6 +347,7 @@ def get_api_key(
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
     control: Annotated[ApiKeyControl, Depends(get_api_key_control)],
 ) -> ApiKeyEnvelope:
+    reject_unknown_query_parameters(request)
     return ApiKeyEnvelope(data=_key(control.get_api_key(context, key_id)), meta=_meta(request))
 
 
@@ -363,6 +371,7 @@ def update_api_key(
     control: Annotated[ApiKeyControl, Depends(get_api_key_control)],
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> ApiKeyEnvelope:
+    reject_unknown_query_parameters(request)
     changes = {}
     fields = body.model_fields_set
     if "enabled" in fields:
@@ -402,6 +411,7 @@ def update_api_key(
             ManagementErrorCode.SESSION_EXPIRED,
             ManagementErrorCode.CAPABILITY_DENIED,
             ManagementErrorCode.ORIGIN_DENIED,
+            ManagementErrorCode.VALIDATION_FAILED,
             ManagementErrorCode.CONFIRMATION_REQUIRED,
             ManagementErrorCode.RESOURCE_NOT_FOUND,
             ManagementErrorCode.REVISION_CONFLICT,
@@ -417,6 +427,7 @@ def delete_api_key(
     control: Annotated[ApiKeyControl, Depends(get_api_key_control)],
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> None:
+    reject_unknown_query_parameters(request)
     control.delete_api_key(context, key_id, if_match=if_match)
     response.headers["X-Request-Id"] = management_request_id(request)
 
@@ -444,6 +455,7 @@ def plan_api_key_regeneration(
     context: Annotated[ManagementContext, Depends(require_capability(Capability.SECRETS_WRITE))],
     control: Annotated[ApiKeyControl, Depends(get_api_key_control)],
 ) -> ApiKeyReplacementPlanEnvelope:
+    reject_unknown_query_parameters(request)
     plan = control.plan_regeneration(context, key_id)
     _mark_sensitive(response)
     return ApiKeyReplacementPlanEnvelope(
@@ -483,6 +495,7 @@ def regenerate_api_key(
     context: Annotated[ManagementContext, Depends(require_capability(Capability.SECRETS_WRITE))],
     control: Annotated[ApiKeyControl, Depends(get_api_key_control)],
 ) -> ApiKeySecretEnvelope:
+    reject_unknown_query_parameters(request)
     result = control.regenerate_api_key(
         context,
         key_id,
@@ -518,6 +531,7 @@ def replace_api_key_secret(
     control: Annotated[ApiKeyControl, Depends(get_api_key_control)],
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> ApiKeySecretEnvelope:
+    reject_unknown_query_parameters(request)
     result = control.replace_api_key_secret(
         context,
         key_id,
@@ -546,6 +560,7 @@ def reorder_api_keys(
     control: Annotated[ApiKeyControl, Depends(get_api_key_control)],
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> ApiKeyOrderEnvelope:
+    reject_unknown_query_parameters(request)
     revision = control.reorder_api_keys(context, body.keyIds, if_match=if_match)
     return ApiKeyOrderEnvelope(data=ApiKeyOrderData(keyIds=body.keyIds, revision=revision), meta=_meta(request))
 
@@ -565,6 +580,7 @@ def reset_api_key_limiter(
     context: Annotated[ManagementContext, Depends(require_capability(Capability.WRITE))],
     control: Annotated[ApiKeyControl, Depends(get_api_key_control)],
 ) -> ApiKeyLimiterEnvelope:
+    reject_unknown_query_parameters(request)
     result = control.reset_api_key_limiter(context, key_id)
     return ApiKeyLimiterEnvelope(data=_limiter(result), meta=_meta(request))
 
@@ -590,6 +606,7 @@ def get_api_key_stats(
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
     control: Annotated[ApiKeyControl, Depends(get_api_key_control)],
 ) -> ApiKeyStatsEnvelope:
+    reject_unknown_query_parameters(request)
     result = control.get_api_key_stats(context, key_id)
     return ApiKeyStatsEnvelope(
         data=ApiKeyStatsData(

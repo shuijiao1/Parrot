@@ -16,6 +16,7 @@ from src.management_auth import (
 from src.management_control import ManagementContext, ManagementError, ManagementErrorCode
 from src.management_control.operations import ManagementOperation
 
+from ._strict_query import reject_unknown_query_parameters
 from ..dependencies import (
     AuthenticatedSession,
     ManagementRuntime,
@@ -243,6 +244,7 @@ async def create_management_session(
     response: Response,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
 ) -> DataEnvelope[SessionCredentialData]:
+    reject_unknown_query_parameters(request)
     request_id = management_request_id(request)
     try:
         if isinstance(grant, ManagementKeyGrant):
@@ -286,6 +288,7 @@ async def create_management_session(
             ManagementErrorCode.SESSION_REQUIRED,
             ManagementErrorCode.SESSION_EXPIRED,
             ManagementErrorCode.ORIGIN_DENIED,
+            ManagementErrorCode.VALIDATION_FAILED,
             ManagementErrorCode.SERVICE_NOT_READY,
         ),
     },
@@ -295,6 +298,7 @@ async def get_current_management_session(
     response: Response,
     authenticated: Annotated[AuthenticatedSession, Depends(get_authenticated_session)],
 ) -> DataEnvelope[SessionSummary]:
+    reject_unknown_query_parameters(request)
     response.headers["Cache-Control"] = "no-store"
     return DataEnvelope(data=_session_summary(authenticated.verified), meta=_meta(request))
 
@@ -310,6 +314,7 @@ async def get_current_management_session(
             ManagementErrorCode.SESSION_REQUIRED,
             ManagementErrorCode.SESSION_EXPIRED,
             ManagementErrorCode.ORIGIN_DENIED,
+            ManagementErrorCode.VALIDATION_FAILED,
             ManagementErrorCode.SERVICE_NOT_READY,
         ),
     },
@@ -319,6 +324,7 @@ async def revoke_current_management_session(
     authenticated: Annotated[AuthenticatedSession, Depends(get_authenticated_session)],
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
 ) -> Response:
+    reject_unknown_query_parameters(request)
     runtime.sessions.revoke_current(
         authenticated.credential,
         request_id=management_request_id(request),
@@ -352,6 +358,7 @@ async def create_telegram_approval(
     response: Response,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
 ) -> DataEnvelope[TelegramApprovalCreatedData]:
+    reject_unknown_query_parameters(request)
     request_id = management_request_id(request)
     try:
         issued = await asyncio.to_thread(
@@ -404,6 +411,7 @@ async def get_telegram_approval(
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
     authorization: Annotated[str | None, Header()] = None,
 ) -> DataEnvelope[TelegramApprovalStatusData]:
+    reject_unknown_query_parameters(request)
     if authorization is None or not authorization.startswith("Approval "):
         raise ManagementError(ManagementErrorCode.AUTHENTICATION_FAILED)
     exchange_secret = authorization[len("Approval ") :]
@@ -436,6 +444,7 @@ async def get_telegram_approval(
             ManagementErrorCode.SESSION_EXPIRED,
             ManagementErrorCode.ORIGIN_DENIED,
             ManagementErrorCode.CAPABILITY_DENIED,
+            ManagementErrorCode.VALIDATION_FAILED,
             ManagementErrorCode.SERVICE_NOT_READY,
         ),
     },
@@ -445,6 +454,7 @@ async def get_management_metadata(
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
 ) -> DataEnvelope[ManagementMetadataData]:
+    reject_unknown_query_parameters(request)
     del context
     return DataEnvelope(
         data=ManagementMetadataData(
@@ -477,6 +487,7 @@ async def get_management_metadata(
             ManagementErrorCode.SESSION_EXPIRED,
             ManagementErrorCode.ORIGIN_DENIED,
             ManagementErrorCode.CAPABILITY_DENIED,
+            ManagementErrorCode.VALIDATION_FAILED,
             ManagementErrorCode.SERVICE_NOT_READY,
         ),
     },
@@ -485,6 +496,7 @@ async def get_management_capabilities(
     request: Request,
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
 ) -> DataEnvelope[ManagementCapabilitiesData]:
+    reject_unknown_query_parameters(request)
     return DataEnvelope(
         data=ManagementCapabilitiesData(
             domains=[
@@ -528,6 +540,7 @@ async def get_management_operation(
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
     context: Annotated[ManagementContext, Depends(get_management_context)],
 ) -> DataEnvelope[ManagementOperationData]:
+    reject_unknown_query_parameters(request)
     operation = runtime.operations.get(context, operationId)
     return DataEnvelope(data=_operation_data(operation), meta=_meta(request))
 
@@ -554,8 +567,10 @@ async def get_management_operation(
 )
 async def cancel_management_operation(
     operationId: Annotated[str, Path(min_length=4, max_length=128)],
+    request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
     context: Annotated[ManagementContext, Depends(get_management_context)],
 ) -> Response:
+    reject_unknown_query_parameters(request)
     runtime.operations.cancel(context, operationId)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

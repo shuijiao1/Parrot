@@ -58,11 +58,13 @@ EXPECTED_ERROR_CODES = {
     "getCurrentManagementSession": {
         401: {"SESSION_REQUIRED", "SESSION_EXPIRED"},
         403: {"ORIGIN_DENIED"},
+        422: {"VALIDATION_FAILED"},
         503: {"SERVICE_NOT_READY"},
     },
     "revokeCurrentManagementSession": {
         401: {"SESSION_REQUIRED", "SESSION_EXPIRED"},
         403: {"ORIGIN_DENIED"},
+        422: {"VALIDATION_FAILED"},
         503: {"SERVICE_NOT_READY"},
     },
     "createTelegramApproval": {
@@ -81,12 +83,14 @@ EXPECTED_ERROR_CODES = {
         400: {"INVALID_REQUEST"},
         401: {"SESSION_REQUIRED", "SESSION_EXPIRED"},
         403: {"ORIGIN_DENIED", "CAPABILITY_DENIED"},
+        422: {"VALIDATION_FAILED"},
         503: {"SERVICE_NOT_READY"},
     },
     "getManagementCapabilities": {
         400: {"INVALID_REQUEST"},
         401: {"SESSION_REQUIRED", "SESSION_EXPIRED"},
         403: {"ORIGIN_DENIED", "CAPABILITY_DENIED"},
+        422: {"VALIDATION_FAILED"},
         503: {"SERVICE_NOT_READY"},
     },
     "getManagementOperation": {
