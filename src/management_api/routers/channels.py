@@ -7,7 +7,12 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Header, Path, Query, Request, Response, status
 
-from src.management_control import ManagementContext, ManagementErrorCode
+from src.management_control import (
+    ErrorField,
+    ManagementContext,
+    ManagementError,
+    ManagementErrorCode,
+)
 from src.management_control.channels import (
     ChannelCompatibility,
     ChannelControl,
@@ -25,6 +30,7 @@ from src.management_control.channels import (
 )
 from src.management_control.operations import ManagementOperation
 
+from ..channels_security import redact_credential_text, strip_url_userinfo
 from ..dependencies import (
     ManagementRuntime,
     get_management_context,
@@ -76,7 +82,38 @@ from ..schemas.operations import (
 )
 
 
-router = APIRouter()
+_LIST_QUERY_PARAMETERS = frozenset({
+    "page",
+    "pageSize",
+    "search",
+    "enabled",
+    "protocol",
+    "providerId",
+    "health",
+    "sort",
+    "direction",
+})
+
+
+def _validate_query_parameters(request: Request) -> None:
+    route = request.scope.get("route")
+    allowed = (
+        _LIST_QUERY_PARAMETERS
+        if getattr(route, "operation_id", None) == "listChannels"
+        else frozenset()
+    )
+    unknown = sorted(set(request.query_params) - allowed)
+    if unknown:
+        raise ManagementError(
+            ManagementErrorCode.VALIDATION_FAILED,
+            fields=tuple(
+                ErrorField(name, "unknown", "Unknown query parameter")
+                for name in unknown
+            ),
+        )
+
+
+router = APIRouter(dependencies=[Depends(_validate_query_parameters)])
 
 _CHANNEL_EXAMPLE = {
     "id": "api:example-channel",
@@ -307,20 +344,21 @@ def _usage_data(usage) -> ProviderUsageData:
         partial=usage.partial,
         source=usage.source,
         fetchedAt=_utc_time(usage.fetched_at, milliseconds=True),
-        error=usage.error,
+        error=redact_credential_text(usage.error),
         errorAt=_utc_time(usage.error_at, milliseconds=True),
         snapshot=snapshot,
     )
 
 
 def _channel_data(view) -> ChannelData:
+    safe_base_url = strip_url_userinfo(view.base_url)
     return ChannelData(
         id=view.id,
         revision=view.revision,
         name=view.display_name,
-        baseUrl=view.base_url,
+        baseUrl=safe_base_url,
         apiPath=view.api_path,
-        url=view.base_url + (view.api_path or ""),
+        url=safe_base_url + (view.api_path or "") if safe_base_url else "",
         apiKeyConfigured=view.api_key_configured,
         apiKeyMaskedHint=view.api_key_masked_hint,
         protocol=view.protocol,

@@ -804,3 +804,160 @@ def test_runtime_audit_and_http_polled_failures_are_stable_and_secret_free(tmp_p
     assert FAKE_CHANNEL_SECRET not in evidence
     assert exception_marker not in evidence
     runtime.close()
+
+
+def test_all_channel_routes_reject_unknown_query_and_list_allows_only_declared_names(tmp_path):
+    app, runtime = _build_app(tmp_path)
+    with TestClient(app) as client:
+        auth = _session(client)
+        allowed = client.get(
+            "/api/management/v1/channels",
+            params={
+                "page": 1, "pageSize": 50, "search": "x", "enabled": True,
+                "protocol": "anthropic", "providerId": "provider", "health": "unknown",
+                "sort": "order", "direction": "asc",
+            },
+            headers=auth,
+        )
+        assert allowed.status_code == 200, allowed.text
+        assert len(ENDPOINTS) == len(MANIFEST.read_text(encoding="utf-8").splitlines())
+        for method, path, body, headers in ENDPOINTS:
+            separator = "&" if "?" in path else "?"
+            response = _request(
+                client, method, f"{path}{separator}unexpectedFilter=1", body,
+                {**auth, **headers},
+            )
+            assert response.status_code == 422, (method, path, response.text)
+            assert response.json()["error"] == {
+                "code": "VALIDATION_FAILED",
+                "message": "Request validation failed",
+                "fields": [{
+                    "path": "unexpectedFilter",
+                    "code": "unknown",
+                    "message": "Unknown query parameter",
+                }],
+                "retryable": False,
+                "requestId": response.headers["X-Request-Id"],
+                "operationId": None,
+            }
+    runtime.close()
+
+
+def test_all_four_channel_url_inputs_reject_username_or_password_userinfo(tmp_path):
+    app, runtime = _build_app(tmp_path)
+    markers = (
+        "create-user-marker", "update-user-marker", "update-password-marker",
+        "discovery-user-marker", "probe-user-marker", "probe-password-marker",
+    )
+    with TestClient(app) as client:
+        auth = _session(client)
+        created = client.post(
+            "/api/management/v1/channels", json=_manual_create("URL Input API"), headers=auth,
+        )
+        assert created.status_code == 201, created.text
+        create_body = _manual_create("Rejected URL Input")
+        create_body["baseUrl"] = "https://create-user-marker@provider.example.test/v1/messages"
+        requests = (
+            ("post", "/api/management/v1/channels", create_body),
+            ("patch", "/api/management/v1/channels/api:URL%20Input%20API", {
+                "baseUrl": "https://update-user-marker:update-password-marker@[2001:db8::1]:8443/v1/messages",
+            }),
+            ("post", "/api/management/v1/channel-model-discoveries", {
+                "source": "draft", "baseUrl": "https://discovery-user-marker@provider.example.test",
+                "apiKey": FAKE_CHANNEL_SECRET, "protocol": "anthropic",
+            }),
+            ("post", "/api/management/v1/channel-drafts/probes", {
+                "baseUrl": "https://probe-user-marker:probe-password-marker@provider.example.test",
+                "apiKey": FAKE_CHANNEL_SECRET, "protocol": "anthropic", "model": "model-real",
+            }),
+        )
+        wire = []
+        for method, path, body in requests:
+            response = client.request(method.upper(), path, json=body, headers=auth)
+            wire.append(response.text)
+            assert response.status_code == 422, (method, path, response.text)
+            assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+            assert any(field["path"].endswith("baseUrl") for field in response.json()["error"]["fields"])
+        assert not runtime.operations._items
+        evidence = "".join(wire) + json.dumps(runtime.state_store.audit_snapshot()) + json.dumps(app.openapi())
+        assert all(marker not in evidence for marker in markers)
+    runtime.close()
+
+
+def test_legacy_url_userinfo_is_stripped_from_read_and_mutation_without_config_change(tmp_path):
+    legacy_url = "https://legacy-user-marker:legacy-password-marker@[2001:db8::7]:8443/root"
+    safe_base = "https://[2001:db8::7]:8443/root"
+    assert channels_router.strip_url_userinfo("https://user:password@[bad") == ""
+    assert channels_router.strip_url_userinfo("https://user:password@host:invalid/path") == ""
+    ChannelControl().create_channel(
+        channel_menu._ctx(7),
+        channel_service.ChannelCreateCommand(
+            name="Legacy URL API", base_url=legacy_url, api_path="/v1/messages",
+            api_key=FAKE_CHANNEL_SECRET, protocol=channel_service.ChannelProtocol.ANTHROPIC,
+            models=(channel_service.ChannelModel(real="model-real", alias="model-real"),),
+        ),
+    )
+    assert config.get()["channels"][0]["baseUrl"] == legacy_url
+    app, runtime = _build_app(tmp_path)
+    with TestClient(app) as client:
+        auth = _session(client)
+        listed = client.get("/api/management/v1/channels", headers=auth)
+        detailed = client.get("/api/management/v1/channels/api:Legacy%20URL%20API", headers=auth)
+        revision = detailed.json()["data"]["revision"]
+        mutated = client.patch(
+            "/api/management/v1/channels/api:Legacy%20URL%20API",
+            json={"enabled": False}, headers={**auth, "If-Match": revision},
+        )
+    for response, data in (
+        (listed, listed.json()["data"][0]),
+        (detailed, detailed.json()["data"]),
+        (mutated, mutated.json()["data"]),
+    ):
+        assert response.status_code == 200, response.text
+        assert data["baseUrl"] == safe_base
+        assert data["url"] == safe_base + "/v1/messages"
+        assert "legacy-user-marker" not in response.text
+        assert "legacy-password-marker" not in response.text
+    assert config.get()["channels"][0]["baseUrl"] == legacy_url
+    runtime.close()
+
+
+def test_provider_usage_error_is_redacted_for_plain_and_json_embedded_credentials(tmp_path, monkeypatch):
+    markers = (
+        "usage-management-marker", "usage-bot-marker", "usage-github-marker",
+        "usage-api-marker", "usage-bearer-marker", "usage-standalone-bearer-marker",
+        "usage-user-marker", "usage-password-marker",
+    )
+    plain = (
+        "managementKey=usage-management-marker botToken=usage-bot-marker "
+        "github_token=usage-github-marker api_token=usage-api-marker "
+        "Authorization: Bearer usage-bearer-marker Bearer usage-standalone-bearer-marker "
+        "https://usage-user-marker:usage-password-marker@[2001:db8::9]:9443/status"
+    )
+    raw_usage = {"status": "error", "error": plain, "error_at": 1_700_000_000_000}
+    monkeypatch.setattr(channel_service.provider_usage, "spec_for", lambda channel: object())
+    monkeypatch.setattr(channel_service.provider_usage, "cached", lambda channel: raw_usage)
+    app, runtime = _build_app(tmp_path)
+    with TestClient(app) as client:
+        auth = _session(client)
+        created = client.post(
+            "/api/management/v1/channels", json=_manual_create("Usage Error API"), headers=auth,
+        )
+        assert created.status_code == 201, created.text
+        wire = []
+        for source in (plain, json.dumps({"upstreamError": plain})):
+            raw_usage["error"] = source
+            response = client.get(
+                "/api/management/v1/channels/api:Usage%20Error%20API", headers=auth,
+            )
+            assert response.status_code == 200, response.text
+            wire.append(response.text)
+            safe_error = response.json()["data"]["providerUsage"]["error"]
+            assert "[REDACTED]" in safe_error
+            assert "https://[2001:db8::9]:9443/status" in safe_error
+            assert all(marker not in safe_error for marker in markers)
+            assert raw_usage["error"] == source
+        evidence = "".join(wire) + json.dumps(runtime.state_store.audit_snapshot()) + json.dumps(app.openapi())
+        assert all(marker not in evidence for marker in markers)
+        assert not runtime.operations._items
+    runtime.close()

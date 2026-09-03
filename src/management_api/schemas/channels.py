@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal, Union
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import AfterValidator, Field, SecretStr, model_validator
 
 from src.management_control.channels import (
     ChannelHealth,
@@ -13,8 +13,16 @@ from src.management_control.channels import (
     CompatibilityMode,
 )
 
+from ..channels_security import require_url_without_userinfo
 from .base import DataEnvelope, ResponseMeta, StrictSchema
 from .operations import ManagementOperationData
+
+
+ChannelInputUrl = Annotated[
+    str,
+    Field(min_length=8, max_length=4096),
+    AfterValidator(require_url_without_userinfo),
+]
 
 
 class ChannelModelInput(StrictSchema):
@@ -51,7 +59,7 @@ class _ChannelCreateBase(StrictSchema):
 
 class ManualChannelCreateRequest(_ChannelCreateBase):
     mode: Literal["manual"]
-    baseUrl: str = Field(min_length=8, max_length=4096)
+    baseUrl: ChannelInputUrl
     apiPath: str | None = Field(default=None, max_length=4096)
 
 
@@ -69,7 +77,7 @@ ChannelCreateRequest = Annotated[
 
 class ChannelUpdateRequest(StrictSchema):
     name: str | None = Field(default=None, min_length=1, max_length=64)
-    baseUrl: str | None = Field(default=None, min_length=8, max_length=4096)
+    baseUrl: ChannelInputUrl | None = None
     apiPath: str | None = Field(default=None, max_length=4096)
     apiKey: SecretStr | None = Field(
         default=None,
@@ -271,7 +279,7 @@ class ProbeExistingRequest(StrictSchema):
 
 class ProbeDraftRequest(StrictSchema):
     name: str = Field(default="management-draft", min_length=1, max_length=64)
-    baseUrl: str = Field(min_length=8, max_length=4096)
+    baseUrl: ChannelInputUrl
     apiPath: str | None = Field(default=None, max_length=4096)
     apiKey: SecretStr = Field(
         min_length=5, max_length=4096, json_schema_extra={"writeOnly": True}
@@ -290,7 +298,7 @@ class ExistingChannelDiscoveryRequest(StrictSchema):
 
 class DraftChannelDiscoveryRequest(StrictSchema):
     source: Literal["draft"]
-    baseUrl: str = Field(min_length=8, max_length=4096)
+    baseUrl: ChannelInputUrl
     apiPath: str | None = Field(default=None, max_length=4096)
     apiKey: SecretStr = Field(
         min_length=5, max_length=4096, json_schema_extra={"writeOnly": True}
