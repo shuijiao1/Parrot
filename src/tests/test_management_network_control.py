@@ -166,6 +166,48 @@ def test_network_settings_sync_cache_clear_and_socks_state_validation(tmp_path):
         assert fixture.config.updates == writes
 
 
+def test_dns_cache_ips_sanitize_credentials_without_public_text_false_positives(tmp_path):
+    app, _runtime, fixture = build_p6_app(tmp_path)
+    public_values = [
+        "192.0.2.10", "monkey", "hockey", "donkey", "Bearer routing-mode",
+        "ordinary monkey hockey donkey; Bearer routing-mode",
+    ]
+    credential_inputs = {
+        "generic-token-marker": "token=generic-token-marker",
+        "camel-token-marker": "apiToken=camel-token-marker",
+        "snake-token-marker": "api_token=snake-token-marker",
+        "upper-token-marker": "API_TOKEN=upper-token-marker",
+        "generic-key-marker": "key=generic-key-marker",
+        "camel-key-marker": "apiKey=camel-key-marker",
+        "snake-key-marker": "api_key=snake-key-marker",
+        "upper-key-marker": "API_KEY=upper-key-marker",
+        "generic-secret-marker": "secret=generic-secret-marker",
+        "camel-secret-marker": "clientSecret=camel-secret-marker",
+        "snake-secret-marker": "client_secret=snake-secret-marker",
+        "upper-secret-marker": "CLIENT_SECRET=upper-secret-marker",
+        "generic-credential-marker": "credential=generic-credential-marker",
+        "camel-credential-marker": "serviceCredential=camel-credential-marker",
+        "snake-credential-marker": "service_credential=snake-credential-marker",
+        "upper-credential-marker": "SERVICE_CREDENTIAL=upper-credential-marker",
+        "authorization-header-marker": "Authorization: Bearer authorization-header-marker",
+        "cookie-header-marker": "Cookie: cookie-header-marker",
+        "bearer-token-marker": "Bearer bearer.opaque.token-marker",
+        "dXNlcjpwYXNzd29yZA==": "Basic dXNlcjpwYXNzd29yZA==",
+        "url-user-marker": "https://url-user-marker:url-password-marker@dns.invalid/result",
+        "url-password-marker": "https://url-user-marker:url-password-marker@dns.invalid/result",
+    }
+    fixture.gateway.cache[0]["ips"] = public_values + list(credential_inputs.values())
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        response = client.get(PREFIX + "/network/dns/cache", headers=headers)
+    assert response.status_code == 200, response.text
+    returned = response.json()["data"]["items"][0]["ips"]
+    assert returned[:len(public_values)] == public_values
+    assert len(returned) == len(public_values) + len(credential_inputs)
+    for marker in credential_inputs:
+        assert marker not in response.text
+
+
 def test_monitor_patch_exact_channels_history_and_async_run_are_secret_safe(tmp_path):
     app, _runtime, fixture = build_p6_app(tmp_path)
     with TestClient(app) as client:

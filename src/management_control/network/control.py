@@ -6,6 +6,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import re
 import secrets
 import threading
 import time
@@ -46,6 +47,10 @@ from .models import (
 
 _MONITOR_CATEGORIES = frozenset({"dns", "socks5", "channel", "core"})
 _MONITOR_PUBLIC_IDENTIFIERS = frozenset({"key", "category"})
+_PLAIN_AUTH_LABEL_RE = re.compile(
+    r"(?<![\w-])(?i:Bearer|Basic)[ \t]+(?P<label>[a-z]+(?:-[a-z]+)+)"
+    r"(?![A-Za-z0-9._~+/=-])"
+)
 
 
 class PlanState(str, Enum):
@@ -98,6 +103,29 @@ def _safe_url(value: str, *, mask_user: bool = False, drop_path: bool = False) -
 def _safe_dns_server(value: Any) -> str:
     raw = str(value or "")
     return _safe_url(raw) if "://" in raw else str(sanitize_credentials(raw))
+
+
+def _safe_dns_cache_ip(value: Any) -> str:
+    raw = str(value)
+    preserved: dict[str, str] = {}
+
+    def preserve_plain_auth_label(match: re.Match[str]) -> str:
+        words = match.group("label").split("-")
+        if (
+            len("".join(words)) >= 24
+            or {"token", "key", "secret", "credential"}.intersection(words)
+        ):
+            return match.group(0)
+        placeholder = f"\0PUBLICAUTH{len(preserved)}\0"
+        while placeholder in raw:
+            placeholder += "\0"
+        preserved[placeholder] = match.group(0)
+        return placeholder
+
+    clean = str(sanitize_credentials(_PLAIN_AUTH_LABEL_RE.sub(preserve_plain_auth_label, raw)))
+    for placeholder, text in preserved.items():
+        clean = clean.replace(placeholder, text)
+    return clean
 
 
 def _utc(seconds: Any) -> datetime | None:
@@ -621,7 +649,7 @@ class NetworkControl(DomainControl):
                     host=str(sanitize_credentials(row.get("host") or "")),
                     family=self._safe_int(row.get("family"), 0),
                     servers=tuple(_safe_dns_server(item) for item in row.get("servers") or []),
-                    ips=tuple(str(item) for item in row.get("ips") or []),
+                    ips=tuple(_safe_dns_cache_ip(item) for item in row.get("ips") or []),
                     expiresAt=expires,
                     ttlRemainingSeconds=max(0, self._safe_int(row.get("ttl_remaining_seconds"), 0)),
                 ))
