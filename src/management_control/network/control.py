@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import hashlib
 import json
@@ -47,10 +48,7 @@ from .models import (
 
 _MONITOR_CATEGORIES = frozenset({"dns", "socks5", "channel", "core"})
 _MONITOR_PUBLIC_IDENTIFIERS = frozenset({"key", "category"})
-_PLAIN_AUTH_LABEL_RE = re.compile(
-    r"(?<![\w-])(?i:Bearer|Basic)[ \t]+(?P<label>[a-z]+(?:-[a-z]+)+)"
-    r"(?![A-Za-z0-9._~+/=-])"
-)
+_AUTH_SCHEME_RE = re.compile(r"(?P<prefix>\b(?P<scheme>bearer|basic)\s+)(?:(?P<quote>\\*[\"'])(?P<quoted>.*?)(?P=quote)|(?P<bare>(?!\[REDACTED\])[^\s\\\"',;&}\]]+))", re.IGNORECASE)
 
 
 class PlanState(str, Enum):
@@ -105,24 +103,42 @@ def _safe_dns_server(value: Any) -> str:
     return _safe_url(raw) if "://" in raw else str(sanitize_credentials(raw))
 
 
+def _looks_like_auth_credential(scheme: str, candidate: str) -> bool:
+    if not candidate or not re.fullmatch(r"[A-Za-z0-9._~+/=-]+", candidate):
+        return False
+    marker_parts = {part for part in re.split(r"[^a-z0-9]+", candidate.casefold()) if part}
+    if marker_parts & {"token", "key", "secret", "credential", "marker"}:
+        return True
+    if scheme.casefold() == "basic" and len(candidate) >= 8:
+        try:
+            decoded = base64.b64decode(candidate + "=" * (-len(candidate) % 4), altchars=b"-_", validate=True)
+        except (ValueError, TypeError):
+            decoded = b""
+        if b":" in decoded:
+            return True
+    punctuation_count = sum(not char.isalnum() for char in candidate)
+    return (
+        (any(char.isdigit() for char in candidate) and len(candidate) >= 8) or (punctuation_count >= 2 and len(candidate) >= 8)
+        or (bool(punctuation_count) and len(candidate) >= 16) or (candidate.isalpha() and len(candidate) >= 24) or (candidate.lower() != candidate and candidate.upper() != candidate and len(candidate) >= 16)
+    )
+
+
 def _safe_dns_cache_ip(value: Any) -> str:
     raw = str(value)
     preserved: dict[str, str] = {}
-
-    def preserve_plain_auth_label(match: re.Match[str]) -> str:
-        words = match.group("label").split("-")
-        if (
-            len("".join(words)) >= 24
-            or {"token", "key", "secret", "credential"}.intersection(words)
-        ):
-            return match.group(0)
+    def replace_auth(match: re.Match[str]) -> str:
+        quote = match.group("quote") or ""
+        candidate = match.group("quoted") or match.group("bare") or ""
+        stripped = candidate if quote else candidate.rstrip(".,!?)")
+        trailing = candidate[len(stripped):]
+        if _looks_like_auth_credential(match.group("scheme"), stripped):
+            return match.group("prefix") + quote + "<redacted>" + quote + trailing
         placeholder = f"\0PUBLICAUTH{len(preserved)}\0"
         while placeholder in raw:
             placeholder += "\0"
         preserved[placeholder] = match.group(0)
         return placeholder
-
-    clean = str(sanitize_credentials(_PLAIN_AUTH_LABEL_RE.sub(preserve_plain_auth_label, raw)))
+    clean = str(sanitize_credentials(_AUTH_SCHEME_RE.sub(replace_auth, raw)))
     for placeholder, text in preserved.items():
         clean = clean.replace(placeholder, text)
     return clean
