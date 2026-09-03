@@ -182,14 +182,23 @@ def test_p5_router_operations_each_call_control_once_with_authorized_context():
             )
             if not is_operation:
                 continue
+            calls = [call for call in ast.walk(node) if isinstance(call, ast.Call)]
             control_calls = [
-                call for call in ast.walk(node)
-                if isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Attribute)
+                call for call in calls
+                if isinstance(call.func, ast.Attribute)
                 and isinstance(call.func.value, ast.Name)
                 and call.func.value.id == "control"
             ]
+            strict_query_calls = [
+                call for call in calls
+                if isinstance(call.func, ast.Name)
+                and call.func.id == "reject_unknown_query_parameters"
+            ]
             assert len(control_calls) == 1, (relative, node.name, control_calls)
+            assert len(strict_query_calls) == 1, (relative, node.name, strict_query_calls)
+            assert strict_query_calls[0].lineno < control_calls[0].lineno, (
+                relative, node.name, "strict query validation must precede control"
+            )
             assert control_calls[0].args
             first_argument = control_calls[0].args[0]
             assert isinstance(first_argument, ast.Name)
@@ -198,38 +207,77 @@ def test_p5_router_operations_each_call_control_once_with_authorized_context():
     assert len(operations) == 40
 
 
-@pytest.mark.parametrize(
-    "method,path",
-    [
-        ("get", "/api/management/v1/model-mappings"),
-        ("delete", "/api/management/v1/model-mappings/example"),
-        ("get", "/api/management/v1/ingress-default-models/anthropic"),
-        ("delete", "/api/management/v1/ingress-default-models/anthropic"),
-        ("get", "/api/management/v1/compression-model"),
-        ("delete", "/api/management/v1/compression-model"),
-        ("get", "/api/management/v1/models/inventory"),
-        ("get", "/api/management/v1/model-metadata"),
-        ("get", "/api/management/v1/model-metadata/example"),
-        ("delete", "/api/management/v1/model-metadata/example/binding"),
-        ("get", "/api/management/v1/model-catalog"),
-        ("get", "/api/management/v1/load-balancing"),
-        ("get", "/api/management/v1/load-balancing/channel-order"),
-        ("get", "/api/management/v1/load-balancing/model-orders/example"),
-        ("delete", "/api/management/v1/load-balancing/model-orders/example"),
-        ("get", "/api/management/v1/proxies"),
-        ("get", "/api/management/v1/proxies/example"),
-        ("delete", "/api/management/v1/proxies/example"),
-        ("get", "/api/management/v1/proxy-groups"),
-        ("get", "/api/management/v1/proxy-groups/example"),
-        ("delete", "/api/management/v1/proxy-groups/example"),
-        ("get", "/api/management/v1/proxy-routing"),
-    ],
-)
-def test_every_p5_get_and_delete_rejects_unknown_query_parameters(
-    domain_client, method, path,
+STRICT_QUERY_CASES = [
+    ("get", "/api/management/v1/model-mappings", None),
+    ("put", "/api/management/v1/model-mappings/example", {"realModel": "model"}),
+    ("delete", "/api/management/v1/model-mappings/example", None),
+    ("get", "/api/management/v1/ingress-default-models/anthropic", None),
+    ("put", "/api/management/v1/ingress-default-models/anthropic", {"modelId": "model"}),
+    ("delete", "/api/management/v1/ingress-default-models/anthropic", None),
+    ("get", "/api/management/v1/compression-model", None),
+    ("put", "/api/management/v1/compression-model", {"modelId": "model"}),
+    ("delete", "/api/management/v1/compression-model", None),
+    ("get", "/api/management/v1/models/inventory", None),
+    ("get", "/api/management/v1/model-metadata", None),
+    ("get", "/api/management/v1/model-metadata/example", None),
+    (
+        "put", "/api/management/v1/model-metadata/example/binding",
+        {"scope": "global", "targetModelId": "provider/model", "providerId": "provider"},
+    ),
+    ("delete", "/api/management/v1/model-metadata/example/binding", None),
+    ("post", "/api/management/v1/model-metadata/actions/sync", {"scope": "full"}),
+    ("get", "/api/management/v1/model-catalog", None),
+    ("get", "/api/management/v1/load-balancing", None),
+    ("patch", "/api/management/v1/load-balancing", {"mode": "smart"}),
+    ("get", "/api/management/v1/load-balancing/channel-order", None),
+    ("put", "/api/management/v1/load-balancing/channel-order", {"order": []}),
+    ("get", "/api/management/v1/load-balancing/model-orders/example", None),
+    ("put", "/api/management/v1/load-balancing/model-orders/example", {"order": []}),
+    ("delete", "/api/management/v1/load-balancing/model-orders/example", None),
+    (
+        "put", "/api/management/v1/load-balancing/model-orders",
+        {"modelIds": ["example"], "order": []},
+    ),
+    ("post", "/api/management/v1/affinity/actions/clear", None),
+    ("post", "/api/management/v1/affinity/families/anthropic/actions/clear", None),
+    ("get", "/api/management/v1/proxies", None),
+    (
+        "post", "/api/management/v1/proxies",
+        {"name": "edge", "url": "socks5://127.0.0.1:1080"},
+    ),
+    ("get", "/api/management/v1/proxies/edge", None),
+    ("patch", "/api/management/v1/proxies/edge", {"name": "renamed"}),
+    ("delete", "/api/management/v1/proxies/edge", None),
+    ("post", "/api/management/v1/proxies/edge/actions/test", None),
+    ("get", "/api/management/v1/proxy-groups", None),
+    (
+        "post", "/api/management/v1/proxy-groups",
+        {"name": "group", "members": ["direct"]},
+    ),
+    ("get", "/api/management/v1/proxy-groups/group", None),
+    ("patch", "/api/management/v1/proxy-groups/group", {"members": []}),
+    ("delete", "/api/management/v1/proxy-groups/group", None),
+    ("post", "/api/management/v1/proxy-groups/group/actions/test", None),
+    ("get", "/api/management/v1/proxy-routing", None),
+    ("patch", "/api/management/v1/proxy-routing", {"directFallback": True}),
+]
+
+
+@pytest.mark.parametrize("method,path,body", STRICT_QUERY_CASES)
+def test_every_p5_route_rejects_unknown_query_without_side_effects(
+    domain_client, method, path, body,
 ):
-    client, _runtime, admin, *_ = domain_client
-    response = client.request(method, f"{path}?undeclared=1", headers=admin)
+    client, runtime, admin, *_ = domain_client
+    assert len(STRICT_QUERY_CASES) == 40
+    before_config = copy.deepcopy(config.get())
+    before_audit = runtime.state_store.audit_snapshot()
+    before_operations = copy.deepcopy(runtime.operations._items)
+    kwargs = {"json": body} if body is not None else {}
+
+    response = client.request(
+        method, f"{path}?undeclared=1", headers=admin, **kwargs
+    )
+
     assert response.status_code == 422, response.text
     assert response.json()["error"]["code"] == "VALIDATION_FAILED"
     assert response.json()["error"]["fields"] == [{
@@ -237,3 +285,6 @@ def test_every_p5_get_and_delete_rejects_unknown_query_parameters(
         "code": "UNKNOWN_QUERY_PARAMETER",
         "message": "query parameter 'undeclared' is not supported",
     }]
+    assert config.get() == before_config
+    assert runtime.state_store.audit_snapshot() == before_audit
+    assert runtime.operations._items == before_operations

@@ -220,8 +220,10 @@ class ProxyControl(DomainControl):
     def _parse_url(url: str) -> dict[str, Any]:
         try:
             parsed = dict(parse_proxy_url(str(url or "").strip()))
-        except ValueError as exc:
-            raise ProxyControl._validation("url", "INVALID_PROXY_URL", str(exc)) from exc
+        except ValueError:
+            raise ProxyControl._validation(
+                "url", "INVALID_PROXY_URL", "proxy URL is invalid"
+            ) from None
         parsed.pop("name", None)
         return parsed
 

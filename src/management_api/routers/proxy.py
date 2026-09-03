@@ -218,6 +218,7 @@ def create_proxies(
     body: CreateProxyRequest, request: Request, context: SecretContext,
     control: Annotated[ProxyControl, Depends(get_proxy_control)],
 ) -> ProxyEnvelope:
+    reject_unknown_query_parameters(request)
     result = control.create_proxy(
         context, name=body.name, url=body.url.get_secret_value()
     )
@@ -247,6 +248,7 @@ def update_proxy(
     request: Request, context: WriteContext,
     control: Annotated[ProxyControl, Depends(get_proxy_control)], if_match: IfMatch = None,
 ) -> ProxyEnvelope:
+    reject_unknown_query_parameters(request)
     result = control.update_proxy(
         context, proxy_id, name=body.name,
         url=body.url.get_secret_value() if body.url else None,
@@ -279,6 +281,7 @@ def test_proxy(
     proxy_id: Annotated[str, Path(max_length=100)], request: Request,
     context: WriteContext, control: Annotated[ProxyControl, Depends(get_proxy_control)],
 ) -> ProxyOperationEnvelope:
+    reject_unknown_query_parameters(request)
     return ProxyOperationEnvelope(
         data=_operation(control.start_proxy_test(context, proxy_id)), meta=_meta(request)
     )
@@ -315,6 +318,7 @@ def create_proxy_groups(
     body: CreateProxyGroupRequest, request: Request, context: WriteContext,
     control: Annotated[ProxyControl, Depends(get_proxy_control)],
 ) -> ProxyGroupEnvelope:
+    reject_unknown_query_parameters(request)
     return ProxyGroupEnvelope(
         data=_group(control.create_group(context, name=body.name, members=body.members)),
         meta=_meta(request),
@@ -346,6 +350,7 @@ def update_proxy_group(
     request: Request, context: WriteContext,
     control: Annotated[ProxyControl, Depends(get_proxy_control)], if_match: IfMatch = None,
 ) -> ProxyGroupEnvelope:
+    reject_unknown_query_parameters(request)
     result = control.update_group(
         context, group_id, name=body.name, members=body.members,
         expected_revision=if_match,
@@ -377,6 +382,7 @@ def test_proxy_group(
     group_id: Annotated[str, Path(max_length=100)], request: Request,
     context: WriteContext, control: Annotated[ProxyControl, Depends(get_proxy_control)],
 ) -> ProxyOperationEnvelope:
+    reject_unknown_query_parameters(request)
     return ProxyOperationEnvelope(
         data=_operation(control.start_group_test(context, group_id)), meta=_meta(request)
     )
@@ -406,6 +412,7 @@ def update_proxy_routing(
     body: UpdateProxyRoutingRequest, request: Request, context: WriteContext,
     control: Annotated[ProxyControl, Depends(get_proxy_control)], if_match: IfMatch = None,
 ) -> ProxyRoutingEnvelope:
+    reject_unknown_query_parameters(request)
     patch = body.model_dump(exclude_unset=True)
     result = control.update_routing(context, patch, expected_revision=if_match)
     return ProxyRoutingEnvelope(data=_routing(result), meta=_meta(request))

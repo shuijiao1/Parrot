@@ -6,6 +6,7 @@ import time
 import pytest
 
 from src import config
+from src.management_control.proxy import ProxyControl
 from src.proxy import manager as proxy_manager
 from src.tests.test_management_mapping_support import domain_client, operation_map
 
@@ -349,6 +350,64 @@ def test_proxy_routing_explicit_null_is_422_and_does_not_mutate(
     assert response.json()["error"]["code"] == "VALIDATION_FAILED"
     assert response.json()["error"]["fields"][0]["path"] == field
     assert config.get().get("network") == before
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_invalid_write_only_proxy_url_is_generic_and_has_no_side_effects(
+    domain_client, operation,
+):
+    client, runtime, admin, *_ = domain_client
+    if operation == "update":
+        current = _create_proxy(client, admin, "edge")
+        endpoint = "/api/management/v1/proxies/edge"
+        method = "patch"
+        headers = {**admin, "If-Match": current["revision"]}
+        body = {"url": None}
+    else:
+        endpoint = "/api/management/v1/proxies"
+        method = "post"
+        headers = admin
+        body = {"name": "rejected", "url": None}
+
+    marker = f"write-only-{operation}-marker"
+    username = f"username-{marker}"
+    password = f"password-{marker}"
+    token = f"token-{marker}"
+    url = f"http://{username}:{password}@proxy.invalid:8080/{token}"
+    body["url"] = url
+    before_config = copy.deepcopy(config.get())
+    before_audit = runtime.state_store.audit_snapshot()
+    before_operations = copy.deepcopy(runtime.operations._items)
+
+    response = client.request(method, endpoint, headers=headers, json=body)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+    assert response.json()["error"]["fields"] == [{
+        "path": "url",
+        "code": "INVALID_PROXY_URL",
+        "message": "proxy URL is invalid",
+    }]
+    assert config.get() == before_config
+    assert runtime.state_store.audit_snapshot() == before_audit
+    assert runtime.operations._items == before_operations
+    public_surfaces = (
+        response.text,
+        repr(runtime.state_store.audit_snapshot()),
+        repr(runtime.operations._items),
+    )
+    for secret in (url, username, password, token, marker):
+        assert all(secret not in surface for surface in public_surfaces)
+
+
+def test_telegram_proxy_url_parser_facade_preserves_underlying_error_message():
+    marker = "telegram-original-error-marker"
+    url = f"http://user:{marker}@proxy.invalid:8080"
+
+    with pytest.raises(ValueError) as caught:
+        ProxyControl().parse_proxy_url(url)
+
+    assert str(caught.value) == f"unsupported proxy URL: {url}"
 
 
 def test_proxy_probe_exception_never_leaks_submitted_credential(

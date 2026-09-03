@@ -136,6 +136,7 @@ def update_load_balancing_mode(
     control: Annotated[LoadBalancingControl, Depends(get_load_balancing_control)],
     if_match: IfMatch = None,
 ) -> LoadBalancingEnvelope:
+    reject_unknown_query_parameters(request)
     result = control.update_mode(
         context, body.mode.value, expected_revision=if_match
     )
@@ -174,6 +175,7 @@ def replace_channel_order(
     control: Annotated[LoadBalancingControl, Depends(get_load_balancing_control)],
     if_match: IfMatch = None,
 ) -> OrderEnvelope:
+    reject_unknown_query_parameters(request)
     result = control.replace_channel_order(
         context, body.order, expected_revision=if_match
     )
@@ -214,6 +216,7 @@ def replace_model_channel_order(
     control: Annotated[LoadBalancingControl, Depends(get_load_balancing_control)],
     if_match: IfMatch = None,
 ) -> OrderEnvelope:
+    reject_unknown_query_parameters(request)
     result = control.replace_model_order(
         context, model_id, body.order, expected_revision=if_match
     )
@@ -255,6 +258,7 @@ def bulk_replace_model_channel_orders(
     control: Annotated[LoadBalancingControl, Depends(get_load_balancing_control)],
     if_match: IfMatch = None,
 ) -> BulkOrderEnvelope:
+    reject_unknown_query_parameters(request)
     results = control.bulk_replace_model_orders(
         context, body.modelIds, body.order, expected_revision=if_match
     )
@@ -277,6 +281,7 @@ def clear_all_affinity(
     context: DestroyContext,
     control: Annotated[LoadBalancingControl, Depends(get_load_balancing_control)],
 ) -> AffinityClearEnvelope:
+    reject_unknown_query_parameters(request)
     return AffinityClearEnvelope(
         data=_affinity(control.clear_all_affinity(context)), meta=_meta(request)
     )
@@ -295,6 +300,7 @@ def clear_family_affinity(
     context: DestroyContext,
     control: Annotated[LoadBalancingControl, Depends(get_load_balancing_control)],
 ) -> AffinityClearEnvelope:
+    reject_unknown_query_parameters(request)
     return AffinityClearEnvelope(
         data=_affinity(control.clear_family_affinity(context, family.value)),
         meta=_meta(request),

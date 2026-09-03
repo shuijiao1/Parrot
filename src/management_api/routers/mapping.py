@@ -161,6 +161,7 @@ def put_model_mapping(
     control: Annotated[MappingControl, Depends(get_mapping_control)],
     if_match: IfMatch = None,
 ) -> MappingEnvelope:
+    reject_unknown_query_parameters(request)
     item = control.put_mapping(
         context, alias, body.realModel, expected_revision=if_match
     )
@@ -224,6 +225,7 @@ def put_ingress_default_model(
     control: Annotated[MappingControl, Depends(get_mapping_control)],
     if_match: IfMatch = None,
 ) -> IngressDefaultEnvelope:
+    reject_unknown_query_parameters(request)
     item = control.put_ingress_default(
         context, ingress.value, body.modelId, expected_revision=if_match
     )
@@ -290,6 +292,7 @@ def put_compression_model(
     control: Annotated[MappingControl, Depends(get_mapping_control)],
     if_match: IfMatch = None,
 ) -> CompressionModelEnvelope:
+    reject_unknown_query_parameters(request)
     model_id, revision = control.put_compression(
         context, body.modelId, expected_revision=if_match
     )

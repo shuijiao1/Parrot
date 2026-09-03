@@ -307,6 +307,7 @@ def put_model_metadata_binding(
     control: Annotated[MappingControl, Depends(get_metadata_control)],
     if_match: IfMatch = None,
 ) -> ModelMetadataEnvelope:
+    reject_unknown_query_parameters(request)
     item = control.put_binding(
         context, model_id,
         scope=body.scope.value,
@@ -362,6 +363,7 @@ def sync_model_metadata(
     context: WriteContext,
     control: Annotated[MappingControl, Depends(get_metadata_control)],
 ) -> MetadataOperationEnvelope:
+    reject_unknown_query_parameters(request)
     operation = control.start_metadata_sync(
         context,
         scope=body.scope.value,
