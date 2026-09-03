@@ -922,19 +922,55 @@ def test_legacy_url_userinfo_is_stripped_from_read_and_mutation_without_config_c
     runtime.close()
 
 
-def test_provider_usage_error_is_redacted_for_plain_and_json_embedded_credentials(tmp_path, monkeypatch):
-    markers = (
-        "usage-management-marker", "usage-bot-marker", "usage-github-marker",
-        "usage-api-marker", "usage-bearer-marker", "usage-standalone-bearer-marker",
-        "usage-user-marker", "usage-password-marker",
+_CREDENTIAL_KEYS = (
+    "apiToken", "api_token", "apiKey", "api_key", "api-key", "apikey", "x-api-key",
+    "accessToken", "access_token", "refreshToken", "refresh_token", "idToken", "id_token",
+    "managementKey", "management_key", "botToken", "bot_token", "githubToken", "github_token",
+    "clientSecret", "client_secret", "sessionToken", "session_token", "session", "password",
+    "passwd", "cookie", "set-cookie", "API_TOKEN",
+)
+
+
+def _credential_error_samples():
+    keyed_markers = tuple(f"usage-secret-{index}" for index in range(len(_CREDENTIAL_KEYS)))
+    extra_markers = (
+        "auth-secret", "proxy-secret", "bearer-secret", "basic-secret",
+        "url-user-secret", "url-password-secret",
     )
-    plain = (
-        "managementKey=usage-management-marker botToken=usage-bot-marker "
-        "github_token=usage-github-marker api_token=usage-api-marker "
-        "Authorization: Bearer usage-bearer-marker Bearer usage-standalone-bearer-marker "
-        "https://usage-user-marker:usage-password-marker@[2001:db8::9]:9443/status"
+    context = (
+        "provider request failed; Bearer bearer-secret Basic basic-secret "
+        "custom+ssh://url-user-secret:url-password-secret@provider.example.test/status"
     )
-    raw_usage = {"status": "error", "error": plain, "error_at": 1_700_000_000_000}
+    data = dict(zip(_CREDENTIAL_KEYS, keyed_markers))
+    data.update({
+        "Authorization": "Bearer auth-secret",
+        "Proxy-Authorization": "Basic proxy-secret",
+        "context": context,
+    })
+    plain = "provider request failed; " + " ".join(
+        f"{key}={marker}" for key, marker in zip(_CREDENTIAL_KEYS, keyed_markers)
+    ) + " Authorization: Bearer auth-secret Proxy-Authorization=Basic proxy-secret " + context
+    structured = json.dumps(data)
+    return keyed_markers + extra_markers, (plain, structured, json.dumps(structured))
+
+
+def test_credential_sanitizer_covers_plain_json_and_escaped_json_without_losing_context():
+    markers, samples = _credential_error_samples()
+    ordinary = "provider request failed after 30 seconds; retry later"
+    assert channels_router.redact_credential_text(ordinary) == ordinary
+    for source in samples:
+        original = source[:]
+        safe = channels_router.redact_credential_text(source)
+        assert source == original
+        assert safe and "provider request failed" in safe
+        assert "custom+ssh://provider.example.test/status" in safe
+        assert "[REDACTED]" in safe
+        assert all(marker not in safe for marker in markers)
+
+
+def test_provider_usage_error_is_redacted_on_http_boundary_without_mutating_cache(tmp_path, monkeypatch):
+    markers, samples = _credential_error_samples()
+    raw_usage = {"status": "error", "error": samples[0], "error_at": 1_700_000_000_000}
     monkeypatch.setattr(channel_service.provider_usage, "spec_for", lambda channel: object())
     monkeypatch.setattr(channel_service.provider_usage, "cached", lambda channel: raw_usage)
     app, runtime = _build_app(tmp_path)
@@ -944,8 +980,8 @@ def test_provider_usage_error_is_redacted_for_plain_and_json_embedded_credential
             "/api/management/v1/channels", json=_manual_create("Usage Error API"), headers=auth,
         )
         assert created.status_code == 201, created.text
-        wire = []
-        for source in (plain, json.dumps({"upstreamError": plain})):
+        wire = [created.text]
+        for source in samples:
             raw_usage["error"] = source
             response = client.get(
                 "/api/management/v1/channels/api:Usage%20Error%20API", headers=auth,
@@ -953,8 +989,8 @@ def test_provider_usage_error_is_redacted_for_plain_and_json_embedded_credential
             assert response.status_code == 200, response.text
             wire.append(response.text)
             safe_error = response.json()["data"]["providerUsage"]["error"]
-            assert "[REDACTED]" in safe_error
-            assert "https://[2001:db8::9]:9443/status" in safe_error
+            assert safe_error and "provider request failed" in safe_error
+            assert "custom+ssh://provider.example.test/status" in safe_error
             assert all(marker not in safe_error for marker in markers)
             assert raw_usage["error"] == source
         evidence = "".join(wire) + json.dumps(runtime.state_store.audit_snapshot()) + json.dumps(app.openapi())

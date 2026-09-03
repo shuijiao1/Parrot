@@ -11,19 +11,31 @@ _URL_USERINFO = re.compile(
     r"(?P<prefix>\b[a-z][a-z0-9+.-]*:(?:[\\]*/){2})[^/@\s\"']+@",
     re.IGNORECASE,
 )
+_CREDENTIAL_KEYS = (
+    r"(?:x[-_]?api[-_]?key|api[-_]?(?:token|key)|access[-_]?token|"
+    r"refresh[-_]?token|id[-_]?token|management[-_]?key|bot[-_]?token|"
+    r"github[-_]?token|client[-_]?secret|session(?:[-_]?token)?|password|"
+    r"passwd|set[-_]?cookie|cookie)"
+)
+_AUTHORIZATION_KEYS = r"(?:proxy[-_]?authorization|authorization)"
+_QUOTED_VALUE = r"(?P<quote>\\*[\"'])(?P<quoted>.*?)(?P=quote)"
+_BARE_VALUE = r"(?P<bare>(?!\[REDACTED\])[^\s\\\"',;&}\]]+)"
 _KEY_ASSIGNMENT = re.compile(
-    r"(?P<prefix>\b(?:managementKey|botToken|github_token|api_token)\b"
-    r"(?:\\?[\"'])?\s*(?:=|:)\s*(?:\\?[\"'])?\s*)"
-    r"[^\s\\\"',;&}\]]+",
+    rf"(?P<prefix>\b{_CREDENTIAL_KEYS}\b(?:\\*[\"'])?\s*(?:=|:)\s*)"
+    rf"(?:{_QUOTED_VALUE}|{_BARE_VALUE})",
     re.IGNORECASE,
 )
 _AUTHORIZATION = re.compile(
-    r"(?P<prefix>\bauthorization\b(?:\\?[\"'])?\s*(?:=|:)\s*"
-    r"(?:\\?[\"'])?\s*)(?:(?:bearer|basic)\s+)?[^\s\\\"',;&}\]]+",
+    rf"(?P<prefix>\b{_AUTHORIZATION_KEYS}\b(?:\\*[\"'])?\s*(?:=|:)\s*)"
+    rf"(?:"
+    rf"(?P<quote>\\*[\"'])(?P<quoted_scheme>(?:bearer|basic)\s+)?"
+    rf"(?P<quoted>.*?)(?P=quote)|"
+    rf"(?P<bare_scheme>(?:bearer|basic)\s+)?{_BARE_VALUE}"
+    rf")",
     re.IGNORECASE,
 )
-_BEARER = re.compile(
-    r"(?P<prefix>\bbearer\s+)[^\s\\\"',;&}\]]+",
+_AUTH_SCHEME = re.compile(
+    rf"(?P<prefix>\b(?:bearer|basic)\s+)(?:{_QUOTED_VALUE}|{_BARE_VALUE})",
     re.IGNORECASE,
 )
 
@@ -67,20 +79,18 @@ def strip_url_userinfo(value: str) -> str:
     return urlunsplit(parsed._replace(netloc=safe_netloc))
 
 
+def _redact_match(match: re.Match[str]) -> str:
+    groups = match.groupdict()
+    quote = groups.get("quote") or ""
+    scheme = groups.get("quoted_scheme") or groups.get("bare_scheme") or ""
+    return match.group("prefix") + quote + scheme + _REDACTED + quote
+
+
 def redact_credential_text(value: str | None) -> str | None:
     """Redact common credential forms from provider error text only."""
     if value is None:
         return None
     safe = _URL_USERINFO.sub(lambda match: match.group("prefix"), str(value))
-    safe = _KEY_ASSIGNMENT.sub(
-        lambda match: match.group("prefix") + _REDACTED,
-        safe,
-    )
-    safe = _AUTHORIZATION.sub(
-        lambda match: match.group("prefix") + _REDACTED,
-        safe,
-    )
-    return _BEARER.sub(
-        lambda match: match.group("prefix") + _REDACTED,
-        safe,
-    )
+    safe = _KEY_ASSIGNMENT.sub(_redact_match, safe)
+    safe = _AUTHORIZATION.sub(_redact_match, safe)
+    return _AUTH_SCHEME.sub(_redact_match, safe)
