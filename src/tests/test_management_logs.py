@@ -175,44 +175,61 @@ def test_body_endpoints_require_log_body_read_not_only_read(tmp_path):
     controls.logs.raw_body.assert_not_called()
 
 
-def test_sanitize_credentials_redacts_nested_keys_header_lines_and_url_userinfo():
+def test_sanitize_credentials_redacts_auth_text_and_all_url_userinfo():
+    marker = "P4_AUTH_URL_MARKER"
     clean = sanitize_credentials({
-        "Proxy-Authorization": "Basic nested-secret",
-        "managementKey": "management-secret",
-        "bot-token": "bot-secret",
-        "github_token": "github-secret",
+        "Proxy-Authorization": f"Basic {marker}_nested",
         "headerLine": (
-            "Authorization: Bearer auth-secret, x-api-key=key-secret; "
-            "password = password-secret; managementKey=management-secret; "
-            "BOT_TOKEN: bot-secret; Github-Token = github-secret"
+            f"Authorization: Bearer {marker}_auth, x-api-key={marker}_key; "
+            f"password = {marker}_password; ordinary upstream failure"
         ),
-        "dsn": "https://alice:url-secret@example.test/v1",
-        "content": "ordinary business text remains unchanged",
+        "embeddedAuth": (
+            f"Bearer {marker}_start; upstream said Bearer {marker}_middle failed; "
+            f"Basic {marker}_basic rejected"
+        ),
+        "sessionText": f"session={marker}_equals; session: {marker}_colon",
+        "passwordDsn": f"socks5://{marker}_user:password@example.test:1080/v1",
+        "usernameDsn": f"custom+ssh://{marker}_username@example.test:2200/path",
+        "content": "ordinary token count=42; token usage is 42; basic routing mode",
     })
 
     assert clean["Proxy-Authorization"] == "<redacted>"
-    assert clean["managementKey"] == "<redacted>"
-    assert clean["bot-token"] == "<redacted>"
-    assert clean["github_token"] == "<redacted>"
     assert clean["headerLine"] == (
         "Authorization: <redacted>, x-api-key=<redacted>; password = <redacted>; "
-        "managementKey=<redacted>; BOT_TOKEN: <redacted>; Github-Token = <redacted>"
+        "ordinary upstream failure"
     )
-    assert clean["dsn"] == "https://alice:<redacted>@example.test/v1"
-    assert clean["content"] == "ordinary business text remains unchanged"
-    assert "secret" not in json.dumps(clean)
+    assert clean["embeddedAuth"] == (
+        "Bearer <redacted>; upstream said Bearer <redacted> failed; "
+        "Basic <redacted> rejected"
+    )
+    assert clean["sessionText"] == "session=<redacted>; session: <redacted>"
+    assert clean["passwordDsn"] == "socks5://example.test:1080/v1"
+    assert clean["usernameDsn"] == "custom+ssh://example.test:2200/path"
+    assert clean["content"] == (
+        "ordinary token count=42; token usage is 42; basic routing mode"
+    )
+    assert marker not in json.dumps(clean)
 
 
-def test_sanitize_credentials_covers_key_family_in_dict_plain_and_nested_json():
+def test_sanitize_credentials_covers_aliases_json_nesting_and_escaped_fragments():
     keys = (
-        "api_token", "apiToken", "credential", "exchangeSecret", "exchange_secret",
-        "challengeSecret", "challenge_secret", "sessionSecret", "session_secret",
-        "managementKey", "botToken", "github_token", "apiKey", "accessToken",
-        "refreshToken", "sessionToken", "clientSecret",
+        "apiToken", "api_token", "apiKey", "api_key", "api-key", "apikey",
+        "xApiKey", "x_api_key", "x-api-key", "accessToken", "access_token",
+        "refreshToken", "refresh_token", "idToken", "id_token",
+        "managementToken", "management_token", "managementKey", "management_key",
+        "botToken", "bot_token", "botKey", "bot_key", "githubToken",
+        "github_token", "githubKey", "github-key", "clientSecret", "client_secret",
+        "exchangeSecret", "exchange_secret", "challengeSecret", "challenge_secret",
+        "sessionSecret", "session_secret", "session", "sessionToken", "session_token",
+        "password", "passwd", "cookie", "setCookie", "set_cookie", "set-cookie",
+        "credential", "Authorization", "Proxy-Authorization",
     )
     marker = "P4_CREDENTIAL_MARKER"
     secrets = {key: f"{marker}_{index}" for index, key in enumerate(keys)}
-    ordinary = "ordinary token count=42; credential descriptions and business text remain"
+    ordinary = (
+        "ordinary token count=42; token usage is 42; basic routing mode; "
+        "credential descriptions and business text remain"
+    )
 
     clean_dict = sanitize_credentials({**secrets, "content": ordinary})
     assert all(clean_dict[key] == "<redacted>" for key in keys)
@@ -227,6 +244,11 @@ def test_sanitize_credentials_covers_key_family_in_dict_plain_and_nested_json():
     assert clean_plain.count("<redacted>") == len(keys)
     assert ordinary in clean_plain
 
+    full_json = sanitize_credentials(json.dumps({**secrets, "content": ordinary}))
+    clean_full = json.loads(full_json)
+    assert all(clean_full[key] == "<redacted>" for key in keys)
+    assert clean_full["content"] == ordinary
+
     nested_json = json.dumps({
         "payload": json.dumps({**secrets, "content": ordinary}),
         "content": ordinary,
@@ -238,6 +260,14 @@ def test_sanitize_credentials_covers_key_family_in_dict_plain_and_nested_json():
     assert all(inner[key] == "<redacted>" for key in keys)
     assert outer["content"] == ordinary
     assert inner["content"] == ordinary
+
+    json_fragment = f'prefix {{"api_token":"{marker}_fragment"}} suffix'
+    clean_fragment = sanitize_credentials(json_fragment)
+    assert clean_fragment == 'prefix {"api_token":"<redacted>"} suffix'
+
+    escaped_fragment = rf'prefix {{\"apiToken\":\"{marker}_escaped\"}} suffix'
+    clean_escaped = sanitize_credentials(escaped_fragment)
+    assert clean_escaped == r'prefix {\"apiToken\":\"<redacted>\"} suffix'
     assert sanitize_credentials(ordinary) == ordinary
 
 

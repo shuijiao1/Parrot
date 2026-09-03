@@ -241,34 +241,88 @@ def test_media_error_text_is_sanitized_without_changing_business_text(tmp_path):
     assert "ordinary provider failure" in result.items[0]["error"]
 
 
-def test_media_detail_direct_and_http_sanitize_raw_text_fields(tmp_path):
+def test_media_detail_direct_and_http_sanitize_raw_text_without_mutating_tg_row(tmp_path):
     marker = "P4_MEDIA_DETAIL_MARKER"
-    artifact = tmp_path / f"api_token={marker}; ordinary-image.png"
+    aliases = (
+        "apiToken", "api_key", "x-api-key", "accessToken", "refresh_token",
+        "id-token", "managementKey", "management_token", "botToken", "bot_key",
+        "githubToken", "github_key", "clientSecret", "exchange_secret",
+        "challengeSecret", "sessionSecret", "sessionToken", "password", "passwd",
+        "cookie", "set-cookie", "credential",
+    )
+    alias_text = "; ".join(
+        f"{key}={marker}_alias_{index}" for index, key in enumerate(aliases)
+    )
+    escaped_fragment = rf'prefix {{\"apiToken\":\"{marker}_escaped\"}} suffix'
+    json_fragment = f'prefix {{"api_token":"{marker}_json"}} suffix'
+    nested_json = json.dumps({
+        "payload": json.dumps({"sessionToken": f"{marker}_nested"}),
+    })
+    prompt_preview = " | ".join((
+        "ordinary prompt remains",
+        f"session={marker}_session_equals",
+        f"session: {marker}_session_colon",
+        f"Authorization: Bearer {marker}_authorization",
+        f"Proxy-Authorization: Basic {marker}_proxy_authorization",
+        f"upstream said Bearer {marker}_bearer failed",
+        f"Basic {marker}_basic rejected",
+        f"socks5://{marker}_user:password@proxy.example:1080/path",
+        f"https://{marker}_username@example.test/media/path",
+        alias_text,
+        json_fragment,
+        escaped_fragment,
+        nested_json,
+    ))
+    artifact = tmp_path / f"passwd={marker}_path; ordinary-image.png"
     artifact.write_bytes(b"png")
     row = _row(1, "success", "generate", 100, artifact)
     row.update({
-        "account_key": f"ordinary account id; session_secret={marker}",
-        "account_email": f"ordinary account label; credential={marker}",
-        "upstream_request_id": f"ordinary upstream request; exchangeSecret={marker}",
-        "upstream_status": f"ordinary upstream status; challenge_secret={marker}",
-        "prompt_preview": (
-            f"ordinary prompt; api_token={marker}; managementKey={marker}"
+        "error_message": (
+            f"ordinary provider failure; upstream said Bearer {marker}_error failed"
         ),
+        "account_key": f"ordinary account id; session={marker}_account",
+        "account_email": f"ordinary account label; {escaped_fragment}",
+        "upstream_request_id": (
+            f"ordinary upstream request; custom://{marker}_user@request.example/id"
+        ),
+        "upstream_status": f"ordinary upstream status; Basic {marker}_status rejected",
+        "prompt_preview": prompt_preview,
     })
-    control = MediaControl(media_db=FakeMediaDb([row]), config=FakeConfig())
+    raw_row = dict(row)
+    db = FakeMediaDb([row])
+    control = MediaControl(media_db=db, config=FakeConfig())
 
     direct = control.detail(context(), "1")
-    client, _, controls, auth = build_client(tmp_path)
+    client, runtime, controls, auth = build_client(tmp_path)
     controls.media = control
     response = client.get("/api/management/v1/media-logs/1", headers=auth)
+    openapi = client.get("/openapi.json")
     assert response.status_code == 200, response.text
+    assert openapi.status_code == 200, openapi.text
 
     for detail in (direct, response.json()["data"]):
         assert marker not in json.dumps(detail, default=str)
+        assert "ordinary provider failure" in detail["error"]
         assert "ordinary account id" in detail["accountId"]
         assert "ordinary account label" in detail["accountLabel"]
         assert "ordinary upstream request" in detail["upstreamRequestId"]
         assert "ordinary upstream status" in detail["upstreamStatus"]
-        assert "ordinary prompt" in detail["promptPreview"]
+        assert "ordinary prompt remains" in detail["promptPreview"]
+        assert "upstream said Bearer <redacted> failed" in detail["promptPreview"]
+        assert "socks5://proxy.example:1080/path" in detail["promptPreview"]
+        assert "https://example.test/media/path" in detail["promptPreview"]
+        assert r'{\"apiToken\":\"<redacted>\"}' in detail["promptPreview"]
         assert detail["artifactCount"] == 1
-        assert detail["paths"] == ["api_token=<redacted>; ordinary-image.png"]
+        assert detail["paths"] == ["passwd=<redacted>; ordinary-image.png"]
+
+    assert marker not in response.text
+    assert marker not in json.dumps(runtime.state_store.audit_snapshot(), default=str)
+    assert not runtime.operations._items
+    assert marker not in openapi.text
+
+    assert db.rows[0] == raw_row
+    telegram_raw = control.raw_log_for_telegram(context(), 1)
+    assert telegram_raw == raw_row
+    assert telegram_raw is not db.rows[0]
+    assert marker in json.dumps(telegram_raw, default=str)
+    assert telegram_raw["prompt_preview"] == prompt_preview

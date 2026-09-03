@@ -134,37 +134,61 @@ def page_slice(items: Iterable[T], *, page: int, page_size: int) -> PageResult[T
 
 _SECRET_KEYS = {
     "authorization", "proxy-authorization", "x-api-key", "api-key", "apikey",
-    "api_key", "api_token", "access_token", "refreshtoken", "refresh_token",
-    "id_token", "credential", "managementkey", "management_key", "session",
-    "session_token", "session_secret", "password", "client_secret",
-    "exchange_secret", "challenge_secret", "bot_token", "bottoken",
-    "github_token", "githubtoken", "cookie", "set-cookie",
+    "api_token", "access_token", "refresh_token", "id_token", "credential",
+    "management_key", "management_token", "bot_key", "bot_token", "github_key",
+    "github_token", "client_secret", "exchange_secret", "challenge_secret",
+    "session", "session_token", "session_secret", "password", "passwd", "cookie",
+    "set-cookie",
 }
 _SECRET_KEYS_COMPACT = {
     key.lower().replace(" ", "").replace("-", "").replace("_", "")
     for key in _SECRET_KEYS
 }
+_SECRET_VALUE_PATTERN = (
+    r'\\"(?:\\.|[^"\\])*\\"'
+    r"|\\'(?:\\.|[^'\\])*\\'"
+    r'|"[^"]*"'
+    r"|'[^']*'"
+    r'|[^\s,;&}\]"\']+'
+)
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"\b(?P<key>proxy[\s_-]?authorization|authorization|x[\s_-]?api[\s_-]?key|"
-    r"api[\s_-]?(?:key|token)|management[\s_-]?key|bot[\s_-]?token|"
-    r"github[\s_-]?token|access[\s_-]?token|refresh[\s_-]?token|id[\s_-]?token|"
-    r"session[\s_-]?(?:token|secret)|password|client[\s_-]?secret|"
-    r"exchange[\s_-]?secret|challenge[\s_-]?secret|credential|"
+    r"api[\s_-]?(?:key|token)|(?:access|refresh|id)[\s_-]?token|"
+    r"(?:management|bot|github)[\s_-]?(?:key|token)|"
+    r"(?:client|exchange|challenge)[\s_-]?secret|"
+    r"session(?:[\s_-]?(?:token|secret))?|password|passwd|credential|"
     r"set[\s_-]?cookie|cookie)"
-    r"(?P<key_quote>[\"']?)(?P<separator>\s*[:=]\s*)"
+    r"(?P<key_quote>\\[\"']|[\"']?)(?P<separator>\s*[:=]\s*)"
     r"(?:bearer\s+|basic\s+)?"
-    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;&}\]\"']+)",
+    rf"(?P<value>{_SECRET_VALUE_PATTERN})",
+    re.IGNORECASE,
+)
+_STANDALONE_AUTH_RE = re.compile(
+    r"(?<![\w-])(?P<scheme>Bearer|Basic)(?P<separator>[ \t]+)"
+    r"(?P<value>[A-Za-z0-9._~+/=-]+)"
+)
+_URL_USERINFO_RE = re.compile(
+    r"(?P<scheme>\b[a-z][a-z0-9+.-]*://)[^/?#\s]+@",
     re.IGNORECASE,
 )
 
 
+def _redacted_value(raw_value: str) -> str:
+    for quote in ('\\"', "\\'", '"', "'"):
+        if raw_value.startswith(quote) and raw_value.endswith(quote):
+            return quote + "<redacted>" + quote
+    return "<redacted>"
+
+
 def _redact_secret_assignment(match: re.Match[str]) -> str:
-    raw_value = match.group("value")
-    quote = raw_value[0] if len(raw_value) >= 2 and raw_value[0] == raw_value[-1] and raw_value[0] in "\"'" else ""
     return (
         match.group("key") + match.group("key_quote") + match.group("separator")
-        + quote + "<redacted>" + quote
+        + _redacted_value(match.group("value"))
     )
+
+
+def _redact_standalone_auth(match: re.Match[str]) -> str:
+    return match.group("scheme") + match.group("separator") + "<redacted>"
 
 
 def _camel_key(value: str) -> str:
@@ -208,16 +232,9 @@ def sanitize_credentials(value: Any) -> Any:
             clean = sanitize_credentials(parsed)
             if clean != parsed:
                 return json.dumps(clean, ensure_ascii=False, separators=(",", ":"))
-        lowered = value.lower().strip()
-        if lowered.startswith("bearer ") or lowered.startswith("basic "):
-            return value.split(" ", 1)[0] + " <redacted>"
         value = _SECRET_ASSIGNMENT_RE.sub(_redact_secret_assignment, value)
-        value = re.sub(
-            r"(?i)([a-z][a-z0-9+.-]*://[^:/@\s]+:)[^@/\s]+(@)",
-            r"\1<redacted>\2",
-            value,
-        )
-        return value
+        value = _STANDALONE_AUTH_RE.sub(_redact_standalone_auth, value)
+        return _URL_USERINFO_RE.sub(r"\g<scheme>", value)
     return copy.deepcopy(value)
 
 
