@@ -294,6 +294,17 @@ class RetentionControl:
         )
         with self._lock:
             self._purge()
+            # The scan is intentionally outside the lock.  Re-check the
+            # actor/session/idempotency tuple before publishing so concurrent
+            # equal payloads converge and differing payloads conflict.
+            if idempotency and create_key in self._idempotent_creates:
+                existing = self._get(context, self._idempotent_creates[create_key])
+                if int(existing.raw_plan.get("days") or 0) != days:
+                    raise ManagementError(
+                        ManagementErrorCode.RESOURCE_CONFLICT,
+                        "Idempotency key was already used with different retention days",
+                    )
+                return self._public_plan(existing)
             self._plans[plan.id] = plan
             if idempotency:
                 self._idempotent_creates[create_key] = plan.id

@@ -84,7 +84,11 @@ def fake_controls() -> ObservabilityControls:
         "apiKeyName": "client", "requestedModel": "example-model", "finalModel": "example-model",
         "channelId": "api:example", "protocol": "anthropic", "transport": "http",
         "retryCount": 0, "durationMilliseconds": 10, "inputTokens": 1, "outputTokens": 2,
-        "costTicks": 3, "error": None, "revision": "rev_log",
+        "costTicks": 3, "billing": {
+            "costTicks": 3, "actualCostTicks": 3, "estimatedCostTicks": 0,
+            "actualCostedSuccess": 1, "estimatedCostedSuccess": 0,
+            "costedSuccess": 1, "unpricedSuccess": 0,
+        }, "error": None, "revision": "rev_log",
     }])
     logs.filter_options.return_value = {
         "apiKeys": [], "models": [], "channels": [],

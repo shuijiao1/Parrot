@@ -92,6 +92,40 @@ def utc_datetime(value: Any) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+def normalize_utc_range(
+    started_at: datetime | None,
+    ended_at: datetime | None,
+) -> tuple[datetime | None, datetime | None]:
+    """Validate typed API bounds and normalize aware values to UTC.
+
+    Storage timestamps remain backward compatible through :func:`utc_datetime`,
+    but public query bounds must never silently assign a timezone to a naive
+    value.  Keeping this check in the control package also protects non-HTTP
+    adapters and direct callers from bare aware/naive ``TypeError`` failures.
+    """
+    normalized: list[datetime | None] = []
+    for path, value in (("startedAt", started_at), ("endedAt", ended_at)):
+        if value is None:
+            normalized.append(None)
+            continue
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise validation_error(path, "timezone_required", "RFC 3339 timezone offset is required")
+        try:
+            offset = value.utcoffset()
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise validation_error(path, "invalid_datetime", "Invalid RFC 3339 timestamp") from exc
+        if offset is None:
+            raise validation_error(path, "timezone_required", "RFC 3339 timezone offset is required")
+        try:
+            normalized.append(value.astimezone(timezone.utc))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise validation_error(path, "invalid_datetime", "Invalid RFC 3339 timestamp") from exc
+    start, end = normalized
+    if start is not None and end is not None and start > end:
+        raise validation_error("endedAt", "invalid_range", "endedAt must not precede startedAt")
+    return start, end
+
+
 def page_slice(items: Iterable[T], *, page: int, page_size: int) -> PageResult[T]:
     values = tuple(items)
     start = (page - 1) * page_size
@@ -102,7 +136,8 @@ _SECRET_KEYS = {
     "authorization", "proxy-authorization", "x-api-key", "api-key", "apikey",
     "api_key", "access_token", "refreshtoken", "refresh_token", "id_token",
     "managementkey", "management_key", "session", "session_token", "password",
-    "client_secret", "bot_token", "cookie", "set-cookie",
+    "client_secret", "bot_token", "bottoken", "github_token", "githubtoken",
+    "cookie", "set-cookie",
 }
 _SECRET_KEYS_COMPACT = {
     key.lower().replace(" ", "").replace("-", "").replace("_", "")
@@ -147,9 +182,11 @@ def sanitize_credentials(value: Any) -> Any:
         if lowered.startswith("bearer ") or lowered.startswith("basic "):
             return value.split(" ", 1)[0] + " <redacted>"
         value = re.sub(
-            r"(?i)\b(authorization|proxy-authorization|x-api-key|api[-_]?key|"
-            r"access[_-]?token|refresh[_-]?token|password|client[_-]?secret)"
-            r"(\s*[:=]\s*)(?:bearer\s+|basic\s+)?[^\s,;\"']+",
+            r"(?i)\b(proxy[\s_-]?authorization|authorization|x[\s_-]?api[\s_-]?key|"
+            r"api[\s_-]?key|management[\s_-]?key|bot[\s_-]?token|github[\s_-]?token|"
+            r"access[\s_-]?token|refresh[\s_-]?token|id[\s_-]?token|session[\s_-]?token|"
+            r"password|client[\s_-]?secret|set[\s_-]?cookie|cookie)"
+            r"(\s*[:=]\s*)(?:bearer\s+|basic\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
             lambda match: match.group(1) + match.group(2) + "<redacted>",
             value,
         )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -12,6 +12,7 @@ from src.management_control.observability import (
     BodySort, LogBodyKind, LogsControl, RequestLogQuery, RequestLogSort,
     RequestLogStatus, RequestProtocol,
 )
+from src.management_control.observability import inspector
 from src.management_control.observability.common import sanitize_credentials
 from src.tests.management_observability_support import build_client
 
@@ -27,6 +28,7 @@ def context():
 
 class FakeLogDb:
     def __init__(self):
+        self.cost_calls = []
         self.rows = [
             {
                 "request_id": "r3", "status": "error", "created_at": 300,
@@ -71,7 +73,17 @@ class FakeLogDb:
         return sorted({row[field] for row in self.rows})
 
     def cost_for_log(self, row):
-        return {"cost_ticks": 0}
+        self.cost_calls.append(row["request_id"])
+        ticks = {"r3": 300, "r2": 200, "r1": 100}.get(row["request_id"], 0)
+        return {
+            "cost_ticks": ticks,
+            "actual_cost_ticks": ticks,
+            "estimated_cost_ticks": 0,
+            "actual_costed_success": int(ticks > 0),
+            "estimated_costed_success": 0,
+            "costed_success": int(ticks > 0),
+            "unpriced_success": 0,
+        }
 
     def log_detail(self, request_id):
         row = next((row for row in self.rows if row["request_id"] == request_id), None)
@@ -166,17 +178,25 @@ def test_body_endpoints_require_log_body_read_not_only_read(tmp_path):
 def test_sanitize_credentials_redacts_nested_keys_header_lines_and_url_userinfo():
     clean = sanitize_credentials({
         "Proxy-Authorization": "Basic nested-secret",
+        "managementKey": "management-secret",
+        "bot-token": "bot-secret",
+        "github_token": "github-secret",
         "headerLine": (
             "Authorization: Bearer auth-secret, x-api-key=key-secret; "
-            "password = password-secret"
+            "password = password-secret; managementKey=management-secret; "
+            "BOT_TOKEN: bot-secret; Github-Token = github-secret"
         ),
         "dsn": "https://alice:url-secret@example.test/v1",
         "content": "ordinary business text remains unchanged",
     })
 
     assert clean["Proxy-Authorization"] == "<redacted>"
+    assert clean["managementKey"] == "<redacted>"
+    assert clean["bot-token"] == "<redacted>"
+    assert clean["github_token"] == "<redacted>"
     assert clean["headerLine"] == (
-        "Authorization: <redacted>, x-api-key=<redacted>; password = <redacted>"
+        "Authorization: <redacted>, x-api-key=<redacted>; password = <redacted>; "
+        "managementKey=<redacted>; BOT_TOKEN: <redacted>; Github-Token = <redacted>"
     )
     assert clean["dsn"] == "https://alice:<redacted>@example.test/v1"
     assert clean["content"] == "ordinary business text remains unchanged"
@@ -244,6 +264,7 @@ def test_body_kind_counts_follow_search_before_kind_filter_and_page():
 def test_logs_nondefault_and_filter_options_scan_in_bounded_chunks_with_exact_total():
     class LargeLogDb(FakeLogDb):
         def __init__(self):
+            self.cost_calls = []
             self.rows = [
                 {
                     "request_id": f"r{i:04d}",
@@ -287,3 +308,196 @@ def test_logs_nondefault_and_filter_options_scan_in_bounded_chunks_with_exact_to
     assert {item["value"] for item in options["apiKeys"]} == {
         f"key-{index}" for index in range(5)
     }
+
+
+def test_response_parser_accepts_dict_without_changing_json_string_results():
+    payload = {
+        "choices": [{
+            "message": {"role": "assistant", "content": "structured answer"},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 3},
+    }
+
+    from_dict = inspector.parse_response_body(payload)
+    from_string = inspector.parse_response_body(json.dumps(payload))
+
+    assert from_dict == from_string
+    assert [item["kind"] for item in from_dict] == ["assistant", "finish", "usage"]
+    assert from_dict[0]["text"] == "structured answer"
+
+
+def test_logs_control_and_http_structure_sanitized_json_response_body(tmp_path):
+    marker = "P4_SECRET_MARKER"
+    db = FakeLogDb()
+    original_detail = db.log_detail
+
+    def detail(request_id):
+        value = original_detail(request_id)
+        value["detail"]["response_body"] = json.dumps({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ordinary response"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3},
+            "github_token": marker,
+        })
+        return value
+
+    db.log_detail = detail
+    control = LogsControl(log_db=db, config=FakeConfig(), oauth_manager=FakeOAuth())
+    result = control.body_items(
+        context(), "r3", kind=LogBodyKind.RESPONSE, query=None,
+        sort=BodySort.ORIGINAL, item_kind=None, page=1, page_size=50,
+    )
+    assert [item["kind"] for item in result.items] == ["assistant", "finish", "usage"]
+    assert result.kind_counts == (
+        {"kind": "assistant", "count": 1},
+        {"kind": "finish", "count": 1},
+        {"kind": "usage", "count": 1},
+    )
+    assert marker not in json.dumps(result.items)
+
+    client, _, controls, auth = build_client(tmp_path)
+    controls.logs = control
+    response = client.get(
+        "/api/management/v1/logs/r3/body?kind=response", headers=auth,
+    )
+    assert response.status_code == 200, response.text
+    assert [item["kind"] for item in response.json()["data"]] == [
+        "assistant", "finish", "usage",
+    ]
+    assert marker not in response.text
+
+
+def test_logs_list_uses_authoritative_transport_and_page_billing_only(tmp_path):
+    db = FakeLogDb()
+    db.rows[0]["upstream_transport"] = "websocket"
+    db.rows[0]["transport"] = "not-authoritative"
+    db.rows[0]["error_message"] = (
+        "botToken=P4_SECRET_MARKER; ordinary upstream failure"
+    )
+    control = LogsControl(log_db=db, config=FakeConfig(), oauth_manager=FakeOAuth())
+
+    result = control.list_logs(context(), RequestLogQuery(page=1, page_size=2))
+
+    assert [item["id"] for item in result.items] == ["r3", "r2"]
+    assert db.cost_calls == ["r3", "r2"]
+    assert len(db.cost_calls) <= result.page_size
+    assert result.items[0]["transport"] == "websocket"
+    assert result.items[0]["costTicks"] == 300
+    assert "P4_SECRET_MARKER" not in result.items[0]["error"]
+    assert "ordinary upstream failure" in result.items[0]["error"]
+    assert result.items[0]["billing"] == {
+        "costTicks": 300,
+        "actualCostTicks": 300,
+        "estimatedCostTicks": 0,
+        "actualCostedSuccess": 1,
+        "estimatedCostedSuccess": 0,
+        "costedSuccess": 1,
+        "unpricedSuccess": 0,
+    }
+
+    db.cost_calls.clear()
+    client, _, controls, auth = build_client(tmp_path)
+    controls.logs = control
+    response = client.get(
+        "/api/management/v1/logs?pageSize=2", headers=auth,
+    )
+    assert response.status_code == 200, response.text
+    assert db.cost_calls == ["r3", "r2"]
+    assert response.json()["data"][0]["billing"]["actualCostTicks"] == 300
+
+
+def test_logs_cost_sort_is_rejected_and_model_options_match_or_filter_semantics(tmp_path):
+    client, _, controls, auth = build_client(tmp_path)
+    rejected = client.get("/api/management/v1/logs?sort=cost", headers=auth)
+    assert rejected.status_code == 422
+    controls.logs.list_logs.assert_not_called()
+
+    db = FakeLogDb()
+    db.rows[0]["final_model"] = "m-final"
+    db.rows[1]["final_model"] = "m1"
+    db.rows[2]["final_model"] = "m2"
+    options = LogsControl(
+        log_db=db, config=FakeConfig(), oauth_manager=FakeOAuth(),
+    ).filter_options(context())
+    assert {item["value"]: item["count"] for item in options["models"]} == {
+        "m1": 2,
+        "m2": 2,
+        "m-final": 1,
+    }
+
+
+@pytest.mark.parametrize("prefix", ["/api/management/v1/logs", "/api/management/v1/media-logs"])
+def test_log_and_media_http_time_bounds_require_rfc3339_timezone_and_order(prefix, tmp_path):
+    client, _, controls, auth = build_client(tmp_path)
+    target = controls.logs.list_logs if prefix.endswith("/logs") else controls.media.list_logs
+    for params in (
+        {"startedAt": "2026-01-02T03:04:05"},
+        {"startedAt": "2026-01-02 03:04:05Z"},
+        {
+            "startedAt": "2026-01-03T03:04:05Z",
+            "endedAt": "2026-01-02T03:04:05Z",
+        },
+    ):
+        response = client.get(prefix, params=params, headers=auth)
+        assert response.status_code == 422, response.text
+        assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+    target.assert_not_called()
+
+    valid = client.get(
+        prefix,
+        params={
+            "startedAt": "2026-01-02T11:04:05+08:00",
+            "endedAt": "2026-01-02T04:04:05Z",
+        },
+        headers=auth,
+    )
+    assert valid.status_code == 200, valid.text
+    query = target.call_args.args[1]
+    assert query.started_at == datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    assert query.ended_at == datetime(2026, 1, 2, 4, 4, 5, tzinfo=timezone.utc)
+
+
+def test_log_control_time_bounds_reject_naive_and_reverse_without_type_error():
+    control = LogsControl(log_db=FakeLogDb(), config=FakeConfig(), oauth_manager=FakeOAuth())
+    for query, path in (
+        (RequestLogQuery(started_at=datetime(2026, 1, 2, 3, 4, 5)), "startedAt"),
+        (RequestLogQuery(
+            started_at=datetime(2026, 1, 3, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        ), "endedAt"),
+        (RequestLogQuery(
+            started_at=datetime(2026, 1, 2, 11, tzinfo=timezone(timedelta(hours=8))),
+            ended_at=datetime(2026, 1, 2, 4, tzinfo=timezone.utc),
+        ), None),
+    ):
+        if path is None:
+            control.list_logs(context(), query)
+            continue
+        with pytest.raises(ManagementError) as invalid:
+            control.list_logs(context(), query)
+        assert invalid.value.code is ManagementErrorCode.VALIDATION_FAILED
+        assert invalid.value.fields[0].path == path
+
+
+def test_logs_non_json_raw_body_reuses_common_secret_sanitizer():
+    marker = "P4_SECRET_MARKER"
+    db = FakeLogDb()
+    db.log_detail = lambda _request_id: {
+        "log": db.rows[0],
+        "detail": {
+            "response_body": (
+                f"managementKey={marker}; botToken: {marker}; "
+                f"github_token={marker}; ordinary business text"
+            ),
+        },
+    }
+    control = LogsControl(log_db=db, config=FakeConfig(), oauth_manager=FakeOAuth())
+
+    raw = control.raw_body(context(), "r3", kind=LogBodyKind.RESPONSE)
+
+    assert marker not in raw["body"]
+    assert "ordinary business text" in raw["body"]
+    assert raw["body"].count("<redacted>") == 3

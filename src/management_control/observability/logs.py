@@ -5,8 +5,7 @@ from __future__ import annotations
 import copy
 import heapq
 import json
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -19,7 +18,16 @@ from src.management_control.context import ManagementContext
 from src.management_control.errors import ManagementError, ManagementErrorCode
 
 from . import inspector
-from .common import PageResult, camelize, page_slice, require, revision_for, sanitize_credentials, utc_datetime
+from .common import (
+    PageResult,
+    camelize,
+    normalize_utc_range,
+    page_slice,
+    require,
+    revision_for,
+    sanitize_credentials,
+    utc_datetime,
+)
 
 
 class LogBodyKind(str, Enum):
@@ -45,7 +53,6 @@ class RequestLogSort(str, Enum):
     CREATED_AT = "createdAt"
     STATUS = "status"
     LATENCY = "latency"
-    COST = "cost"
     MODEL = "model"
 
 
@@ -134,8 +141,6 @@ class LogsControl:
             return str(row.get("status") or "")
         if sort is RequestLogSort.LATENCY:
             return float(row.get("duration_ms") or row.get("total_time_ms") or 0)
-        if sort is RequestLogSort.COST:
-            return int(row.get("cost_ticks") or row.get("cost_usd_ticks") or 0)
         if sort is RequestLogSort.MODEL:
             return str(row.get("requested_model") or row.get("final_model") or "").casefold()
         dt = utc_datetime(row.get("created_at"))
@@ -143,6 +148,8 @@ class LogsControl:
 
     def list_logs(self, context: ManagementContext, query: RequestLogQuery) -> PageResult[dict[str, Any]]:
         require(context)
+        started_at, ended_at = normalize_utc_range(query.started_at, query.ended_at)
+        query = replace(query, started_at=started_at, ended_at=ended_at)
         filters = self._base_filters(query)
         requires_memory = bool(
             len(query.statuses) > 1 or query.protocols or query.query
@@ -221,8 +228,22 @@ class LogsControl:
         require(context)
         return copy.deepcopy(self.log_db.cost_for_log(row))
 
+    @staticmethod
+    def _billing_summary(value: Any) -> dict[str, int]:
+        clean = sanitize_credentials(value if isinstance(value, dict) else {})
+        return {
+            "costTicks": int(clean.get("cost_ticks") or 0),
+            "actualCostTicks": int(clean.get("actual_cost_ticks") or 0),
+            "estimatedCostTicks": int(clean.get("estimated_cost_ticks") or 0),
+            "actualCostedSuccess": int(clean.get("actual_costed_success") or 0),
+            "estimatedCostedSuccess": int(clean.get("estimated_costed_success") or 0),
+            "costedSuccess": int(clean.get("costed_success") or 0),
+            "unpricedSuccess": int(clean.get("unpriced_success") or 0),
+        }
+
     def _list_record(self, row: dict[str, Any]) -> dict[str, Any]:
         clean = sanitize_credentials(dict(row))
+        billing = self._billing_summary(self.log_db.cost_for_log(row))
         return {
             "id": str(clean.get("request_id") or clean.get("id") or ""),
             "status": str(clean.get("status") or "unknown"),
@@ -232,12 +253,13 @@ class LogsControl:
             "finalModel": clean.get("final_model"),
             "channelId": clean.get("final_channel_key"),
             "protocol": clean.get("protocol") or clean.get("ingress_protocol"),
-            "transport": clean.get("transport"),
+            "transport": clean.get("upstream_transport"),
             "retryCount": int(clean.get("retry_count") or clean.get("total_retries") or 0),
             "durationMilliseconds": clean.get("duration_ms") or clean.get("total_time_ms"),
             "inputTokens": int(clean.get("input_tokens") or clean.get("prompt_tokens") or 0),
             "outputTokens": int(clean.get("output_tokens") or clean.get("completion_tokens") or 0),
-            "costTicks": int(clean.get("cost_ticks") or clean.get("cost_usd_ticks") or 0),
+            "costTicks": billing["costTicks"],
+            "billing": billing,
             "error": clean.get("error_message"),
             "revision": revision_for(clean),
         }
@@ -246,12 +268,11 @@ class LogsControl:
         require(context)
         total = int(self.log_db.recent_logs_count())
         fields = {
-            "apiKeys": "api_key_name", "models": "requested_model",
-            "channels": "final_channel_key", "statuses": "status",
-            "protocols": "protocol",
+            "apiKeys": "api_key_name", "channels": "final_channel_key",
+            "statuses": "status", "protocols": "protocol",
         }
         counts_by_field: dict[str, dict[str, int]] = {
-            public: {} for public in fields
+            public: {} for public in (*fields, "models")
         }
         for offset in range(0, total, _SCAN_CHUNK):
             rows = self.log_db.recent_logs(min(_SCAN_CHUNK, total - offset), offset=offset)
@@ -266,6 +287,14 @@ class LogsControl:
                         key = str(value)
                         counts = counts_by_field[public]
                         counts[key] = counts.get(key, 0) + 1
+                # The authoritative model filter is requested OR final.  Count
+                # both values, but only once when a row used the same model.
+                for value in {
+                    str(row.get("requested_model") or ""),
+                    str(row.get("final_model") or ""),
+                } - {""}:
+                    counts = counts_by_field["models"]
+                    counts[value] = counts.get(value, 0) + 1
         result: dict[str, list[dict[str, Any]]] = {}
         for public, counts in counts_by_field.items():
             result[public] = [
@@ -319,11 +348,7 @@ class LogsControl:
         try:
             parsed = json.loads(text)
         except Exception:
-            return re.sub(
-                r"(?i)(authorization|proxy-authorization|x-api-key|api-key)\s*:\s*([^\s,;]+)",
-                lambda match: f"{match.group(1)}: <redacted>",
-                text,
-            )
+            return sanitize_credentials(text)
         return sanitize_credentials(parsed)
 
     def body_items(

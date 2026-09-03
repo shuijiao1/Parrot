@@ -162,3 +162,80 @@ def test_media_nondefault_scan_is_chunk_bounded_with_exact_sort_page_and_total(t
     assert [item["id"] for item in default.items] == [
         str(row["id"]) for row in rows[13:26]
     ]
+
+
+def test_media_control_time_bounds_reject_naive_and_reverse_without_type_error(tmp_path):
+    row = _row(1, "success", "generate", 100, tmp_path / "missing.png")
+    control = MediaControl(media_db=FakeMediaDb([row]), config=FakeConfig())
+    for query, path in (
+        (MediaLogQuery(started_at=datetime(2026, 1, 2, 3, 4, 5)), "startedAt"),
+        (MediaLogQuery(
+            started_at=datetime(2026, 1, 3, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        ), "endedAt"),
+    ):
+        with pytest.raises(ManagementError) as invalid:
+            control.list_logs(context(), query)
+        assert invalid.value.code is ManagementErrorCode.VALIDATION_FAILED
+        assert invalid.value.fields[0].path == path
+
+
+def test_expired_media_record_blocks_metadata_and_download_but_success_expiry_does_not(
+    tmp_path,
+):
+    marker = tmp_path / "artifact.png"
+    marker.write_bytes(b"artifact")
+    expired = _row(1, "expired", "generate", 100, marker)
+    successful = _row(2, "success", "generate", 200, marker)
+    # This is a residual job-binding expiry, not an artifact expiry signal.
+    successful["expires_at"] = 1
+    control = MediaControl(
+        media_db=FakeMediaDb([expired, successful]), config=FakeConfig(),
+    )
+
+    for access in (
+        lambda: control.artifacts(context(), "1"),
+        lambda: control.download(context(), "1", control._artifact_id(1, str(marker))),
+    ):
+        with pytest.raises(ManagementError) as missing:
+            access()
+        assert missing.value.code is ManagementErrorCode.RESOURCE_NOT_FOUND
+
+    metadata = control.artifacts(context(), "2")
+    assert metadata[0]["expiresAt"] == datetime.fromtimestamp(1, tz=timezone.utc)
+    assert b"".join(control.download(context(), "2", metadata[0]["id"]).chunks) == b"artifact"
+
+
+def test_expired_media_artifact_http_is_stable_404(tmp_path):
+    marker = tmp_path / "artifact.png"
+    marker.write_bytes(b"artifact")
+    control = MediaControl(
+        media_db=FakeMediaDb([_row(1, "expired", "generate", 100, marker)]),
+        config=FakeConfig(),
+    )
+    client, _, controls, auth = build_client(tmp_path)
+    controls.media = control
+
+    metadata = client.get(
+        "/api/management/v1/media-logs/1/artifacts", headers=auth,
+    )
+    download = client.get(
+        f"/api/management/v1/media-logs/1/artifacts/{control._artifact_id(1, str(marker))}",
+        headers=auth,
+    )
+
+    for response in (metadata, download):
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "RESOURCE_NOT_FOUND"
+
+
+def test_media_error_text_is_sanitized_without_changing_business_text(tmp_path):
+    marker = "P4_SECRET_MARKER"
+    row = _row(1, "failed", "generate", 100, tmp_path / "missing.png")
+    row["error_message"] = f"github_token={marker}; ordinary provider failure"
+    control = MediaControl(media_db=FakeMediaDb([row]), config=FakeConfig())
+
+    result = control.list_logs(context(), MediaLogQuery())
+
+    assert marker not in result.items[0]["error"]
+    assert "ordinary provider failure" in result.items[0]["error"]

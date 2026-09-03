@@ -25,7 +25,15 @@ from src import status_monitor as status_monitor_module
 from src.channel import registry as registry_module
 from src.management_control.context import ManagementContext
 
-from .common import PageResult, camelize, page_slice, require, revision_for, utc_datetime
+from .common import (
+    PageResult,
+    camelize,
+    page_slice,
+    require,
+    revision_for,
+    sanitize_credentials,
+    utc_datetime,
+)
 
 
 _BJT = timezone(timedelta(hours=8))
@@ -208,8 +216,9 @@ class StatusControl:
             },
             "today": camelize(_plain(today or {})),
             "lifetime": camelize(_plain(lifetime or {})),
-            "activeAlerts": camelize(_plain(self.status_monitor.snapshot_active())),
+            "activeAlerts": camelize(sanitize_credentials(_plain(self.status_monitor.snapshot_active()))),
         }
+        data = sanitize_credentials(data)
         data["revision"] = revision_for(data)
         return data
 
@@ -221,7 +230,7 @@ class StatusControl:
             "protocol": str(getattr(channel, "protocol", "") or "unknown"),
             "type": str(getattr(channel, "type", "") or "unknown"),
             "enabled": bool(getattr(channel, "enabled", False)),
-            "disabledReason": getattr(channel, "disabled_reason", None),
+            "disabledReason": sanitize_credentials(getattr(channel, "disabled_reason", None)),
         }
 
     def runtime_status(self, context: ManagementContext) -> dict[str, Any]:
@@ -235,11 +244,18 @@ class StatusControl:
             if not row["enabled"] or row["disabledReason"]
         }
         problem_ids.update(str(row.get("channel_key") or "") for row in cooldowns)
+        cooldown_pairs = {
+            (str(row.get("channel_key") or ""), str(row.get("model") or ""))
+            for row in cooldowns
+        }
         fastest: dict[str, list[dict[str, Any]]] = {"anthropic": [], "openai": []}
         for stat in self.scorer.snapshot():
             key = str(stat.get("channel_key") or "")
             channel = by_key.get(key)
             if not channel or not channel["enabled"] or channel["disabledReason"]:
+                continue
+            model = str(stat.get("model") or "")
+            if (key, model) in cooldown_pairs:
                 continue
             requests = int(stat.get("recent_requests") or 0)
             successes = int(stat.get("recent_success_count") or 0)
@@ -248,7 +264,7 @@ class StatusControl:
             family = "openai" if "openai" in channel["protocol"].lower() else "anthropic"
             fastest[family].append({
                 "channelId": key,
-                "model": str(stat.get("model") or ""),
+                "model": model,
                 "successRate": successes / requests,
                 "score": float(stat.get("score") or 0),
                 "averageFirstByteMilliseconds": stat.get("avg_first_byte_ms"),
@@ -273,6 +289,7 @@ class StatusControl:
             },
             "database": camelize(self._database_status()),
         }
+        data = sanitize_credentials(data)
         data["revision"] = revision_for(data)
         return data
 
@@ -319,7 +336,7 @@ class StatusControl:
                 "errorCount": int(row.get("error_count") or 0),
                 "state": "permanent" if until == -1 else "active",
                 "until": None if until == -1 else utc_datetime(until / 1000),
-                "message": str(row.get("message") or "") or None,
+                "message": sanitize_credentials(str(row.get("message") or "")) or None,
             })
         return page_slice(normalized, page=page, page_size=page_size)
 

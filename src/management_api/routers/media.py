@@ -1,6 +1,5 @@
 """Multimedia log and cached-artifact endpoints."""
 
-from datetime import datetime
 from typing import Annotated
 from urllib.parse import quote
 
@@ -9,12 +8,24 @@ from fastapi.responses import StreamingResponse
 
 from src.management_auth import Capability
 from src.management_control import ManagementContext, ManagementErrorCode
-from src.management_control.observability import MediaAction, MediaLogQuery, MediaSort, MediaStatus
+from src.management_control.observability import (
+    MediaAction,
+    MediaLogQuery,
+    MediaSort,
+    MediaStatus,
+    normalize_utc_range,
+)
 
 from ..dependencies import require_capability
 from ..error_mapping import management_error_responses
 from ..schemas import DataEnvelope
-from ..schemas.observability import MediaArtifactData, MediaLogData, MediaLogDetailData, PagedEnvelope
+from ..schemas.observability import (
+    MediaArtifactData,
+    MediaLogData,
+    MediaLogDetailData,
+    PagedEnvelope,
+    Rfc3339UtcDateTime,
+)
 from ._observability import controls, meta, paged_meta, reject_unknown_query
 
 
@@ -37,8 +48,8 @@ def list_media_logs(
     provider: Annotated[list[str] | None, Query()] = None,
     model: Annotated[list[str] | None, Query()] = None,
     action: Annotated[list[MediaAction] | None, Query()] = None,
-    started_at: Annotated[datetime | None, Query(alias="startedAt")] = None,
-    ended_at: Annotated[datetime | None, Query(alias="endedAt")] = None,
+    started_at: Annotated[Rfc3339UtcDateTime | None, Query(alias="startedAt")] = None,
+    ended_at: Annotated[Rfc3339UtcDateTime | None, Query(alias="endedAt")] = None,
     sort: Annotated[MediaSort, Query()] = MediaSort.CREATED_AT,
     descending: Annotated[bool, Query()] = True,
     page: Annotated[int, Query(ge=1)] = 1,
@@ -48,6 +59,7 @@ def list_media_logs(
         "status", "provider", "model", "action", "startedAt", "endedAt",
         "sort", "descending", "page", "pageSize",
     ))
+    started_at, ended_at = normalize_utc_range(started_at, ended_at)
     result = controls(request).media.list_logs(context, MediaLogQuery(
         statuses=tuple(status or ()), providers=tuple(provider or ()), models=tuple(model or ()),
         actions=tuple(action or ()), started_at=started_at, ended_at=ended_at,

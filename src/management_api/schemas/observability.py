@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Generic, Literal, TypeVar
+import re
+from datetime import datetime, timezone
+from typing import Annotated, Generic, Literal, TypeVar
 
-from pydantic import ConfigDict, Field, JsonValue
+from pydantic import BeforeValidator, ConfigDict, Field, JsonValue
 
 from .base import ResponseMeta, StrictSchema
 
@@ -18,6 +19,30 @@ class PagedResponseMeta(ResponseMeta):
 
 
 PageT = TypeVar("PageT")
+
+
+_RFC3339_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$",
+)
+
+
+def _rfc3339_utc(value):
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and _RFC3339_RE.fullmatch(value):
+        text = value[:-1] + "+00:00" if value[-1:] in {"Z", "z"} else value
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError("invalid RFC 3339 timestamp") from exc
+    else:
+        raise ValueError("RFC 3339 timestamp with timezone offset is required")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("RFC 3339 timezone offset is required")
+    return parsed.astimezone(timezone.utc)
+
+
+Rfc3339UtcDateTime = Annotated[datetime, BeforeValidator(_rfc3339_utc)]
 
 
 class PagedEnvelope(StrictSchema, Generic[PageT]):
@@ -276,6 +301,16 @@ class TelegramStatsPreferencesPatch(StrictSchema):
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{"byChannel": False}]})
 
 
+class RequestLogBillingData(StrictSchema):
+    costTicks: int = Field(ge=0)
+    actualCostTicks: int = Field(ge=0)
+    estimatedCostTicks: int = Field(ge=0)
+    actualCostedSuccess: int = Field(ge=0)
+    estimatedCostedSuccess: int = Field(ge=0)
+    costedSuccess: int = Field(ge=0)
+    unpricedSuccess: int = Field(ge=0)
+
+
 class RequestLogData(StrictSchema):
     id: str
     status: str
@@ -291,6 +326,7 @@ class RequestLogData(StrictSchema):
     inputTokens: int = Field(ge=0)
     outputTokens: int = Field(ge=0)
     costTicks: int = Field(ge=0)
+    billing: RequestLogBillingData
     error: str | None = None
     revision: str
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
@@ -298,7 +334,13 @@ class RequestLogData(StrictSchema):
         "apiKeyName": "client", "requestedModel": "example", "finalModel": "example",
         "channelId": "api:example", "protocol": "anthropic", "transport": "http",
         "retryCount": 0, "durationMilliseconds": 850, "inputTokens": 20,
-        "outputTokens": 30, "costTicks": 100, "error": None, "revision": "rev_example",
+        "outputTokens": 30, "costTicks": 100,
+        "billing": {
+            "costTicks": 100, "actualCostTicks": 100, "estimatedCostTicks": 0,
+            "actualCostedSuccess": 1, "estimatedCostedSuccess": 0,
+            "costedSuccess": 1, "unpricedSuccess": 0,
+        },
+        "error": None, "revision": "rev_example",
     }]})
 
 

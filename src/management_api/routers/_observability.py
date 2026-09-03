@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import RLock
 from typing import Iterable
 
 from fastapi import Request
@@ -26,6 +27,9 @@ from ..dependencies import ManagementRuntime, management_request_id
 from ..schemas import ManagementOperationData
 from ..schemas.observability import LogBodyPagedResponseMeta, PagedResponseMeta
 from ..schemas.operations import OperationErrorData, OperationProgressData
+
+
+_binding_lock = RLock()
 
 
 @dataclass(slots=True)
@@ -52,13 +56,21 @@ def controls(request: Request) -> ObservabilityControls:
         return current
     if not isinstance(runtime, ManagementRuntime):
         raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY, retryable=True)
-    current = ObservabilityControls(
-        stats=StatsControl(audit_sink=runtime.audit_sink),
-        retention=RetentionControl(audit_sink=runtime.audit_sink),
-    )
-    request.app.state.management_observability_controls = current
-    request.app.state.management_observability_controls_runtime = runtime
-    return current
+    with _binding_lock:
+        # Double-check after acquiring the process-wide bind lock.  Concurrent
+        # first requests for one runtime must never receive different retention
+        # plan stores, or a plan created by one request can disappear at commit.
+        current = getattr(request.app.state, "management_observability_controls", None)
+        owner = getattr(request.app.state, "management_observability_controls_runtime", None)
+        if isinstance(current, ObservabilityControls) and (owner is None or owner is runtime):
+            return current
+        current = ObservabilityControls(
+            stats=StatsControl(audit_sink=runtime.audit_sink),
+            retention=RetentionControl(audit_sink=runtime.audit_sink),
+        )
+        request.app.state.management_observability_controls = current
+        request.app.state.management_observability_controls_runtime = runtime
+        return current
 
 
 def meta(request: Request) -> dict[str, str]:

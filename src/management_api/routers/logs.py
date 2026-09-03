@@ -1,6 +1,5 @@
 """Request log list, detail and protected body endpoints."""
 
-from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path, Query, Request
@@ -14,6 +13,7 @@ from src.management_control.observability import (
     RequestLogSort,
     RequestLogStatus,
     RequestProtocol,
+    normalize_utc_range,
 )
 
 from ..dependencies import require_capability
@@ -25,6 +25,7 @@ from ..schemas.observability import (
     PagedEnvelope,
     RawLogBodyData,
     RequestLogData,
+    Rfc3339UtcDateTime,
     RequestLogDetailData,
     RequestLogFilterOptionsData,
 )
@@ -57,8 +58,8 @@ def list_request_logs(
     channel: Annotated[list[str] | None, Query()] = None,
     protocol: Annotated[list[RequestProtocol] | None, Query()] = None,
     query: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
-    started_at: Annotated[datetime | None, Query(alias="startedAt")] = None,
-    ended_at: Annotated[datetime | None, Query(alias="endedAt")] = None,
+    started_at: Annotated[Rfc3339UtcDateTime | None, Query(alias="startedAt")] = None,
+    ended_at: Annotated[Rfc3339UtcDateTime | None, Query(alias="endedAt")] = None,
     sort: Annotated[RequestLogSort, Query()] = RequestLogSort.CREATED_AT,
     descending: Annotated[bool, Query()] = True,
     page: Annotated[int, Query(ge=1)] = 1,
@@ -68,6 +69,7 @@ def list_request_logs(
         "status", "apiKey", "model", "channel", "protocol", "query",
         "startedAt", "endedAt", "sort", "descending", "page", "pageSize",
     ))
+    started_at, ended_at = normalize_utc_range(started_at, ended_at)
     result = controls(request).logs.list_logs(context, RequestLogQuery(
         statuses=tuple(status or ()), api_keys=tuple(api_key or ()),
         models=tuple(model or ()), channels=tuple(channel or ()),

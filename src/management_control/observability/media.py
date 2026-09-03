@@ -8,7 +8,7 @@ import hashlib
 import json
 import mimetypes
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from typing import Any, Iterator
@@ -18,7 +18,14 @@ from src import media_db as media_db_module
 from src.management_control.context import ManagementContext
 from src.management_control.errors import ManagementError, ManagementErrorCode
 
-from .common import PageResult, require, revision_for, sanitize_credentials, utc_datetime
+from .common import (
+    PageResult,
+    normalize_utc_range,
+    require,
+    revision_for,
+    sanitize_credentials,
+    utc_datetime,
+)
 
 
 class MediaStatus(str, Enum):
@@ -144,6 +151,8 @@ class MediaControl:
 
     def list_logs(self, context: ManagementContext, query: MediaLogQuery) -> PageResult[dict[str, Any]]:
         require(context)
+        started_at, ended_at = normalize_utc_range(query.started_at, query.ended_at)
+        query = replace(query, started_at=started_at, ended_at=ended_at)
         total_candidates = int(self.media_db.count())
         is_default = not (
             query.statuses or query.providers or query.models or query.actions
@@ -244,7 +253,7 @@ class MediaControl:
             row = self.media_db.get_log(int(media_log_id))
         except (TypeError, ValueError):
             row = None
-        if not row:
+        if not row or str(row.get("status") or "").strip().lower() == MediaStatus.EXPIRED.value:
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         out = []
         for index, path in enumerate(self._paths(row), 1):

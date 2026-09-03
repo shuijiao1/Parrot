@@ -1,6 +1,6 @@
 """Public P4 observability control surface shared by API and Telegram."""
 
-from .common import PageResult, telegram_context
+from .common import PageResult, normalize_utc_range, telegram_context
 from .logs import (
     BodySort,
     DEFAULT_LOGS_CONTROL,
@@ -48,6 +48,7 @@ __all__ = [
     "MediaLogQuery",
     "MediaSort",
     "MediaStatus",
+    "normalize_utc_range",
     "PageResult",
     "RequestLogQuery",
     "RequestLogSort",

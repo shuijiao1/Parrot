@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -177,3 +178,88 @@ def test_common_require_only_maps_real_capability_denials(monkeypatch):
     monkeypatch.setattr(observability_common, "authorize", programming_error)
     with pytest.raises(RuntimeError, match="policy implementation failed"):
         observability_common.require(context())
+
+
+@pytest.mark.parametrize("cooldown_until", [1_700_000_600_000, -1])
+def test_runtime_fastest_excludes_temporary_and_permanent_cooldown_pairs(cooldown_until):
+    class PairCooldown:
+        @staticmethod
+        def active_entries():
+            return [{
+                "channel_key": "api:one", "model": "cooled-model",
+                "error_count": 1, "cooldown_until": cooldown_until,
+            }]
+
+    class PairScorer:
+        @staticmethod
+        def snapshot():
+            return [
+                {
+                    "channel_key": "api:one", "model": "cooled-model",
+                    "recent_requests": 2, "recent_success_count": 2,
+                    "score": 1, "avg_first_byte_ms": 10,
+                },
+                {
+                    "channel_key": "api:one", "model": "available-model",
+                    "recent_requests": 2, "recent_success_count": 2,
+                    "score": 2, "avg_first_byte_ms": 20,
+                },
+            ]
+
+    control = StatusControl(
+        config=Config(), registry=Registry(), cooldown=PairCooldown(), scorer=PairScorer(),
+        affinity=Affinity(), concurrency=Limiter(), apikey_limiter=ApiLimiter(),
+        log_db=Logs(), oauth_manager=OAuth(), quota_errors=QuotaErrors(), state_db=State(),
+        status_monitor=StatusMonitor(), load_balancing=LoadBalancing(),
+    )
+
+    fastest = control.runtime_status(context())["fastestByFamily"]["anthropic"]
+
+    assert [item["model"] for item in fastest] == ["available-model"]
+
+
+def test_runtime_error_and_message_fields_are_secret_safe_and_preserve_business_text():
+    marker = "P4_SECRET_MARKER"
+
+    class SecretRegistry:
+        @staticmethod
+        def all_channels():
+            return [SimpleNamespace(
+                key="api:one", display_name="one", protocol="anthropic",
+                type="api", enabled=False,
+                disabled_reason=f"managementKey={marker}; ordinary disable reason",
+            )]
+
+    class SecretCooldown:
+        @staticmethod
+        def active_entries():
+            return [{
+                "channel_key": "api:one", "model": "model", "error_count": 1,
+                "cooldown_until": -1,
+                "message": f"botToken: {marker}; ordinary cooldown message",
+            }]
+
+    class SecretStatusMonitor:
+        snapshot_active = staticmethod(lambda: {
+            "error": f"github_token={marker}; ordinary alert message",
+        })
+
+    control = StatusControl(
+        config=Config(), registry=SecretRegistry(), cooldown=SecretCooldown(), scorer=Scorer(),
+        affinity=Affinity(), concurrency=Limiter(), apikey_limiter=ApiLimiter(),
+        log_db=Logs(), oauth_manager=OAuth(), quota_errors=QuotaErrors(), state_db=State(),
+        status_monitor=SecretStatusMonitor(), load_balancing=LoadBalancing(),
+        now=lambda: 1_700_000_000, service_started_at=1_699_999_900,
+    )
+
+    exposed = {
+        "overview": control.overview(context()),
+        "runtime": control.runtime_status(context()),
+        "cooldowns": list(control.cooldown_page(context(), page=1, page_size=10).items),
+    }
+    serialized = json.dumps(exposed, default=str)
+
+    assert marker not in serialized
+    assert "ordinary disable reason" in serialized
+    assert "ordinary cooldown message" in serialized
+    assert "ordinary alert message" in serialized

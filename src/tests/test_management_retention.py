@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
+from src.management_api.dependencies import ManagementRuntime
 from src.management_api.routers._observability import controls as resolve_controls
 from src.management_auth import AuthMethod, ManagementPrincipal
 from src.management_control import ManagementContext, ManagementError, ManagementErrorCode, OperationStore
@@ -379,3 +381,128 @@ def test_retention_expired_plan_fails_without_apply():
         control.cancel_plan(ctx, plan["id"])
     assert expired.value.code is ManagementErrorCode.STATE_CONFLICT
     assert db.apply_calls == []
+
+
+def test_runtime_lazy_binding_is_singleton_under_concurrent_first_requests(tmp_path):
+    client, runtime, _, _ = build_client(tmp_path, inject_controls=False)
+    barrier = threading.Barrier(2)
+
+    class RacingState:
+        def __init__(self, bound_runtime: ManagementRuntime):
+            self.management_runtime = bound_runtime
+            self._seen_threads = set()
+            self._seen_lock = threading.Lock()
+
+        def __getattr__(self, name):
+            if name == "management_observability_controls":
+                ident = threading.get_ident()
+                with self._seen_lock:
+                    first_access = ident not in self._seen_threads
+                    self._seen_threads.add(ident)
+                if first_access:
+                    barrier.wait(timeout=5)
+            raise AttributeError(name)
+
+    request = SimpleNamespace(app=SimpleNamespace(state=RacingState(runtime)))
+    resolved = []
+    failures = []
+
+    def bind():
+        try:
+            resolved.append(resolve_controls(request))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=bind) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not failures
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(resolved) == 2
+    assert resolved[0] is resolved[1]
+    assert request.app.state.management_observability_controls is resolved[0]
+    assert request.app.state.management_observability_controls_runtime is runtime
+    client.close()
+
+
+def test_retention_concurrent_equal_create_idempotency_converges_to_one_plan():
+    barrier = threading.Barrier(2)
+
+    class BarrierLogDb(FakeLogDb):
+        def __init__(self):
+            super().__init__()
+            self.scan_calls = []
+            self.scan_lock = threading.Lock()
+
+        def plan_retention(self, days):
+            with self.scan_lock:
+                self.scan_calls.append(days)
+            barrier.wait(timeout=5)
+            return super().plan_retention(days)
+
+    config = FakeConfig()
+    db = BarrierLogDb()
+    db.config = config
+    control = RetentionControl(log_db=db, config=config)
+    ctx = make_context(idempotency="concurrent-equal")
+    results = []
+    failures = []
+
+    def create():
+        try:
+            results.append(control.create_plan(ctx, days=30))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=create) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not failures
+    assert all(not thread.is_alive() for thread in threads)
+    assert db.scan_calls == [30, 30]
+    assert len({result["id"] for result in results}) == 1
+    assert len(control._plans) == 1
+
+
+def test_retention_concurrent_different_create_payload_conflicts_without_second_plan():
+    barrier = threading.Barrier(2)
+
+    class BarrierLogDb(FakeLogDb):
+        def plan_retention(self, days):
+            barrier.wait(timeout=5)
+            return super().plan_retention(days)
+
+    config = FakeConfig()
+    db = BarrierLogDb()
+    db.config = config
+    control = RetentionControl(log_db=db, config=config)
+    ctx = make_context(idempotency="concurrent-different")
+    results = []
+    failures = []
+
+    def create(days):
+        try:
+            results.append(control.create_plan(ctx, days=days))
+        except ManagementError as exc:
+            failures.append(exc)
+
+    threads = [
+        threading.Thread(target=create, args=(30,)),
+        threading.Thread(target=create, args=(60,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(results) == 1
+    assert len(failures) == 1
+    assert failures[0].code is ManagementErrorCode.RESOURCE_CONFLICT
+    assert len(control._plans) == 1
