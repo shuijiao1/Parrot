@@ -7,9 +7,11 @@
 import copy
 import json
 import os
+import secrets
 import shutil
 import tempfile
 import threading
+from urllib.parse import urlsplit
 from contextlib import contextmanager
 from typing import Any
 
@@ -443,6 +445,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "maxTokens": 50,
         "userMessage": "1+1=?",
     },
+    "management": {
+        # A missing key is generated once and persisted with the private config file.
+        # An explicitly empty/short value is never repaired silently: management
+        # initialization rejects it while the inference API remains available.
+        "managementKey": "",
+        "stateDbPath": "management-state.db",
+        "allowedOrigins": [],
+        "sessionIdleTimeoutSeconds": 3 * 24 * 60 * 60,
+        "sessionAbsoluteTimeoutSeconds": 30 * 24 * 60 * 60,
+        "sessionTouchIntervalSeconds": 5 * 60,
+        "telegramApprovalTtlSeconds": 3 * 60,
+        "authRateLimitWindowSeconds": 60,
+        "authRateLimitPerSource": 5,
+        "authRateLimitGlobal": 30,
+        "maxOperations": 500,
+        "maxAuditRecords": 5000,
+    },
     "telegram": {
         "botToken": "",
         "adminIds": [],
@@ -794,9 +813,92 @@ def _normalize_api_keys(cfg: dict) -> bool:
     return changed
 
 
+def _new_management_key() -> str:
+    """Return the documented fixed key format: ``pmk_`` + 64 URL-safe chars."""
+    return "pmk_" + secrets.token_urlsafe(48)
+
+
+def _normalize_management_config(cfg: dict, raw: dict | None = None) -> bool:
+    """Generate only a genuinely missing management key; preserve invalid input."""
+    raw = raw if isinstance(raw, dict) else {}
+    raw_management = raw.get("management")
+    raw_management = raw_management if isinstance(raw_management, dict) else {}
+    management = cfg.setdefault("management", {})
+    if not isinstance(management, dict):
+        return False
+    if "managementKey" not in raw_management:
+        management["managementKey"] = _new_management_key()
+        return True
+    return False
+
+
+def management_settings(cfg: dict | None = None) -> dict[str, Any]:
+    """Validate and resolve the additive management namespace for composition."""
+    source = cfg if cfg is not None else get()
+    management = source.get("management")
+    if not isinstance(management, dict):
+        raise ValueError("management configuration must be an object")
+    key = management.get("managementKey")
+    if not isinstance(key, str) or len(key.encode("utf-8")) < 48:
+        raise ValueError("management.managementKey must contain at least 48 bytes")
+
+    def integer(name: str, minimum: int, maximum: int) -> int:
+        value = management.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise ValueError(f"management.{name} is outside its allowed range")
+        return value
+
+    idle = integer("sessionIdleTimeoutSeconds", 60, 30 * 24 * 60 * 60)
+    absolute = integer("sessionAbsoluteTimeoutSeconds", idle, 365 * 24 * 60 * 60)
+    touch = integer("sessionTouchIntervalSeconds", 0, idle)
+    approval_ttl = integer("telegramApprovalTtlSeconds", 30, 10 * 60)
+    rate_window = integer("authRateLimitWindowSeconds", 1, 60 * 60)
+    rate_source = integer("authRateLimitPerSource", 1, 10_000)
+    rate_global = integer("authRateLimitGlobal", rate_source, 100_000)
+    max_operations = integer("maxOperations", 1, 100_000)
+    max_audit = integer("maxAuditRecords", 1, 1_000_000)
+
+    origins = management.get("allowedOrigins")
+    if not isinstance(origins, list) or any(not isinstance(item, str) for item in origins):
+        raise ValueError("management.allowedOrigins must be a string array")
+    clean_origins: list[str] = []
+    for origin in origins:
+        parsed = urlsplit(origin)
+        if (
+            origin == "*"
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("management.allowedOrigins contains an invalid origin")
+        clean_origins.append(f"{parsed.scheme}://{parsed.netloc}")
+
+    configured_path = management.get("stateDbPath")
+    if not isinstance(configured_path, str) or not configured_path.strip():
+        raise ValueError("management.stateDbPath must not be empty")
+    state_path = configured_path if os.path.isabs(configured_path) else os.path.join(DATA_DIR, configured_path)
+    return {
+        "managementKey": key,
+        "stateDbPath": os.path.abspath(state_path),
+        "allowedOrigins": tuple(clean_origins),
+        "sessionIdleTimeoutSeconds": idle,
+        "sessionAbsoluteTimeoutSeconds": absolute,
+        "sessionTouchIntervalSeconds": touch,
+        "telegramApprovalTtlSeconds": approval_ttl,
+        "authRateLimitWindowSeconds": rate_window,
+        "authRateLimitPerSource": rate_source,
+        "authRateLimitGlobal": rate_global,
+        "maxOperations": max_operations,
+        "maxAuditRecords": max_audit,
+    }
+
+
 def _load_from_disk() -> dict:
     if not os.path.exists(CONFIG_PATH):
         initial = copy.deepcopy(DEFAULT_CONFIG)
+        _normalize_management_config(initial, {})
         _write_atomic(initial)
         return initial
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -809,6 +911,9 @@ def _load_from_disk() -> dict:
     changed = merged != raw
     if changed:
         print("[config] backfilled missing config defaults")
+    if _normalize_management_config(merged, raw):
+        changed = True
+        print("[config] generated missing management credential")
     if _normalize_api_keys(merged):
         changed = True
         print("[config] upgraded legacy apiKeys to new structure")

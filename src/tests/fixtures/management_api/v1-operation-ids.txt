@@ -1,0 +1,9 @@
+cancelManagementOperation
+createManagementSession
+createTelegramApproval
+getCurrentManagementSession
+getManagementCapabilities
+getManagementMetadata
+getManagementOperation
+getTelegramApproval
+revokeCurrentManagementSession

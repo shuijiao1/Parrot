@@ -17,7 +17,7 @@ from __future__ import annotations
 import threading
 import time
 import traceback
-from typing import Optional
+from typing import Callable, Optional
 
 from . import menu_cache, states, ui
 from .menus import (
@@ -33,6 +33,40 @@ from .menus import main as main_menu
 _offset = 0
 _thread: Optional[threading.Thread] = None
 _running = False
+_management_approval_handler: Optional[Callable[[str, int, bool], str]] = None
+
+
+def configure_management_approval_handler(
+    handler: Optional[Callable[[str, int, bool], str]],
+) -> None:
+    """Install the isolated ``mauth:`` callback bridge owned by composition."""
+    global _management_approval_handler
+    _management_approval_handler = handler
+
+
+def send_management_approval(admin_ids: tuple[int, ...], notification) -> bool:
+    """Render the only new TG surface without exposing browser credentials."""
+    device = notification.device_summary or "未提供"
+    text = (
+        "🔐 <b>Management 登录批准</b>\n\n"
+        f"客户端：<code>{ui.escape_html(notification.client_name)}</code>\n"
+        f"来源：<code>{ui.escape_html(notification.source_address)}</code>\n"
+        f"设备：<code>{ui.escape_html(device)}</code>\n"
+        f"请求时间：<code>{notification.requested_at.isoformat()}</code>\n"
+        f"过期时间：<code>{notification.expires_at.isoformat()}</code>"
+    )
+    keyboard = ui.inline_kb(
+        [[
+            ui.btn("✅ 批准", notification.approve_callback),
+            ui.btn("❌ 拒绝", notification.deny_callback),
+        ]]
+    )
+    sent_all = True
+    for admin_id in admin_ids:
+        result = ui.send(admin_id, text, reply_markup=keyboard)
+        if not isinstance(result, dict) or not result.get("ok"):
+            sent_all = False
+    return sent_all
 
 
 def _summarize_text(text: str) -> str:
@@ -223,6 +257,32 @@ def _handle_callback(cb: dict) -> None:
     cb_id = cb["id"]
     data = cb.get("data", "") or ""
     print(f"[tg] cb from {chat_id}: data={data!r}")    # DEBUG
+
+    # Management login approvals are deliberately isolated from all legacy menu
+    # dispatch and authorization.  The service validates callback_query.from.id
+    # against the current non-empty configured admin allow-list.
+    if data.startswith("mauth:"):
+        parts = data.split(":", 2)
+        actor_id = (cb.get("from") or {}).get("id")
+        if len(parts) != 3 or parts[1] not in {"a", "d"} or actor_id is None:
+            ui.answer_cb(cb_id, "无效的登录批准请求", show_alert=True)
+            return
+        if _management_approval_handler is None:
+            ui.answer_cb(cb_id, "Management 登录暂不可用", show_alert=True)
+            return
+        try:
+            result = _management_approval_handler(parts[2], int(actor_id), parts[1] == "a")
+        except Exception:
+            ui.answer_cb(cb_id, "登录批准失败或已失效", show_alert=True)
+            return
+        messages = {
+            "approved": "✅ 已批准登录",
+            "denied": "❌ 已拒绝登录",
+            "expired": "登录批准已过期",
+            "consumed": "登录批准已使用",
+        }
+        ui.answer_cb(cb_id, messages.get(result, "登录批准状态未变更"), show_alert=True)
+        return
 
     if not ui.is_admin(chat_id):
         ui.answer_cb(cb_id, "⛔ 无权限")

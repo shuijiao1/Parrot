@@ -43,6 +43,14 @@ from src.channel import registry
 from src.client_ip import get_client_ip
 from datetime import datetime, timezone
 from src.telegram import bot as tgbot
+from src.management_api import (
+    ManagementOriginMiddleware,
+    ManagementRuntime,
+    create_management_router,
+    install_management_error_handlers,
+)
+from src.management_auth import ApprovalService, ManagementStateStore, SessionPolicy, SessionService
+from src.management_control import OperationRegistry, OperationStore, StoreAuditSink
 from src.protocols import errors as protocol_errors
 from src.openai.codex_constants import codex_cli_version
 from src.transform.cc_mimicry import (
@@ -85,6 +93,115 @@ async def _throttled_notify(alert_key: str, text: str) -> None:
 # ─── 后台循环 ─────────────────────────────────────────────────────
 
 _background_tasks: list[asyncio.Task] = []
+
+
+class _TelegramApprovalNotifier:
+    def send(self, admin_ids, notification) -> bool:
+        return tgbot.send_management_approval(admin_ids, notification)
+
+
+def _management_admin_ids() -> tuple[int, ...]:
+    telegram = config.get().get("telegram") or {}
+    values = telegram.get("adminIds") or [] if isinstance(telegram, dict) else []
+    admins: list[int] = []
+    for value in values:
+        try:
+            admins.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return tuple(admins)
+
+
+def _management_telegram_configured() -> bool:
+    telegram = config.get().get("telegram") or {}
+    return isinstance(telegram, dict) and bool(telegram.get("botToken"))
+
+
+def _initialize_management_runtime(app: FastAPI) -> ManagementRuntime | None:
+    """Build the isolated management plane; any local failure stays fail closed."""
+    store = None
+    try:
+        settings = config.management_settings()
+        store = ManagementStateStore(
+            settings["stateDbPath"],
+            clock=time.time,
+            max_audit_records=settings["maxAuditRecords"],
+        )
+        audit_sink = StoreAuditSink(store)
+        operations = OperationStore(
+            max_operations=settings["maxOperations"],
+            audit_sink=audit_sink,
+        )
+        sessions = SessionService(
+            store,
+            management_key=settings["managementKey"],
+            policy=SessionPolicy(
+                idle_timeout_seconds=settings["sessionIdleTimeoutSeconds"],
+                absolute_timeout_seconds=settings["sessionAbsoluteTimeoutSeconds"],
+                touch_interval_seconds=settings["sessionTouchIntervalSeconds"],
+            ),
+            clock=time.time,
+            rate_limit_window_seconds=settings["authRateLimitWindowSeconds"],
+            rate_limit_per_source=settings["authRateLimitPerSource"],
+            rate_limit_global=settings["authRateLimitGlobal"],
+        )
+        approvals = ApprovalService(
+            store,
+            clock=time.time,
+            ttl_seconds=settings["telegramApprovalTtlSeconds"],
+            admin_ids_provider=_management_admin_ids,
+            telegram_configured_provider=_management_telegram_configured,
+            notifier=_TelegramApprovalNotifier(),
+            rate_limit_window_seconds=settings["authRateLimitWindowSeconds"],
+            rate_limit_per_source=settings["authRateLimitPerSource"],
+            rate_limit_global=settings["authRateLimitGlobal"],
+        )
+        runtime = ManagementRuntime(
+            sessions=sessions,
+            approvals=approvals,
+            operations=operations,
+            operation_registry=OperationRegistry(operations),
+            audit_sink=audit_sink,
+            state_store=store,
+            allowed_origins=frozenset(settings["allowedOrigins"]),
+            application_version=__version__,
+            documentation_url="/docs/13-management-control-api-refactor.md",
+        )
+        app.state.management_runtime = runtime
+
+        def decide(approval_id: str, telegram_user_id: int, approved: bool) -> str:
+            return runtime.approvals.decide(
+                approval_id,
+                telegram_user_id=telegram_user_id,
+                approved=approved,
+            ).value
+
+        tgbot.configure_management_approval_handler(decide)
+        print("[management] control plane ready")
+        return runtime
+    except Exception as exc:
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+        app.state.management_runtime = None
+        tgbot.configure_management_approval_handler(None)
+        # Exception text can contain a configured path or credential; type is enough.
+        print(f"[management] initialization failed closed ({type(exc).__name__})")
+        return None
+
+
+def _close_management_runtime(app: FastAPI) -> None:
+    runtime = getattr(app.state, "management_runtime", None)
+    app.state.management_runtime = None
+    tgbot.configure_management_approval_handler(None)
+    if not isinstance(runtime, ManagementRuntime):
+        return
+    try:
+        runtime.close()
+    except Exception as exc:
+        print(f"[management] shutdown failed ({type(exc).__name__})")
 
 
 async def _wal_checkpoint_loop():
@@ -169,6 +286,9 @@ async def lifespan(app: FastAPI):
     log_db.init()
     image_db.init()
     translation.init()
+    # Management state is isolated from inference state; failure leaves the
+    # mounted management router in explicit SERVICE_NOT_READY mode.
+    _initialize_management_runtime(app)
     await asyncio.to_thread(log_db.cleanup_stale_pending, 1800)
     # 手工编辑 config 后重启的按天留存策略也应尽快收敛；默认永久保留时只做
     # 一个轻量判断，不会触碰任何日志数据。
@@ -347,6 +467,7 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(*_background_tasks, return_exceptions=True)
         await apikey_limiter.shutdown_spooling()
         tgbot.stop()
+        _close_management_runtime(app)
         # Provider workers may mutate state; stop them before the final snapshot.
         await provider_usage.stop()
         await upstream.close_client()
@@ -355,6 +476,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.state.management_runtime = None
+app.include_router(create_management_router())
+install_management_error_handlers(app)
 
 app.add_middleware(
     CORSMiddleware,
@@ -616,6 +740,9 @@ class _DrainHttpMiddleware:
 
 
 app.add_middleware(_DrainHttpMiddleware)
+# Added last so it rejects management browser origins before wildcard inference
+# CORS and before request-body/concurrency middleware can consume the request.
+app.add_middleware(ManagementOriginMiddleware)
 
 
 def _model_never_supported(model: str) -> bool:
