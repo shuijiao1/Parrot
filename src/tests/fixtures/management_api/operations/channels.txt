@@ -1,0 +1,17 @@
+clearAllChannelAffinity
+clearAllChannelErrors
+clearChannelAffinity
+clearChannelErrors
+createChannel
+deleteChannel
+discoverChannelModels
+getChannel
+getChannelCatalog
+getChannelCompatibility
+listChannels
+probeChannelDraft
+probeExistingChannel
+refreshChannelProviderUsage
+reorderChannels
+updateChannel
+updateChannelCompatibility

@@ -1,0 +1,344 @@
+"""Strict camelCase schemas for the Channels Management API."""
+
+from __future__ import annotations
+
+from typing import Annotated, Literal, Union
+
+from pydantic import Field, SecretStr, model_validator
+
+from src.management_control.channels import (
+    ChannelHealth,
+    ChannelProtocol,
+    CompatibilityMode,
+)
+
+from .base import DataEnvelope, ResponseMeta, StrictSchema
+from .operations import ManagementOperationData
+
+
+class ChannelModelInput(StrictSchema):
+    real: str = Field(min_length=1, max_length=256)
+    alias: str = Field(min_length=1, max_length=256)
+
+
+class CompatibilityFeatureInput(StrictSchema):
+    mode: CompatibilityMode = CompatibilityMode.AUTO
+    models: list[str] = Field(default_factory=list, max_length=2000)
+
+
+class ChannelCompatibilityInput(StrictSchema):
+    context1m: CompatibilityFeatureInput = Field(default_factory=CompatibilityFeatureInput)
+    fast: CompatibilityFeatureInput = Field(default_factory=CompatibilityFeatureInput)
+
+
+class _ChannelCreateBase(StrictSchema):
+    name: str = Field(min_length=1, max_length=64)
+    apiKey: SecretStr = Field(
+        min_length=5,
+        max_length=4096,
+        json_schema_extra={"writeOnly": True},
+    )
+    protocol: ChannelProtocol
+    models: list[ChannelModelInput] = Field(min_length=1, max_length=2000)
+    maxConcurrent: int = Field(default=0, ge=0, le=100000)
+    compatibility: ChannelCompatibilityInput = Field(default_factory=ChannelCompatibilityInput)
+    ccMimicry: bool | None = None
+    omitTemperature: bool = False
+    omitThinking: bool = False
+    enabled: bool = True
+
+
+class ManualChannelCreateRequest(_ChannelCreateBase):
+    mode: Literal["manual"]
+    baseUrl: str = Field(min_length=8, max_length=4096)
+    apiPath: str | None = Field(default=None, max_length=4096)
+
+
+class PresetChannelCreateRequest(_ChannelCreateBase):
+    mode: Literal["preset"]
+    providerId: str = Field(min_length=1, max_length=120)
+    providerPresetId: str = Field(min_length=1, max_length=120)
+
+
+ChannelCreateRequest = Annotated[
+    Union[ManualChannelCreateRequest, PresetChannelCreateRequest],
+    Field(discriminator="mode"),
+]
+
+
+class ChannelUpdateRequest(StrictSchema):
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    baseUrl: str | None = Field(default=None, min_length=8, max_length=4096)
+    apiPath: str | None = Field(default=None, max_length=4096)
+    apiKey: SecretStr | None = Field(
+        default=None,
+        min_length=5,
+        max_length=4096,
+        json_schema_extra={"writeOnly": True},
+    )
+    protocol: ChannelProtocol | None = None
+    models: list[ChannelModelInput] | None = Field(default=None, min_length=1, max_length=2000)
+    maxConcurrent: int | None = Field(default=None, ge=0, le=100000)
+    compatibility: ChannelCompatibilityInput | None = None
+    ccMimicry: bool | None = None
+    omitTemperature: bool | None = None
+    omitThinking: bool | None = None
+    enabled: bool | None = None
+    providerId: str | None = Field(default=None, max_length=120)
+    providerPresetId: str | None = Field(default=None, max_length=120)
+
+    @model_validator(mode="after")
+    def require_patch(self):
+        if not self.model_fields_set:
+            raise ValueError("at least one channel field is required")
+        return self
+
+
+class ChannelModelData(StrictSchema):
+    real: str
+    alias: str
+
+
+class CompatibilityFeatureData(StrictSchema):
+    mode: CompatibilityMode
+    models: list[str]
+    allModels: bool
+
+
+class ChannelCompatibilityData(StrictSchema):
+    revision: str
+    context1m: CompatibilityFeatureData
+    fast: CompatibilityFeatureData
+
+
+class ProviderUsageMetricData(StrictSchema):
+    id: str | None = None
+    label: str
+    kind: str | None = None
+    group: str | None = None
+    unit: str | None = None
+    currency: str | None = None
+    value: str | None = None
+    used: str | None = None
+    total: str | None = None
+    remaining: str | None = None
+    usedPercent: float | None = None
+    resetAt: str | None = None
+    resetInSeconds: float | None = None
+    status: str | None = None
+    startAt: str | None = None
+    endAt: str | None = None
+    distributionTotal: str | None = None
+
+
+class ProviderUsageSnapshotData(StrictSchema):
+    version: int
+    source: str
+    balances: list[ProviderUsageMetricData]
+    windows: list[ProviderUsageMetricData]
+    counters: list[ProviderUsageMetricData]
+    notices: list[str]
+    partial: bool
+
+
+class ProviderUsageData(StrictSchema):
+    supported: bool
+    status: str
+    stale: bool
+    partial: bool
+    source: str | None = None
+    fetchedAt: int | None = None
+    error: str | None = None
+    errorAt: int | None = None
+    snapshot: ProviderUsageSnapshotData | None = None
+
+
+class ChannelRuntimeModelData(StrictSchema):
+    real: str
+    alias: str
+    recentRequests: int
+    recentSuccessRate: float | None = None
+    totalRequests: int
+    averageConnectMilliseconds: float | None = None
+    averageFirstByteMilliseconds: float | None = None
+    score: float | None = None
+    cooldownUntil: int | None = None
+    cooldownKind: Literal["permanent", "quota", "temporary"] | None = None
+    errorCount: int
+
+
+class ChannelData(StrictSchema):
+    id: str
+    revision: str
+    name: str
+    baseUrl: str
+    apiPath: str | None = None
+    url: str
+    apiKeyConfigured: bool
+    apiKeyMaskedHint: str | None = None
+    protocol: ChannelProtocol
+    providerId: str | None = None
+    providerPresetId: str | None = None
+    models: list[ChannelModelData]
+    modelCount: int
+    enabled: bool
+    disabledReason: str | None = None
+    maxConcurrent: int
+    ccMimicry: bool
+    omitTemperature: bool
+    omitThinking: bool
+    compatibility: ChannelCompatibilityData
+    health: ChannelHealth
+    recentSuccessRate: float | None = None
+    cooldownCount: int
+    affinityCount: int
+    clientAffinityCount: int
+    providerUsage: ProviderUsageData
+
+
+class ChannelMonthStatsData(StrictSchema):
+    total: int
+    successCount: int
+    errorCount: int
+    inputTokens: int
+    outputTokens: int
+    cacheCreationTokens: int
+    cacheReadTokens: int
+    averageTokensPerSecond: float | None = None
+    maximumTokensPerSecond: float | None = None
+    minimumTokensPerSecond: float | None = None
+    cost: str | None = None
+
+
+class ChannelModelStatsData(StrictSchema):
+    finalModel: str
+    total: int
+    successCount: int
+    errorCount: int
+    inputTokens: int
+    outputTokens: int
+    cacheCreationTokens: int
+    cacheReadTokens: int
+    averageTokensPerSecond: float | None = None
+    maximumTokensPerSecond: float | None = None
+    minimumTokensPerSecond: float | None = None
+    costTicks: int
+    actualCostTicks: int
+    estimatedCostTicks: int
+    actualCostedSuccess: int
+    estimatedCostedSuccess: int
+    costedSuccess: int
+    unpricedSuccess: int
+
+
+class ChannelDetailData(ChannelData):
+    monthStats: ChannelMonthStatsData
+    modelStats: list[ChannelModelStatsData]
+    runtimeModels: list[ChannelRuntimeModelData]
+
+
+class ChannelPageMeta(ResponseMeta):
+    page: int
+    pageSize: int
+    total: int
+    hasNext: bool
+    orderRevision: str
+
+
+class ChannelListEnvelope(StrictSchema):
+    data: list[ChannelData]
+    meta: ChannelPageMeta
+
+
+class ChannelOrderRequest(StrictSchema):
+    channelIds: list[str] = Field(max_length=10000)
+
+
+class ChannelOrderData(StrictSchema):
+    revision: str
+    channelIds: list[str]
+
+
+class ActionResultData(StrictSchema):
+    affected: int
+    queued: bool | None = None
+
+
+class ProbeExistingRequest(StrictSchema):
+    model: str = Field(min_length=1, max_length=256)
+
+
+class ProbeDraftRequest(StrictSchema):
+    name: str = Field(default="management-draft", min_length=1, max_length=64)
+    baseUrl: str = Field(min_length=8, max_length=4096)
+    apiPath: str | None = Field(default=None, max_length=4096)
+    apiKey: SecretStr = Field(
+        min_length=5, max_length=4096, json_schema_extra={"writeOnly": True}
+    )
+    protocol: ChannelProtocol
+    model: str = Field(min_length=1, max_length=256)
+    providerId: str | None = Field(default=None, max_length=120)
+    providerPresetId: str | None = Field(default=None, max_length=120)
+    ccMimicry: bool | None = None
+
+
+class ExistingChannelDiscoveryRequest(StrictSchema):
+    source: Literal["existing"]
+    channelId: str = Field(min_length=5, max_length=256)
+
+
+class DraftChannelDiscoveryRequest(StrictSchema):
+    source: Literal["draft"]
+    baseUrl: str = Field(min_length=8, max_length=4096)
+    apiPath: str | None = Field(default=None, max_length=4096)
+    apiKey: SecretStr = Field(
+        min_length=5, max_length=4096, json_schema_extra={"writeOnly": True}
+    )
+    protocol: ChannelProtocol
+    providerId: str | None = Field(default=None, max_length=120)
+    providerPresetId: str | None = Field(default=None, max_length=120)
+
+
+ChannelDiscoveryRequest = Annotated[
+    Union[ExistingChannelDiscoveryRequest, DraftChannelDiscoveryRequest],
+    Field(discriminator="source"),
+]
+
+
+class CatalogProtocolEndpointData(StrictSchema):
+    protocol: ChannelProtocol
+    endpoint: str
+
+
+class ChannelPresetData(StrictSchema):
+    id: str
+    name: str
+    modelsUrlConfigured: bool
+    modelDiscoveryAuth: str
+    modelDiscoveryParser: str
+    protocols: list[CatalogProtocolEndpointData]
+    staticModels: list[str]
+    ccMimicry: bool
+    providerUsageSupported: bool
+
+
+class ChannelProviderData(StrictSchema):
+    id: str
+    name: str
+    presets: list[ChannelPresetData]
+
+
+class ChannelCatalogData(StrictSchema):
+    providers: list[ChannelProviderData]
+    protocols: list[ChannelProtocol]
+    compatibilityModes: list[CompatibilityMode]
+    features: list[str]
+
+
+ChannelEnvelope = DataEnvelope[ChannelData]
+ChannelDetailEnvelope = DataEnvelope[ChannelDetailData]
+ChannelCompatibilityEnvelope = DataEnvelope[ChannelCompatibilityData]
+ChannelOrderEnvelope = DataEnvelope[ChannelOrderData]
+ChannelCatalogEnvelope = DataEnvelope[ChannelCatalogData]
+ChannelActionEnvelope = DataEnvelope[ActionResultData]
+ChannelOperationEnvelope = DataEnvelope[ManagementOperationData]

@@ -28,14 +28,23 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
-from ... import affinity, channel_state, config, cooldown, load_balancing, log_db, probe, provider_usage, quota_errors, scorer, state_db
-from ...channel import api_channel, registry
-from ...channel.compatibility import FORCE_MODE, normalize_mode, normalize_models
-from ...channel.url_utils import (
-    detect_suffix_protocol,
-    split_base_url,
-    validate_api_path_for_protocol,
+from ...management_auth import AuthMethod, ManagementPrincipal
+from ...management_control import ManagementContext, ManagementError
+from ...management_control.channels import (
+    ChannelCompatibility,
+    ChannelControl,
+    ChannelHealth,
+    ChannelCreateCommand,
+    ChannelListQuery,
+    ChannelModel,
+    ChannelProtocol,
+    ChannelUpdateCommand,
+    CompatibilityFeature,
+    CompatibilityMode,
+    DraftProbeCommand,
+    ProbeResult,
 )
+from ...management_control.channels import service as _channel_service
 from .. import menu_cache, states, ui
 from . import main as main_menu
 
@@ -48,6 +57,133 @@ PROTOCOL_CHOICES: list[tuple[str, str]] = [
 ]
 
 _PROTOCOL_LABEL = {p: label for p, label in PROTOCOL_CHOICES}
+FORCE_MODE = "force"
+_CONTROL = ChannelControl()
+# Frozen TG harness compatibility; production paths below still call only _CONTROL.
+provider_usage = _channel_service.provider_usage
+probe = _channel_service.probe
+_TG_PRINCIPAL = ManagementPrincipal.administrator(
+    subject_id="telegram:channel-menu",
+    auth_method=AuthMethod.TELEGRAM_ADMIN,
+)
+
+
+def _ctx(chat_id: int = 0) -> ManagementContext:
+    return ManagementContext(
+        request_id=f"telegram:channel:{chat_id}",
+        actor=_TG_PRINCIPAL,
+    )
+
+
+def _all_channels(chat_id: int = 0):
+    return list(_CONTROL.list_all(_ctx(chat_id)))
+
+
+def _get_channel(name: str | None, chat_id: int = 0):
+    if not name:
+        return None
+    try:
+        return _CONTROL.get_channel(_ctx(chat_id), f"api:{name}")
+    except ManagementError:
+        return None
+
+
+def _normalized_mode(value: Any) -> str:
+    raw = str(value or "auto").strip().lower()
+    return raw if raw in {"auto", "force"} else "auto"
+
+
+def _normalized_models(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return list(dict.fromkeys(str(item or "").strip() for item in value if str(item or "").strip()))
+
+
+def _usage_raw(ch) -> dict:
+    view = getattr(ch, "provider_usage", None)
+    if view is None:  # Compatibility for formatter tests that pass a domain-shaped stub.
+        view = _CONTROL._usage(ch)
+    return {
+        "status": view.status,
+        "snapshot": view.snapshot,
+        "source": view.source,
+        "fetched_at": view.fetched_at,
+        "stale": view.stale,
+        "partial": view.partial,
+        "unsupported": not view.supported,
+        "error": view.error,
+        "error_at": view.error_at,
+    }
+
+
+def _control_update(name: str, patch: dict, chat_id: int = 0):
+    kwargs: dict[str, Any] = {}
+    direct = {
+        "name": "name", "baseUrl": "base_url", "apiKey": "api_key",
+        "maxConcurrent": "max_concurrent", "cc_mimicry": "cc_mimicry",
+        "omitTemperature": "omit_temperature", "omitThinking": "omit_thinking",
+        "enabled": "enabled", "apiPath": "api_path", "providerId": "provider_id",
+        "providerPresetId": "provider_preset_id",
+    }
+    for key, target in direct.items():
+        if key in patch:
+            kwargs[target] = patch[key]
+    if "protocol" in patch:
+        kwargs["protocol"] = ChannelProtocol(patch["protocol"])
+    if "models" in patch:
+        kwargs["models"] = tuple(
+            ChannelModel(real=str(item.get("real") or ""), alias=str(item.get("alias") or item.get("real") or ""))
+            for item in patch["models"]
+        )
+    compatibility_keys = {
+        "context1mMode", "context1mModels", "fastMode", "fastModels",
+    }
+    if compatibility_keys.intersection(patch):
+        current = _CONTROL.get_channel(_ctx(chat_id), f"api:{name}").compatibility
+        kwargs["compatibility"] = ChannelCompatibility(
+            context_1m=CompatibilityFeature(
+                mode=CompatibilityMode(patch.get("context1mMode", current.context_1m.mode)),
+                models=tuple(patch.get("context1mModels", current.context_1m.models)),
+            ),
+            fast=CompatibilityFeature(
+                mode=CompatibilityMode(patch.get("fastMode", current.fast.mode)),
+                models=tuple(patch.get("fastModels", current.fast.models)),
+            ),
+        )
+    try:
+        return _CONTROL.update_channel(
+            _ctx(chat_id), f"api:{name}", ChannelUpdateCommand(**kwargs)
+        )
+    except ManagementError as exc:
+        if exc.code.value == "RESOURCE_NOT_FOUND":
+            raise KeyError(f"channel not found: {name}") from exc
+        raise
+
+
+def _parse_models_for_tg(raw: str) -> list[dict[str, str]]:
+    return [dict(model) for model in _CONTROL.parse_models_input(raw)]
+
+
+def _parse_url_for_tg(raw: str) -> tuple[str, str | None, str | None]:
+    parsed = _CONTROL.parse_url(raw)
+    protocol = parsed.detected_protocol.value if parsed.detected_protocol else None
+    return parsed.base_url, parsed.api_path, protocol
+
+
+def _create_command(data: dict, results: dict | None = None) -> ChannelCreateCommand:
+    protocol = ChannelProtocol(data.get("protocol") or "anthropic")
+    probes = {
+        model: ProbeResult(bool(value[0]), int(value[1]), value[2], False, False)
+        for model, value in (results or {}).items()
+    }
+    return ChannelCreateCommand(
+        name=data["name"], base_url=data["baseUrl"], api_path=data.get("apiPath"),
+        api_key=data["apiKey"], protocol=protocol,
+        models=tuple(ChannelModel(real=item["real"], alias=item["alias"]) for item in data["models"]),
+        cc_mimicry=bool(data.get("cc_mimicry", protocol is ChannelProtocol.ANTHROPIC)),
+        provider_id=data.get("providerId"), provider_preset_id=data.get("providerPresetId"),
+        enabled=True, initial_probe_results=probes,
+    )
 _PROTOCOL_FAMILY = {
     "anthropic": "anthropic",
     "openai-chat": "openai",
@@ -96,7 +232,8 @@ def _protocol_button(protocol: str, callback_data: str, *, prefix: str = "") -> 
 
 
 def _protocol_of(ch) -> str:
-    return getattr(ch, "protocol", "anthropic")
+    value = getattr(ch, "protocol", "anthropic")
+    return value.value if isinstance(value, ChannelProtocol) else str(value)
 
 
 _COMPAT_FEATURES = {
@@ -120,8 +257,8 @@ _COMPAT_FEATURES = {
 def _compat_feature_values(ch, feature: str) -> tuple[str, list[str]]:
     spec = _COMPAT_FEATURES[feature]
     return (
-        normalize_mode(getattr(ch, spec["mode_attr"], "auto")),
-        normalize_models(getattr(ch, spec["models_attr"], [])),
+        _normalized_mode(getattr(ch, spec["mode_attr"], "auto")),
+        _normalized_models(getattr(ch, spec["models_attr"], [])),
     )
 
 
@@ -224,34 +361,18 @@ def _spawn_async_task(coro_factory, name: str = "tg-task") -> None:
 
 def _channel_health(ch) -> tuple[str, str]:
     """返回 (icon, short_status_text)。"""
-    if not ch.enabled:
+    if not hasattr(ch, "health"):
+        ch = _CONTROL.get_channel(_ctx(), getattr(ch, "key", ""))
+    health = ch.health
+    if health is ChannelHealth.DISABLED:
         return "⬛", "已禁用"
-
-    key = ch.key
-    # 冷却中？
-    cd_entries = cooldown.active_entries()
-    perm = [e for e in cd_entries if e["channel_key"] == key and e["cooldown_until"] == -1]
-    temp = [e for e in cd_entries if e["channel_key"] == key and e["cooldown_until"] != -1]
-    quota_temp = [e for e in temp if quota_errors.active_quota_cooldown(e)]
-    if perm:
-        return "🔴", f"永久冷却 ({len(perm)}模型)"
-    if temp and len(quota_temp) == len(temp):
-        return "🟠", f"配额冷却 ({len(temp)}模型)"
-    if temp:
-        return "🟠", f"冷却中 ({len(temp)}模型)"
-
-    # 看最近成功率
-    worst = None
-    for stat in scorer.snapshot():
-        if stat["channel_key"] != key:
-            continue
-        recent = stat["recent_requests"]
-        if recent <= 0:
-            continue
-        rate = (stat["recent_success_count"] / recent) * 100
-        if worst is None or rate < worst:
-            worst = rate
-
+    if health is ChannelHealth.PERMANENT_COOLDOWN:
+        return "🔴", f"永久冷却 ({ch.cooldown_count}模型)"
+    if health is ChannelHealth.QUOTA_COOLDOWN:
+        return "🟠", f"配额冷却 ({ch.cooldown_count}模型)"
+    if health is ChannelHealth.COOLDOWN:
+        return "🟠", f"冷却中 ({ch.cooldown_count}模型)"
+    worst = ch.recent_success_rate
     if worst is None:
         return "⚪", "暂无数据"
     if worst >= 80:
@@ -402,9 +523,9 @@ def _status_text(status: str | None, *, has_snapshot: bool = False) -> str | Non
 
 
 def _usage_summary(ch) -> str | None:
-    if provider_usage.spec_for(ch) is None:
+    view = _usage_raw(ch)
+    if view["unsupported"]:
         return None
-    view = provider_usage.cached(ch)
     status, snap = view.get("status"), view.get("snapshot") or {}
     if not snap:
         return _status_text(status) or "上游用量尚未获取"
@@ -444,9 +565,9 @@ def _usage_summary(ch) -> str | None:
 
 
 def _usage_detail_lines(ch) -> list[str]:
-    if provider_usage.spec_for(ch) is None:
+    view = _usage_raw(ch)
+    if view["unsupported"]:
         return ["<b>☁️ 上游账户额度</b>", "当前 Provider/Preset 暂不支持只读查询。"]
-    view = provider_usage.cached(ch)
     status, snap = view.get("status"), view.get("snapshot") or {}
     lines = ["<b>☁️ 上游账户额度</b>"]
     warning = _status_text(status, has_snapshot=True)
@@ -514,7 +635,10 @@ def _usage_detail_lines(ch) -> list[str]:
 
 def _schedule_usage(channels: list[Any], *, force: bool = False) -> None:
     for ch in channels:
-        provider_usage.schedule_refresh(ch, force=force)
+        try:
+            _CONTROL.schedule_provider_usage_hint(_ctx(), ch.id, force=force)
+        except ManagementError:
+            pass
 
 
 # ─── 渠道列表 ─────────────────────────────────────────────────────
@@ -606,7 +730,7 @@ def _callback_payload(short: str, page: int) -> str:
 
 def _list_text_and_kb(page: int = 1, *, snapshot: dict | None = None,
                       stats_loading: bool = False) -> tuple[str, dict]:
-    chans = [ch for ch in registry.all_channels() if ch.type == "api"]
+    chans = _all_channels()
     total = len(chans)
     total_pages = max(1, math.ceil(total / _PAGE_SIZE)) if total else 1
     page = max(1, min(int(page or 1), total_pages))
@@ -675,7 +799,7 @@ def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int =
     text, kb = _list_text_and_kb(page=page, snapshot=cached.value)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
     # 页面已经完成渲染后才排队；Provider 网络永不位于 Telegram handler 等待路径。
-    _schedule_usage([ch for ch in registry.all_channels() if ch.type == "api"][(page - 1) * _PAGE_SIZE:page * _PAGE_SIZE])
+    _schedule_usage(_all_channels(chat_id)[(page - 1) * _PAGE_SIZE:page * _PAGE_SIZE])
 
 
 def send_new(chat_id: int, page: int = 1) -> None:
@@ -686,13 +810,13 @@ def send_new(chat_id: int, page: int = 1) -> None:
         return
     text, kb = _list_text_and_kb(page=page, snapshot=cached.value)
     ui.send(chat_id, text, reply_markup=kb)
-    _schedule_usage([ch for ch in registry.all_channels() if ch.type == "api"][(page - 1) * _PAGE_SIZE:page * _PAGE_SIZE])
+    _schedule_usage(_all_channels(chat_id)[(page - 1) * _PAGE_SIZE:page * _PAGE_SIZE])
 
 
 # ─── 渠道排序 ─────────────────────────────────────────────────────
 
 def _api_channel_names() -> list[str]:
-    return [ch.display_name for ch in registry.all_channels() if ch.type == "api"]
+    return [ch.display_name for ch in _all_channels()]
 
 
 def _split_number_rows(n: int, max_cols: int = 6) -> list[list[int]]:
@@ -731,7 +855,7 @@ def _set_sort_state(chat_id: int, draft: list[str], page: int = 1,
 
 
 def _sort_item_line(idx: int, name: str) -> str:
-    ch = registry.get_channel(f"api:{name}")
+    ch = _get_channel(name)
     if ch is None:
         return f"{idx}. <code>{ui.escape_html(name)}</code> ⚠ 已不存在"
     icon, status = _channel_health(ch)
@@ -899,17 +1023,11 @@ def on_sort_reset(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _save_api_channel_order(draft: list[str]) -> None:
-    order = {name: i for i, name in enumerate(draft)}
-
-    def _mutate(cfg):
-        channels = list(cfg.get("channels") or [])
-        ordered = [c for c in channels if c.get("name") in order]
-        ordered.sort(key=lambda c: order.get(c.get("name"), 10**9))
-        rest = [c for c in channels if c.get("name") not in order]
-        cfg["channels"] = ordered + rest
-
-    config.update(_mutate)
-    registry.rebuild_from_config()
+    context = _ctx()
+    revision = _CONTROL.list_channels(context, ChannelListQuery()).order_revision
+    _CONTROL.reorder_channels(
+        context, tuple(f"api:{name}" for name in draft), expected_revision=revision,
+    )
 
 
 def on_sort_save(chat_id: int, message_id: int, cb_id: str) -> None:
@@ -944,10 +1062,12 @@ def on_sort_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
 
 def _channel_model_lines(ch, model_stats: list[dict] | None = None,
                          *, stats_loading: bool = False) -> list[str]:
+    if not hasattr(ch, "performance_by_model"):
+        ch = _CONTROL.get_channel(_ctx(), getattr(ch, "key", ""))
     lines = []
     now = int(time.time() * 1000)
-    perfs = {s["model"]: s for s in scorer.snapshot() if s["channel_key"] == ch.key}
-    cd_map = {e["model"]: e for e in cooldown.active_entries() if e["channel_key"] == ch.key}
+    perfs = ch.performance_by_model
+    cd_map = ch.cooldown_by_model
 
     # 本月每个 model 的 TPS / 次数只读后台缓存。
     if model_stats is None:
@@ -965,35 +1085,37 @@ def _channel_model_lines(ch, model_stats: list[dict] | None = None,
         perf = perfs.get(real)
         cd = cd_map.get(real)
 
-        quota_cooling = bool(cd and quota_errors.active_quota_cooldown(cd, now_ms=now))
+        quota_cooling = bool(cd and cd.quota)
         if cd:
-            if cd["cooldown_until"] == -1:
+            if cd.cooldown_until == -1:
                 line += " 🔴 <b>永久冷却</b>"
             elif quota_cooling:
                 line += " 🟠 <b>配额冷却</b>"
             else:
-                remaining = max(0, (cd["cooldown_until"] - now) // 1000)
+                remaining = max(0, (cd.cooldown_until - now) // 1000)
                 line += f" 🟠 冷却 {remaining}s"
         else:
-            if perf and perf["recent_requests"] > 0:
-                rate = (perf["recent_success_count"] / perf["recent_requests"]) * 100
+            if perf and perf.recent_requests > 0:
+                rate = (perf.recent_success_count / perf.recent_requests) * 100
                 icon = "🟢" if rate >= 80 else ("🟡" if rate >= 50 else "🔴")
                 line += f" {icon} {rate:.0f}%"
             else:
                 line += " ⚪ 暂无数据"
         lines.append(line)
         if quota_cooling:
-            reset_text = quota_errors.format_bjt_ms(cd["cooldown_until"])
+            reset_text = datetime.fromtimestamp(
+                int(cd.cooldown_until) / 1000, tz=_USAGE_BJT,
+            ).strftime("%Y-%m-%d %H:%M:%S")
             lines.append("    原因: 周/月额度已用尽（1310）")
             lines.append(f"    恢复: <code>{reset_text}</code> 北京时间")
             lines.append("    调度: 恢复前自动跳过本渠道模型")
 
-        if perf and perf["total_requests"] > 0:
+        if perf and perf.total_requests > 0:
             stats_line = (
-                f"    请求 {perf['total_requests']} · "
-                f"连接 {perf['avg_connect_ms']}ms · "
-                f"首字 {perf['avg_first_byte_ms']}ms · "
-                f"score {perf['score']}"
+                f"    请求 {perf.total_requests} · "
+                f"连接 {perf.avg_connect_ms}ms · "
+                f"首字 {perf.avg_first_byte_ms}ms · "
+                f"score {perf.score}"
             )
             lines.append(stats_line)
 
@@ -1017,7 +1139,7 @@ def _channel_model_lines(ch, model_stats: list[dict] | None = None,
 def _detail_text_and_kb(name: str, page: int = 1, *,
                         model_stats: list[dict] | None = None,
                         stats_loading: bool = False) -> tuple[Optional[str], Optional[dict]]:
-    ch = registry.get_channel(f"api:{name}")
+    ch = _get_channel(name)
     if ch is None or ch.type != "api":
         return None, None
 
@@ -1032,7 +1154,7 @@ def _detail_text_and_kb(name: str, page: int = 1, *,
         f"{icon} <b>{ui.escape_html(ch.display_name)}</b>",
         "",
         f"🔗 URL: <code>{ui.escape_html(url_display)}</code>",
-        f"🔑 Key: <code>{ui.escape_html(_mask_key(ch.api_key))}</code>",
+        f"🔑 Key: <code>{ui.escape_html(ch.api_key_masked_hint or '')}</code>",
     ]
     # 只在非 anthropic 时显示协议行，避免对现有 anthropic 渠道造成视觉噪声
     if protocol != "anthropic":
@@ -1062,7 +1184,7 @@ def _detail_text_and_kb(name: str, page: int = 1, *,
     lines.extend(_channel_model_lines(ch, model_stats, stats_loading=stats_loading))
 
     # 亲和绑定数
-    bound = sum(1 for v in affinity.snapshot().values() if v["channel_key"] == ch.key)
+    bound = ch.affinity_count
     lines.append("")
     lines.append(f"🔗 亲和绑定: {bound} 个会话")
 
@@ -1074,7 +1196,7 @@ def _detail_text_and_kb(name: str, page: int = 1, *,
         [ui.btn("🧹 清错误", f"ch:clear_errors:{payload}"),
          ui.btn("🔗 清亲和", f"ch:clear_affinity:{payload}")],
     ]
-    if provider_usage.spec_for(ch) is not None:
+    if ch.provider_usage.supported:
         rows.append([ui.btn("🔄 刷新上游用量", f"ch:usage:{payload}")])
     rows += [
         [ui.btn(toggle_label, f"ch:toggle:{payload}"),
@@ -1091,7 +1213,7 @@ def on_view(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
         ui.answer_cb(cb_id, "短码已失效")
         show(chat_id, message_id, page=page)
         return
-    ch = registry.get_channel(f"api:{name}")
+    ch = _get_channel(name)
     if ch is None:
         ui.answer_cb(cb_id, "渠道不存在")
         return
@@ -1109,7 +1231,9 @@ def on_view(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
         cached = menu_cache.DETAIL_STATS.peek(detail_key)
     if not cached.fresh:
         menu_cache.DETAIL_STATS.request(
-            detail_key, lambda: log_db.channel_model_stats(ch.key, since_ts=since),
+            detail_key, lambda: _CONTROL.channel_model_stats(
+                _ctx(chat_id), ch.key, since_ts=since,
+            ),
         )
     # 旧详情页中的每模型调用量、Token、缓存、TPS 都是原有内容；冷快照时
     # 保持列表页不动，不能先打开一个把这些字段删掉的残缺详情。
@@ -1123,17 +1247,22 @@ def on_view(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
     )
     if text is not None:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
-        provider_usage.schedule_refresh(ch)
+        try:
+            _CONTROL.schedule_provider_usage_hint(_ctx(chat_id), ch.id)
+        except ManagementError:
+            pass
 
 
 def on_usage_refresh(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
     short, page = _split_short_page(payload)
     name = ui.resolve_code(short)
-    ch = registry.get_channel(f"api:{name}") if name else None
+    ch = _get_channel(name, chat_id)
     if ch is None:
         ui.answer_cb(cb_id, "渠道不存在")
         return
-    queued = provider_usage.schedule_refresh(ch, force=True)
+    queued = bool(_CONTROL.schedule_provider_usage(
+        _ctx(chat_id), ch.id, force=True,
+    ).queued)
     ui.answer_cb(cb_id, "已请求更新" if queued else "暂时无需重复更新")
     text, kb = _detail_text_and_kb(name, page=page)
     if text: ui.edit(chat_id, message_id, text, reply_markup=kb)
@@ -1147,12 +1276,12 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
     if not name:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    ch = registry.get_channel(f"api:{name}")
+    ch = _get_channel(name)
     if ch is None:
         ui.answer_cb(cb_id, "渠道不存在")
         return
     new_enabled = not (ch.enabled and not ch.disabled_reason)
-    registry.update_api_channel(name, {"enabled": new_enabled})
+    _control_update(name, {"enabled": new_enabled}, chat_id)
     ui.answer_cb(cb_id, "已启用" if new_enabled else "已禁用")
     text, kb = _detail_text_and_kb(name, page=page)
     if text:
@@ -1165,7 +1294,10 @@ def on_clear_errors(chat_id: int, message_id: int, cb_id: str, payload: str) -> 
     if not name:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    cooldown.clear(f"api:{name}", model=None)
+    try:
+        _CONTROL.clear_channel_errors(_ctx(chat_id), f"api:{name}")
+    except ManagementError:
+        pass
     ui.answer_cb(cb_id, "已清除")
     text, kb = _detail_text_and_kb(name, page=page)
     if text:
@@ -1178,7 +1310,10 @@ def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, payload: str) -
     if not name:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    affinity.delete_by_channel(f"api:{name}")
+    try:
+        _CONTROL.clear_channel_affinity(_ctx(chat_id), f"api:{name}")
+    except ManagementError:
+        pass
     ui.answer_cb(cb_id, "已清空亲和")
     text, kb = _detail_text_and_kb(name, page=page)
     if text:
@@ -1186,13 +1321,13 @@ def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, payload: str) -
 
 
 def on_clear_errors_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> None:
-    cooldown.clear_all()
+    _CONTROL.clear_all_errors(_ctx(chat_id))
     ui.answer_cb(cb_id, "已全部清除")
     show(chat_id, message_id, page=page)
 
 
 def on_clear_affinity_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> None:
-    affinity.delete_all()
+    _CONTROL.clear_all_affinity(_ctx(chat_id))
     ui.answer_cb(cb_id, "已全部清空")
     show(chat_id, message_id, page=page)
 
@@ -1203,7 +1338,7 @@ def on_delete_ask(chat_id: int, message_id: int, cb_id: str, payload: str) -> No
     if not name:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    ch = registry.get_channel(f"api:{name}")
+    ch = _get_channel(name)
     if ch is None:
         ui.answer_cb(cb_id, "渠道不存在")
         return
@@ -1229,11 +1364,20 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, payload: str) -> N
         ui.answer_cb(cb_id, "短码已失效")
         show(chat_id, message_id, page=page)
         return
-    ok = registry.delete_api_channel(name)
-    if ok:
+    ch = _get_channel(name, chat_id)
+    try:
+        result = (
+            _CONTROL.delete_channel(
+                _ctx(chat_id), f"api:{name}", expected_revision=ch.revision,
+            )
+            if ch is not None else None
+        )
+    except ManagementError:
+        result = None
+    if result and result.deleted:
         ui.answer_cb(cb_id, "已删除")
         extra = ""
-        if load_balancing.is_initialized():
+        if result.load_balancing_initialized:
             extra = "\n已从负载均衡优先级队列中移除。"
         ui.edit(chat_id, message_id, f"✅ 已删除 <code>{ui.escape_html(name)}</code>{extra}")
         show(chat_id, message_id, page=page)
@@ -1270,8 +1414,7 @@ def wiz_on_name_input(chat_id: int, text: str) -> None:
     if len(name) > 64:
         ui.send(chat_id, "❌ 名称过长（上限 64 字符），请重新输入：")
         return
-    cfg = config.get()
-    if any(c.get("name") == name for c in cfg.get("channels", [])):
+    if _CONTROL.channel_name_exists(_ctx(chat_id), name):
         ui.send(chat_id, f"❌ 渠道名称 <code>{ui.escape_html(name)}</code> 已存在，请换一个：")
         return
 
@@ -1305,7 +1448,7 @@ def wiz_on_url_input(chat_id: int, text: str) -> None:
     data = state["data"]
     # 自动识别完整路径：末段命中 messages/completions/responses 则拆分
     try:
-        split_base, split_path = split_base_url(url)
+        split_base, split_path, _ = _parse_url_for_tg(url)
     except ValueError as exc:
         ui.send(chat_id, f"❌ URL 无效：{ui.escape_html(str(exc))}")
         return
@@ -1327,7 +1470,7 @@ def _wiz_send_protocol_panel(chat_id: int) -> None:
     head = "✅ URL 已设置\n\n"
     if api_path:
         # 提示已自动拆分，建议用户按 apiPath 末段对应的协议选
-        detected = detect_suffix_protocol(api_path)
+        _, _, detected = _parse_url_for_tg(data.get("baseUrl", "") + api_path)
         detected_label = _PROTOCOL_LABEL.get(detected, "?") if detected else "?"
         head = (
             "✅ URL 已设置（检测到完整路径，已自动拆分）\n"
@@ -1369,7 +1512,7 @@ def wiz_on_protocol_select(chat_id: int, message_id: int, cb_id: str, protocol: 
         return
     data = state["data"]
     api_path = data.get("apiPath")
-    detected = detect_suffix_protocol(api_path) if api_path else None
+    detected = _parse_url_for_tg(data.get("baseUrl", "") + api_path)[2] if api_path else None
     # apiPath 识别的协议 != 用户选的协议 → 弹确认面板
     if api_path and detected and detected != protocol:
         ui.answer_cb(cb_id)
@@ -1469,7 +1612,7 @@ def wiz_on_key_input(chat_id: int, text: str) -> None:
 
 def wiz_on_models_input(chat_id: int, text: str) -> None:
     try:
-        models = api_channel.parse_models_input(text or "")
+        models = _parse_models_for_tg(text or "")
     except ValueError as exc:
         ui.send(chat_id, f"❌ {ui.escape_html(str(exc))}\n请重新输入：")
         return
@@ -1553,27 +1696,14 @@ def wiz_back_to_models(chat_id: int, message_id: int, cb_id: str) -> None:
 
 # ─── 测试：单个模型 / 全部 / 跳过 ─────────────────────────────────
 
-def _make_temp_channel(data: dict):
-    protocol = data.get("protocol") or "anthropic"
-    entry = {
-        "name": data["name"] + "__wiz",
-        "type": "api",
-        "baseUrl": data["baseUrl"],
-        "apiKey": data["apiKey"],
-        "protocol": protocol,
-        "models": data["models"],
-        "cc_mimicry": bool(data.get("cc_mimicry", protocol == "anthropic")),
-        "providerId": data.get("providerId"),
-        "providerPresetId": data.get("providerPresetId"),
-        "enabled": True,
-    }
-    if data.get("apiPath"):
-        entry["apiPath"] = data["apiPath"]
-    # openai-* 协议走 OpenAIApiChannel；anthropic 走 ApiChannel
-    if protocol == "anthropic":
-        return api_channel.ApiChannel(entry)
-    from ...openai.channel.api_channel import OpenAIApiChannel
-    return OpenAIApiChannel(entry)
+def _make_temp_channel(data: dict) -> DraftProbeCommand:
+    protocol = ChannelProtocol(data.get("protocol") or "anthropic")
+    return DraftProbeCommand(
+        name=data["name"], base_url=data["baseUrl"], api_path=data.get("apiPath"),
+        api_key=data["apiKey"], protocol=protocol, model="",
+        provider_id=data.get("providerId"), provider_preset_id=data.get("providerPresetId"),
+        cc_mimicry=bool(data.get("cc_mimicry", protocol is ChannelProtocol.ANTHROPIC)),
+    )
 
 
 async def _probe_with_progress_async(chat_id: int, msg_id: int, header: str,
@@ -1590,33 +1720,35 @@ async def _probe_with_progress_async(chat_id: int, msg_id: int, header: str,
         ui.edit(chat_id, msg_id, state["text"])
 
     try:
-        ok, elapsed, reason = await probe.probe_with_progress(
-            ch, real_model,
-            progress_cb=progress_cb,
-            timeout_s=None,
-            progress_interval=10,
-        )
+        if isinstance(ch, DraftProbeCommand):
+            result = await _CONTROL.probe_draft(
+                _ctx(chat_id),
+                DraftProbeCommand(
+                    name=ch.name, base_url=ch.base_url, api_path=ch.api_path,
+                    api_key=ch.api_key, protocol=ch.protocol, model=real_model,
+                    provider_id=ch.provider_id,
+                    provider_preset_id=ch.provider_preset_id,
+                    cc_mimicry=ch.cc_mimicry,
+                ),
+                progress_cb=progress_cb,
+            )
+        else:
+            result = await _CONTROL.probe_existing(
+                _ctx(chat_id), ch.id, real_model, progress_cb=progress_cb,
+            )
     except Exception as exc:
         state["text"] += f"\n[×] 测试异常：{ui.escape_html(str(exc))}"
         ui.edit(chat_id, msg_id, state["text"])
         return False, 0, str(exc), state["text"]
 
+    ok, elapsed, reason = result.ok, result.elapsed_ms, result.reason
     if ok:
         state["text"] += f"\n[√] 模型测试成功，耗时: {elapsed}ms"
-        # 手动测试成功 → 自动清除该 (渠道, 模型) 的冷却 / 永久禁用状态
-        # 复用 probe recovery loop 的 cooldown.clear 路径，避免用户还要手动点"清错误"
-        try:
-            prev = cooldown.get_state(ch.key, real_model)
-            if prev and (prev.get("cooldown_until") is not None
-                         or int(prev.get("error_count", 0)) > 0):
-                was_permanent = prev.get("cooldown_until") == -1
-                cooldown.clear(ch.key, real_model)
-                if was_permanent:
-                    state["text"] += "\n[✓] 已自动解除永久冷却"
-                else:
-                    state["text"] += "\n[✓] 已自动清除冷却与失败计数"
-        except Exception as exc:
-            print(f"[channel_menu] auto-clear cooldown on test success failed: {exc}")
+        if result.cooldown_cleared:
+            if result.permanent_cooldown_cleared:
+                state["text"] += "\n[✓] 已自动解除永久冷却"
+            else:
+                state["text"] += "\n[✓] 已自动清除冷却与失败计数"
     else:
         state["text"] += f"\n[×] 模型测试失败，失败原因: {ui.escape_html(reason or '未知错误')}"
     ui.edit(chat_id, msg_id, state["text"])
@@ -1734,25 +1866,14 @@ def wiz_skip_test(chat_id: int, message_id: int, cb_id: str) -> None:
     data = state["data"]
     protocol = data.get("protocol") or "anthropic"
     try:
-        registry.add_api_channel({
-            "name": data["name"],
-            "baseUrl": data["baseUrl"],
-            "apiPath": data.get("apiPath"),
-            "apiKey": data["apiKey"],
-            "protocol": protocol,
-            "models": data["models"],
-            "cc_mimicry": bool(data.get("cc_mimicry", protocol == "anthropic")),
-            "providerId": data.get("providerId"),
-            "providerPresetId": data.get("providerPresetId"),
-            "enabled": True,
-        })
+        result = _CONTROL.create_channel(_ctx(chat_id), _create_command(data))
     except Exception as exc:
         ui.send(chat_id, f"❌ 保存失败: <code>{ui.escape_html(str(exc))}</code>")
         return
     states.pop_state(chat_id)
     lb_hint = (
         "\n\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
-        if load_balancing.is_initialized() else ""
+        if result.load_balancing_initialized else ""
     )
     ui.edit(
         chat_id, message_id,
@@ -1780,33 +1901,13 @@ def wiz_save(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.answer_cb(cb_id, "需要至少一个模型测试成功", show_alert=True)
         return
     try:
-        registry.add_api_channel({
-            "name": data["name"],
-            "baseUrl": data["baseUrl"],
-            "apiPath": data.get("apiPath"),
-            "apiKey": data["apiKey"],
-            "protocol": protocol,
-            "models": data["models"],
-            "cc_mimicry": bool(data.get("cc_mimicry", protocol == "anthropic")),
-            "providerId": data.get("providerId"),
-            "providerPresetId": data.get("providerPresetId"),
-            "enabled": True,
-        })
+        result = _CONTROL.create_channel(
+            _ctx(chat_id), _create_command(data, results),
+        )
     except Exception as exc:
         ui.send(chat_id, f"❌ 保存失败: <code>{ui.escape_html(str(exc))}</code>")
         ui.answer_cb(cb_id, "失败")
         return
-
-    # 失败的模型：记入初始冷却（errorWindows[0]，默认 1 分钟）
-    # 避免启用即被调度到；冷却期到后 probe 会自动重测。使用刚创建
-    # Channel 的 generation identity，确保与所有 attempt 副作用同一门禁。
-    saved_channel = registry.get_channel(f"api:{data['name']}")
-    saved_state_key = channel_state.effect_key(saved_channel) if saved_channel else f"api:{data['name']}"
-    for m in data["models"]:
-        real = m["real"]
-        r = results.get(real)
-        if r and not r[0]:
-            cooldown.record_error(saved_state_key, real, f"initial probe failed: {r[2]}")
 
     states.pop_state(chat_id)
     ui.answer_cb(cb_id, "已保存")
@@ -1821,7 +1922,7 @@ def wiz_save(chat_id: int, message_id: int, cb_id: str) -> None:
     )
     if fail_names:
         summary += f"不可用（已加入冷却） ({len(fail_names)}): {fail_display}"
-    if load_balancing.is_initialized():
+    if result.load_balancing_initialized:
         summary += "\n\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
     # edit 同一消息显示结果 + 导航；用户点击按钮返回列表，避免双消息
     ui.edit(chat_id, message_id, summary, reply_markup=ui.inline_kb([
@@ -1835,7 +1936,7 @@ def wiz_save(chat_id: int, message_id: int, cb_id: str) -> None:
 def on_test_panel(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
     ui.answer_cb(cb_id)
     name = ui.resolve_code(short)
-    ch = registry.get_channel(f"api:{name}") if name else None
+    ch = _get_channel(name, chat_id)
     if ch is None:
         ui.edit(chat_id, message_id, "⚠ 渠道不存在",
                 reply_markup=ui.inline_kb([[ui.btn("◀ 返回", "menu:channel")]]))
@@ -1864,7 +1965,7 @@ def on_test_single(chat_id: int, message_id: int, cb_id: str, short: str, idx_st
     """后台线程测单个模型，不阻塞 polling。"""
     ui.answer_cb(cb_id, "测试已开始")
     name = ui.resolve_code(short)
-    ch = registry.get_channel(f"api:{name}") if name else None
+    ch = _get_channel(name, chat_id)
     if ch is None:
         return
     try:
@@ -1894,7 +1995,7 @@ def on_test_all(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
     """后台线程批量测试已存在渠道的所有模型，不阻塞 polling。"""
     ui.answer_cb(cb_id, "测试已开始")
     name = ui.resolve_code(short)
-    ch = registry.get_channel(f"api:{name}") if name else None
+    ch = _get_channel(name, chat_id)
     if ch is None:
         return
     sent = ui.send(
@@ -1937,7 +2038,7 @@ def on_edit_menu(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
         states.pop_state(chat_id)
     ui.answer_cb(cb_id)
     name = ui.resolve_code(short)
-    ch = registry.get_channel(f"api:{name}") if name else None
+    ch = _get_channel(name, chat_id)
     if ch is None:
         return
     cc_label = "🎭 切换 CC 伪装（当前: 开）" if ch.cc_mimicry else "🎭 切换 CC 伪装（当前: 关）"
@@ -1966,7 +2067,7 @@ def on_edit_menu(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
 
 def _resolve_compat_channel(short: str):
     name = ui.resolve_code(short)
-    ch = registry.get_channel(f"api:{name}") if name else None
+    ch = _get_channel(name)
     return name, ch
 
 
@@ -2099,9 +2200,9 @@ def on_compat_feature_mode(
     if feature == "1m" and _protocol_of(ch) != "anthropic":
         ui.answer_cb(cb_id, "仅 Anthropic 渠道支持 1M 标志")
         return
-    normalized = normalize_mode(mode)
+    normalized = _normalized_mode(mode)
     spec = _COMPAT_FEATURES[feature]
-    registry.update_api_channel(name, {spec["mode_key"]: normalized})
+    _control_update(name, {spec["mode_key"]: normalized}, chat_id)
     ui.answer_cb(cb_id, "已设为强制" if normalized == FORCE_MODE else "已设为自动透传")
     _render_compat_feature(chat_id, message_id, short, feature)
 
@@ -2117,7 +2218,7 @@ def on_compat_feature_all_models(
         ui.answer_cb(cb_id, "仅 Anthropic 渠道支持 1M 标志")
         return
     spec = _COMPAT_FEATURES[feature]
-    registry.update_api_channel(name, {spec["models_key"]: []})
+    _control_update(name, {spec["models_key"]: []}, chat_id)
     ui.answer_cb(cb_id, "已设为全部模型")
     _render_compat_feature(chat_id, message_id, short, feature)
 
@@ -2155,7 +2256,7 @@ def on_compat_feature_toggle_model(
         selected = [m for m in selected if m != real]
     else:
         selected.append(real)
-    registry.update_api_channel(name, {spec["models_key"]: selected})
+    _control_update(name, {spec["models_key"]: selected}, chat_id)
     ui.answer_cb(cb_id, "已更新模型范围")
     _render_compat_feature(chat_id, message_id, short, feature)
 
@@ -2163,7 +2264,7 @@ def on_compat_feature_toggle_model(
 def on_edit_protocol(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
     ui.answer_cb(cb_id)
     name = ui.resolve_code(short)
-    ch = registry.get_channel(f"api:{name}") if name else None
+    ch = _get_channel(name, chat_id)
     if ch is None:
         return
     current = _protocol_of(ch)
@@ -2210,7 +2311,7 @@ def on_edit_url_switch(chat_id: int, message_id: int, cb_id: str, short: str) ->
         return
     try:
         # 同时更新 baseUrl + apiPath + protocol；显式带 apiPath 让 registry 信任 UI
-        registry.update_api_channel(name, {
+        _control_update(name, {
             "baseUrl": data["new_base"],
             "apiPath": data["new_path"],
             "protocol": data["detected"],
@@ -2247,7 +2348,7 @@ def on_edit_url_basesonly(chat_id: int, message_id: int, cb_id: str, short: str)
         return
     try:
         # 只留 baseUrl，清空 apiPath（显式传 None）
-        registry.update_api_channel(name, {
+        _control_update(name, {
             "baseUrl": data["new_base"],
             "apiPath": None,
         })
@@ -2276,7 +2377,7 @@ def on_set_protocol(chat_id: int, message_id: int, cb_id: str, short: str, proto
         ui.answer_cb(cb_id, "无效协议")
         return
     try:
-        registry.update_api_channel(name, {"protocol": protocol})
+        _control_update(name, {"protocol": protocol}, chat_id)
     except Exception as exc:
         ui.answer_cb(cb_id, "切换失败")
         ui.send(chat_id, f"❌ 切换失败: <code>{ui.escape_html(str(exc))}</code>")
@@ -2331,12 +2432,12 @@ def on_edit_max_concurrent(chat_id: int, message_id: int, cb_id: str, short: str
 
 def on_edit_cc_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
     name = ui.resolve_code(short)
-    ch = registry.get_channel(f"api:{name}") if name else None
+    ch = _get_channel(name, chat_id)
     if ch is None:
         ui.answer_cb(cb_id, "渠道不存在")
         return
     try:
-        registry.update_api_channel(name, {"cc_mimicry": not ch.cc_mimicry})
+        _control_update(name, {"cc_mimicry": not ch.cc_mimicry}, chat_id)
     except Exception as exc:
         ui.answer_cb(cb_id, "切换失败")
         ui.send(chat_id, f"❌ 切换失败: {ui.escape_html(str(exc))}")
@@ -2349,13 +2450,13 @@ def on_edit_omit_temperature_toggle(
     chat_id: int, message_id: int, cb_id: str, short: str,
 ) -> None:
     name = ui.resolve_code(short)
-    ch = registry.get_channel(f"api:{name}") if name else None
+    ch = _get_channel(name, chat_id)
     if ch is None:
         ui.answer_cb(cb_id, "渠道不存在")
         return
     current = bool(getattr(ch, "omit_temperature", False))
     try:
-        registry.update_api_channel(name, {"omitTemperature": not current})
+        _control_update(name, {"omitTemperature": not current}, chat_id)
     except Exception as exc:
         ui.answer_cb(cb_id, "切换失败")
         ui.send(chat_id, f"❌ 切换失败: {ui.escape_html(str(exc))}")
@@ -2368,13 +2469,13 @@ def on_edit_omit_thinking_toggle(
     chat_id: int, message_id: int, cb_id: str, short: str,
 ) -> None:
     name = ui.resolve_code(short)
-    ch = registry.get_channel(f"api:{name}") if name else None
+    ch = _get_channel(name, chat_id)
     if ch is None:
         ui.answer_cb(cb_id, "渠道不存在")
         return
     current = bool(getattr(ch, "omit_thinking", False))
     try:
-        registry.update_api_channel(name, {"omitThinking": not current})
+        _control_update(name, {"omitThinking": not current}, chat_id)
     except Exception as exc:
         ui.answer_cb(cb_id, "切换失败")
         ui.send(chat_id, f"❌ 切换失败: {ui.escape_html(str(exc))}")
@@ -2399,7 +2500,7 @@ def _do_edit(chat_id: int, short: str, field: str, value: Any) -> tuple[bool, st
             patch = {"models": value}
         elif field == "maxConcurrent":
             patch = {"maxConcurrent": value}
-        registry.update_api_channel(name, patch)
+        _control_update(name, patch, chat_id)
     except Exception as exc:
         return False, str(exc)
     return True, patch.get("name", name) if field == "name" else name
@@ -2441,13 +2542,13 @@ def handle_edit_text(chat_id: int, action: str, text: str) -> bool:
             return True
         # 先判断是否需要进入冲突解决：先 split，看识别出的协议与当前 channel 协议
         try:
-            split_base, split_path = split_base_url(url)
+            split_base, split_path, _ = _parse_url_for_tg(url)
         except ValueError as exc:
             ui.send(chat_id, f"❌ URL 无效：{ui.escape_html(str(exc))}")
             return True
-        ch = registry.get_channel(f"api:{ui.resolve_code(short) or ''}")
+        ch = _get_channel(ui.resolve_code(short), chat_id)
         current_proto = _protocol_of(ch) if ch else "anthropic"
-        detected = detect_suffix_protocol(split_path) if split_path else None
+        detected = _parse_url_for_tg(url)[2] if split_path else None
         if split_path and detected and detected != current_proto:
             # 冲突：记下候选 url + 两个分支信息，让用户按钮选
             states.set_state(chat_id, "ch_edit_url_confirm", {
@@ -2514,7 +2615,7 @@ def handle_edit_text(chat_id: int, action: str, text: str) -> bool:
         return True
     if action == "ch_edit_models":
         try:
-            models = api_channel.parse_models_input(text or "")
+            models = _parse_models_for_tg(text or "")
         except ValueError as exc:
             ui.send(chat_id, f"❌ {ui.escape_html(str(exc))}\n请重新输入：")
             return True

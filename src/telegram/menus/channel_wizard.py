@@ -3,11 +3,9 @@ from __future__ import annotations
 import math
 import time
 
-from ... import config
-from ...channel import api_channel, registry
-from ...channel.url_utils import detect_suffix_protocol, split_base_url
-from ...models_discovery import ModelsDiscoveryError, derive_custom_models_url, discover_models
-from ...providers.catalog import PROVIDER_CATALOG, get_preset
+from ...management_control import ManagementError
+from ...management_control.channels import DiscoveryCommand
+from ...management_control.channels.discovery import ModelsDiscoveryError, discover_models
 from .. import states, ui
 
 PAGE = 10
@@ -19,15 +17,36 @@ def _cm():
     return channel_menu
 
 
+def _catalog(chat_id=0):
+    return _cm()._CONTROL.get_catalog(_cm()._ctx(chat_id))
+
+
+def get_preset(provider_id, preset_id):
+    """Compatibility seam used by the frozen wizard tests; data still comes from control."""
+    for brand in _catalog().providers:
+        if brand.id == provider_id:
+            return next((item for item in brand.presets if item.id == preset_id), None)
+    return None
+
+
+def _preset(provider_id, preset_id, chat_id=0):
+    return get_preset(provider_id, preset_id)
+
+
+def _preset_has_models_url(preset) -> bool:
+    return bool(getattr(preset, "models_url_configured", getattr(preset, "models_url", None)))
+
+
 def _bounds(n, page):
     pages = max(1, math.ceil(n / PAGE)); page = max(0, min(int(page), pages - 1))
     return page, page * PAGE, pages
 
 
 def _providers_kb(page=0):
-    page, start, pages = _bounds(len(PROVIDER_CATALOG), page)
+    providers = _catalog().providers
+    page, start, pages = _bounds(len(providers), page)
     rows = [[ui.btn(b.display_name, f"chw:brand:{i}:{page}")]
-            for i, b in enumerate(PROVIDER_CATALOG[start:start + PAGE], start)]
+            for i, b in enumerate(providers[start:start + PAGE], start)]
     if pages > 1:
         rows.append([ui.btn("◀", f"chw:brands:{page-1}"), ui.btn(f"{page+1}/{pages}", "chw:noop"),
                      ui.btn("▶", f"chw:brands:{page+1}")])
@@ -46,7 +65,7 @@ def wiz_on_name_input(chat_id, text):
     name = (text or "").strip()
     if not name: ui.send(chat_id, "❌ 名称不能为空，请重新输入："); return
     if len(name) > 64: ui.send(chat_id, "❌ 名称过长（上限 64 字符），请重新输入："); return
-    if any(c.get("name") == name for c in config.get().get("channels", [])):
+    if _cm()._CONTROL.channel_name_exists(_cm()._ctx(chat_id), name):
         ui.send(chat_id, f"❌ 渠道名称 <code>{ui.escape_html(name)}</code> 已存在，请换一个："); return
     states.set_state(chat_id, "ch_wiz_url", {"name": name, "provider_page": 0}); show_providers(chat_id)
 
@@ -61,7 +80,7 @@ def wiz_show_brands(chat_id, message_id, cb_id, page):
 def wiz_select_brand(chat_id, message_id, cb_id, idx, page):
     state = states.get_state(chat_id)
     if not state or state.get("action") != "ch_wiz_url": ui.answer_cb(cb_id, "会话已过期"); return
-    try: brand = PROVIDER_CATALOG[idx]
+    try: brand = _catalog(chat_id).providers[idx]
     except IndexError: ui.answer_cb(cb_id, "无效提供商"); return
     data = state["data"]; data["provider_page"] = page
     if len(brand.presets) == 1:
@@ -80,7 +99,9 @@ def wiz_select_preset(chat_id, message_id, cb_id, idx):
 
 
 def _apply_preset(chat_id, message_id, data, brand_idx, preset_idx):
-    try: brand, preset = PROVIDER_CATALOG[brand_idx], PROVIDER_CATALOG[brand_idx].presets[preset_idx]
+    try:
+        brand = _catalog(chat_id).providers[brand_idx]
+        preset = brand.presets[preset_idx]
     except IndexError: ui.send(chat_id, "❌ 提供商模板已变化，请重新选择"); return
     data.update(providerId=brand.id, providerPresetId=preset.id, brand_idx=brand_idx, preset_idx=preset_idx)
     for k in ("baseUrl", "apiPath", "protocol"): data.pop(k, None)
@@ -100,7 +121,7 @@ def wiz_on_url_input(chat_id, text):
     url = (text or "").strip().rstrip("/"); state = states.get_state(chat_id)
     if not url.startswith(("http://", "https://")): ui.send(chat_id, "❌ URL 需以 http:// 或 https:// 开头，请重新输入："); return
     if not state or state.get("action") != "ch_wiz_url": ui.send(chat_id, "❌ 会话过期，请重新添加"); return
-    try: base, path = split_base_url(url)
+    try: base, path, _ = _cm()._parse_url_for_tg(url)
     except ValueError as exc: ui.send(chat_id, f"❌ URL 无效：{ui.escape_html(str(exc))}"); return
     data = state["data"]
     for k in ("providerId", "providerPresetId", "brand_idx", "preset_idx"): data.pop(k, None)
@@ -112,7 +133,7 @@ def wiz_on_url_input(chat_id, text):
 
 def send_protocol_panel(chat_id, message_id=None):
     cm = _cm(); state = states.get_state(chat_id) or {}; data = state.get("data") or {}
-    preset = get_preset(data.get("providerId", ""), data.get("providerPresetId", ""))
+    preset = _preset(data.get("providerId", ""), data.get("providerPresetId", ""), chat_id)
     protocols = list(preset.protocols) if preset else list(cm._PROTOCOL_LABEL)
     rows = [[cm._protocol_button(p, f"chw:proto:{p}")] for p in protocols] + [NAV]
     head = "✅ 提供商模板已设置" if preset else "✅ URL 已设置"
@@ -131,9 +152,9 @@ def _to_key(chat_id, message_id, data, protocol):
 
 
 def _select_provider_protocol(chat_id, message_id, data, protocol):
-    preset = get_preset(data.get("providerId", ""), data.get("providerPresetId", ""))
+    preset = _preset(data.get("providerId", ""), data.get("providerPresetId", ""), chat_id)
     if not preset or protocol not in preset.protocols: return False
-    data["baseUrl"], data["apiPath"] = split_base_url(preset.protocols[protocol])
+    data["baseUrl"], data["apiPath"], _ = _cm()._parse_url_for_tg(preset.protocols[protocol])
     data["cc_mimicry"] = bool(protocol == "anthropic" and preset.cc_mimicry)
     _to_key(chat_id, message_id, data, protocol); return True
 
@@ -147,7 +168,8 @@ def wiz_on_protocol_select(chat_id, message_id, cb_id, protocol):
         else: ui.answer_cb(cb_id)
         return
     if protocol not in cm._PROTOCOL_LABEL: ui.answer_cb(cb_id, "无效协议"); return
-    path = data.get("apiPath"); detected = detect_suffix_protocol(path) if path else None
+    path = data.get("apiPath")
+    detected = _cm()._parse_url_for_tg(data.get("baseUrl", "") + path)[2] if path else None
     if path and detected and detected != protocol:
         ui.answer_cb(cb_id); ui.edit(chat_id, message_id, "⚠ <b>协议与路径不匹配</b>\n\n如何处理？",
           reply_markup=ui.inline_kb([[cm._protocol_button(detected, f"chw:proto_adopt:{detected}", prefix="✅ 使用 ")],
@@ -212,8 +234,8 @@ def wiz_on_key_input(chat_id, text):
     if len(key) < 5: ui.send(chat_id, "❌ API Key 过短，请重新输入："); return
     if not state or state.get("action") != "ch_wiz_key": ui.send(chat_id, "❌ 会话过期，请重新添加"); return
     data = state["data"]; data["apiKey"] = key
-    preset = get_preset(data.get("providerId", ""), data.get("providerPresetId", ""))
-    if preset and not preset.models_url:
+    preset = _preset(data.get("providerId", ""), data.get("providerPresetId", ""), chat_id)
+    if preset and not _preset_has_models_url(preset):
         data.pop("discovery_error", None)
         data["discovery_retry_available"] = False
         if preset.static_models:
@@ -228,33 +250,26 @@ def wiz_on_key_input(chat_id, text):
 
 
 async def _discover_model_ids(data):
-    preset = get_preset(data.get("providerId") or "", data.get("providerPresetId") or "")
-    error = None
-    ids: list[str] = []
-    source = "live"
+    name = ui.resolve_code(data.get("short", "")) if data.get("short") else None
+    preset = _preset(data.get("providerId", ""), data.get("providerPresetId", ""))
+    override = preset is not None and hasattr(preset, "models_url")
+    command = DiscoveryCommand(
+        channel_id=f"api:{name}" if name else None,
+        base_url=data.get("baseUrl"), api_path=data.get("apiPath"),
+        api_key=data.get("apiKey"), provider_id=data.get("providerId"),
+        provider_preset_id=data.get("providerPresetId"), catalog_override=override,
+        models_url=getattr(preset, "models_url", None),
+        models_auth=getattr(preset, "models_auth", "bearer"),
+        models_parser=getattr(preset, "models_parser", "openai-data-id"),
+        static_models=tuple(getattr(preset, "static_models", ()) or ()),
+    )
     try:
-        if preset and preset.models_url:
-            ids = await discover_models(
-                preset.models_url, data["apiKey"],
-                auth=preset.models_auth, parser=preset.models_parser,
-            )
-        elif preset and preset.static_models:
-            ids = list(preset.static_models)
-            source = "static"
-        elif preset:
-            raise ModelsDiscoveryError("该提供商未公开模型列表")
-        else:
-            ids = await discover_models(
-                derive_custom_models_url(data["baseUrl"], data.get("apiPath")),
-                data["apiKey"],
-            )
-    except ModelsDiscoveryError as exc:
-        error = str(exc)
-        if preset and preset.static_models:
-            ids = list(preset.static_models)
-            source = "static"
-    retry = bool((preset and preset.models_url) or not preset)
-    return ids, source, error, retry
+        result = await _cm()._CONTROL.discover_model_ids(
+            _cm()._ctx(), command, discoverer=discover_models,
+        )
+    except ManagementError as exc:
+        return [], "live", str(exc), True
+    return list(result.models), result.source, result.error, result.retry_available
 
 
 def start_discovery(chat_id, message_id, data):
@@ -380,7 +395,7 @@ def wiz_discovery_retry(chat_id, message_id, cb_id):
 
 
 def wiz_on_models_input(chat_id, text):
-    try: models = api_channel.parse_models_input(text or "")
+    try: models = _cm()._parse_models_for_tg(text or "")
     except ValueError as exc: ui.send(chat_id, f"❌ {ui.escape_html(str(exc))}\n请重新输入："); return
     state = states.get_state(chat_id)
     if not state or state.get("action") != "ch_wiz_models": ui.send(chat_id, "❌ 会话过期，请重新添加"); return
@@ -477,7 +492,9 @@ def _edit_channel_data(ch, short: str) -> dict:
     data = {
         "short": short,
         "name": ch.display_name,
-        "apiKey": ch.api_key,
+        "apiKey": _cm()._CONTROL.get_channel_secret_for_edit(
+            _cm()._ctx(), getattr(ch, "id", getattr(ch, "key", "")),
+        ),
         "baseUrl": ch.base_url,
         "apiPath": getattr(ch, "api_path", None),
         "providerId": getattr(ch, "provider_id", None),
@@ -600,14 +617,14 @@ def edit_render_models(chat_id, message_id, data):
 
 def edit_start_models(chat_id, message_id, cb_id, short):
     name = ui.resolve_code(short)
-    ch = registry.get_channel(f"api:{name}") if name else None
+    ch = _cm()._get_channel(name, chat_id)
     if ch is None or ch.type != "api":
         ui.answer_cb(cb_id, "渠道不存在")
         return
     ui.answer_cb(cb_id)
     data = _edit_channel_data(ch, short)
-    preset = get_preset(data.get("providerId") or "", data.get("providerPresetId") or "")
-    if preset and not preset.models_url:
+    preset = _preset(data.get("providerId") or "", data.get("providerPresetId") or "")
+    if preset and not _preset_has_models_url(preset):
         data.pop("discovery_error", None)
         data["discovery_retry_available"] = False
         if preset.static_models:
