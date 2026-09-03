@@ -135,6 +135,7 @@ class ChannelView:
     health: ChannelHealth
     recent_success_rate: float | None
     cooldown_count: int
+    permanent_cooldown_count: int
     performance_by_model: Mapping[str, PerformanceView]
     cooldown_by_model: Mapping[str, CooldownView]
     affinity_count: int

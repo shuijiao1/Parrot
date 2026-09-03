@@ -282,6 +282,9 @@ class ChannelControl:
             health=health,
             recent_success_rate=recent_rate,
             cooldown_count=len(cooldowns),
+            permanent_cooldown_count=sum(
+                row.cooldown_until == -1 for row in cooldowns.values()
+            ),
             performance_by_model=perfs,
             cooldown_by_model=cooldowns,
             affinity_count=server_affinity,
@@ -651,11 +654,18 @@ class ChannelControl:
         self._audit(context, "channel.reorder", "channels", "succeeded")
         return revision
 
-    def clear_channel_errors(self, context: ManagementContext, channel_id: str) -> ActionResult:
+    def clear_channel_errors(
+        self, context: ManagementContext, channel_id: str, *, telegram_compatibility: bool = False,
+    ) -> ActionResult:
         self._authorize(context, Capability.WRITE)
-        self._domain_channel(channel_id)
+        live = registry.get_channel(channel_id)
+        if not telegram_compatibility or live is not None:
+            self._domain_channel(channel_id)
         before = sum(1 for row in cooldown.active_entries() if row.get("channel_key") == channel_id)
-        cooldown.clear(channel_id, model=None)
+        cooldown.clear(
+            channel_id, model=None,
+            resolve_alias=not telegram_compatibility or live is not None,
+        )
         self._audit(context, "channel.errors.clear", channel_id, "succeeded")
         return ActionResult(affected=before)
 
@@ -666,21 +676,31 @@ class ChannelControl:
         self._audit(context, "channel.errors.clear-all", "channels", "succeeded")
         return ActionResult(affected=before)
 
-    def clear_channel_affinity(self, context: ManagementContext, channel_id: str) -> ActionResult:
+    def clear_channel_affinity(
+        self, context: ManagementContext, channel_id: str, *, telegram_compatibility: bool = False,
+    ) -> ActionResult:
         self._authorize(context, Capability.WRITE)
-        self._domain_channel(channel_id)
+        if not telegram_compatibility or registry.get_channel(channel_id) is not None:
+            self._domain_channel(channel_id)
         before = sum(1 for row in affinity.snapshot().values() if row.get("channel_key") == channel_id)
-        before += sum(1 for row in affinity.client_snapshot().values() if row.get("channel_key") == channel_id)
+        if not telegram_compatibility:
+            before += sum(1 for row in affinity.client_snapshot().values() if row.get("channel_key") == channel_id)
         affinity.delete_by_channel(channel_id)
-        affinity.client_delete_by_channel(channel_id)
+        if not telegram_compatibility:
+            affinity.client_delete_by_channel(channel_id)
         self._audit(context, "channel.affinity.clear", channel_id, "succeeded")
         return ActionResult(affected=before)
 
-    def clear_all_affinity(self, context: ManagementContext) -> ActionResult:
+    def clear_all_affinity(
+        self, context: ManagementContext, *, telegram_compatibility: bool = False,
+    ) -> ActionResult:
         self._authorize(context, Capability.WRITE)
-        before = len(affinity.snapshot()) + len(affinity.client_snapshot())
+        before = len(affinity.snapshot())
+        if not telegram_compatibility:
+            before += len(affinity.client_snapshot())
         affinity.delete_all()
-        affinity.client_delete_all()
+        if not telegram_compatibility:
+            affinity.client_delete_all()
         self._audit(context, "channel.affinity.clear-all", "channels", "succeeded")
         return ActionResult(affected=before)
 
@@ -763,16 +783,13 @@ class ChannelControl:
         progress_cb: ProgressCallback | None,
         pre_save: bool,
     ) -> ProbeResult:
-        try:
-            ok, elapsed, reason = await probe.probe_with_progress(
-                channel,
-                model,
-                progress_cb=progress_cb,
-                timeout_s=None,
-                progress_interval=10,
-            )
-        except Exception as exc:
-            ok, elapsed, reason = False, 0, str(exc)
+        ok, elapsed, reason = await probe.probe_with_progress(
+            channel,
+            model,
+            progress_cb=progress_cb,
+            timeout_s=None,
+            progress_interval=10,
+        )
         cleared = False
         permanent = False
         if ok:
@@ -799,11 +816,15 @@ class ChannelControl:
         command: DraftProbeCommand,
         *,
         progress_cb: ProgressCallback | None = None,
+        telegram_compatibility: bool = False,
     ) -> ProbeResult:
         self._authorize(context, Capability.WRITE)
         self._authorize(context, Capability.SECRETS_WRITE)
         channel = self._draft_channel(command)
-        return await self._probe(channel, command.model, progress_cb=progress_cb, pre_save=True)
+        return await self._probe(
+            channel, command.model, progress_cb=progress_cb,
+            pre_save=not telegram_compatibility,
+        )
 
     async def probe_existing(
         self,

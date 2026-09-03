@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal, Union
 
 from pydantic import Field, SecretStr, model_validator
@@ -123,11 +124,11 @@ class ProviderUsageMetricData(StrictSchema):
     total: str | None = None
     remaining: str | None = None
     usedPercent: float | None = None
-    resetAt: str | None = None
+    resetAt: datetime | None = None
     resetInSeconds: float | None = None
     status: str | None = None
-    startAt: str | None = None
-    endAt: str | None = None
+    startAt: datetime | None = None
+    endAt: datetime | None = None
     distributionTotal: str | None = None
 
 
@@ -147,9 +148,9 @@ class ProviderUsageData(StrictSchema):
     stale: bool
     partial: bool
     source: str | None = None
-    fetchedAt: int | None = None
+    fetchedAt: datetime | None = None
     error: str | None = None
-    errorAt: int | None = None
+    errorAt: datetime | None = None
     snapshot: ProviderUsageSnapshotData | None = None
 
 
@@ -162,7 +163,7 @@ class ChannelRuntimeModelData(StrictSchema):
     averageConnectMilliseconds: float | None = None
     averageFirstByteMilliseconds: float | None = None
     score: float | None = None
-    cooldownUntil: int | None = None
+    cooldownUntil: datetime | None = None
     cooldownKind: Literal["permanent", "quota", "temporary"] | None = None
     errorCount: int
 

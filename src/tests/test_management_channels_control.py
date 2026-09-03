@@ -27,6 +27,8 @@ from src.management_control.channels import (
 )
 from src.management_control.channels import service as channel_service
 from src.openai.channel.registration import register_factories
+from src.telegram import states
+from src.telegram.menus import channel_menu
 
 
 def _principal(*capabilities: Capability) -> ManagementPrincipal:
@@ -259,6 +261,7 @@ def test_clear_actions_report_affected_entries():
     affinity.upsert("one-server", one.id, "model-real")
     affinity.client_upsert("one-client", one.id, "model-real")
     affinity.upsert("two-server", two.id, "model-real")
+    affinity.client_upsert("two-client", two.id, "model-real")
 
     assert control.clear_channel_errors(ADMIN_CONTEXT, one.id).affected == 1
     assert cooldown.get_state(one.id, "model-real") is None
@@ -266,5 +269,133 @@ def test_clear_actions_report_affected_entries():
     assert cooldown.active_entries() == []
 
     assert control.clear_channel_affinity(ADMIN_CONTEXT, one.id).affected == 2
-    assert control.clear_all_affinity(ADMIN_CONTEXT).affected == 1
+    assert control.clear_all_affinity(ADMIN_CONTEXT).affected == 2
     assert affinity.snapshot() == {} and affinity.client_snapshot() == {}
+
+
+def test_telegram_mixed_cooldown_health_counts_only_permanent_models():
+    control = ChannelControl()
+    command = ChannelCreateCommand(
+        name="Mixed Cooldown",
+        base_url="https://provider.example.test/v1/messages",
+        api_key="sk-fake-channel-key",
+        protocol=ChannelProtocol.ANTHROPIC,
+        models=(
+            ChannelModel(real="permanent-model", alias="permanent-model"),
+            ChannelModel(real="temporary-model", alias="temporary-model"),
+        ),
+    )
+    view = control.create_channel(ADMIN_CONTEXT, command).channel
+    cooldown.record_error(view.id, "permanent-model", "permanent", cooldown_until=-1)
+    cooldown.record_error(
+        view.id, "temporary-model", "temporary", cooldown_until=4_102_444_800_000,
+    )
+
+    refreshed = control.get_channel(ADMIN_CONTEXT, view.id)
+    assert refreshed.cooldown_count == 2
+    assert refreshed.permanent_cooldown_count == 1
+    assert channel_menu._channel_health(refreshed) == ("🔴", "永久冷却 (1模型)")
+
+
+def test_telegram_probe_exception_and_wizard_failure_timing_are_frozen(monkeypatch):
+    draft = DraftProbeCommand(
+        name="Wizard Timing",
+        base_url="https://provider.example.test",
+        api_key="sk-fake-channel-key",
+        protocol=ChannelProtocol.ANTHROPIC,
+        model="failed-model",
+    )
+    edits = []
+    monkeypatch.setattr(channel_menu.ui, "edit", lambda *args, **kwargs: edits.append(args[2]))
+
+    async def failed(*args, **kwargs):
+        return False, 27, "fixed upstream failure"
+
+    monkeypatch.setattr(channel_service.probe, "probe_with_progress", failed)
+    result = asyncio.run(channel_menu._probe_with_progress_async(
+        42, 100, "probe header", draft, "failed-model",
+    ))
+    assert result[:3] == (False, 27, "fixed upstream failure")
+    assert cooldown.get_state("api:Wizard Timing__wiz", "failed-model") is None
+
+    states.set_state(42, "ch_wiz_test", {
+        "name": "Wizard Timing",
+        "baseUrl": "https://provider.example.test",
+        "apiKey": "sk-fake-channel-key",
+        "protocol": "anthropic",
+        "models": [
+            {"real": "good-model", "alias": "good-model"},
+            {"real": "failed-model", "alias": "failed-model"},
+        ],
+        "test_results": {
+            "good-model": (True, 11, None),
+            "failed-model": (False, 27, "fixed upstream failure"),
+        },
+    })
+    monkeypatch.setattr(channel_menu.ui, "answer_cb", lambda *args, **kwargs: None)
+    channel_menu.wiz_save(42, 100, "callback")
+    saved = registry.get_channel("api:Wizard Timing")
+    assert saved is not None
+    saved_state = cooldown.get_state(saved.key, "failed-model")
+    assert saved_state is not None
+    assert saved_state["last_error_message"] == "initial probe failed: fixed upstream failure"
+
+    async def exploded(*args, **kwargs):
+        raise RuntimeError("fixed probe exception")
+
+    monkeypatch.setattr(channel_service.probe, "probe_with_progress", exploded)
+    result = asyncio.run(channel_menu._probe_with_progress_async(
+        42, 101, "probe header", draft, "failed-model",
+    ))
+    assert result[:3] == (False, 0, "fixed probe exception")
+    assert edits[-1] == "probe header\n[×] 测试异常：fixed probe exception"
+    assert "模型测试失败" not in edits[-1]
+
+
+def test_telegram_cleanup_keeps_server_only_and_clears_deleted_shortcode_state(monkeypatch):
+    control = ChannelControl()
+    view = control.create_channel(ADMIN_CONTEXT, _command("Stale Runtime")).channel
+    short = channel_menu.ui.register_code("Stale Runtime")
+    control.delete_channel(ADMIN_CONTEXT, view.id, expected_revision=view.revision)
+
+    now = state_db.now_ms()
+    state_db.error_save(view.id, "model-real", 1, 4_102_444_800_000, "stale")
+    state_db.affinity_upsert("stale-server", view.id, "model-real", last_used=now)
+    state_db.client_affinity_upsert("stale-client", view.id, "model-real", last_used=now)
+    cooldown._entries[(view.id, "model-real")] = {
+        "error_count": 1,
+        "cooldown_until": 4_102_444_800_000,
+        "last_error_message": "stale",
+    }
+    affinity._entries["stale-server"] = {
+        "channel_key": view.id, "model": "model-real", "last_used": now,
+    }
+    affinity._client_entries["stale-client"] = {
+        "channel_key": view.id, "model": "model-real", "last_used": now,
+    }
+    answers = []
+    monkeypatch.setattr(channel_menu.ui, "answer_cb", lambda *args, **kwargs: answers.append(args[1:]))
+    monkeypatch.setattr(channel_menu.ui, "edit", lambda *args, **kwargs: None)
+
+    channel_menu.on_clear_errors(42, 100, "callback", short)
+    assert cooldown.get_state(view.id, "model-real") is None
+    assert state_db.error_load(view.id, "model-real") is None
+    assert answers[-1] == ("已清除",)
+
+    channel_menu.on_clear_affinity(42, 100, "callback", short)
+    assert "stale-server" not in affinity.snapshot()
+    assert not any(row["fingerprint"] == "stale-server" for row in state_db.affinity_load_all())
+    assert "stale-client" in affinity.client_snapshot()
+    assert any(row["client_key"] == "stale-client" for row in state_db.client_affinity_load_all())
+    assert answers[-1] == ("已清空亲和",)
+
+    state_db.affinity_upsert("all-server", view.id, "model-real", last_used=now)
+    affinity._entries["all-server"] = {
+        "channel_key": view.id, "model": "model-real", "last_used": now,
+    }
+    channel_menu.on_clear_affinity_all(42, 100, "callback")
+    assert affinity.snapshot() == {}
+    assert state_db.affinity_load_all() == []
+    assert "stale-client" in affinity.client_snapshot()
+    assert any(row["client_key"] == "stale-client" for row in state_db.client_affinity_load_all())
+    assert answers[-1] == ("已全部清空",)

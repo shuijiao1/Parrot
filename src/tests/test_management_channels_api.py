@@ -7,6 +7,7 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -273,6 +274,20 @@ def test_openapi_operation_manifest_examples_strict_schemas_and_write_only_secre
     channel_data = document["components"]["schemas"]["ChannelData"]
     assert "apiKey" not in channel_data["properties"]
     assert channel_data["additionalProperties"] is False
+    datetime_fields = (
+        ("ProviderUsageData", "fetchedAt"),
+        ("ProviderUsageData", "errorAt"),
+        ("ProviderUsageMetricData", "resetAt"),
+        ("ProviderUsageMetricData", "startAt"),
+        ("ProviderUsageMetricData", "endAt"),
+        ("ChannelRuntimeModelData", "cooldownUntil"),
+    )
+    for schema_name, field_name in datetime_fields:
+        schema = document["components"]["schemas"][schema_name]["properties"][field_name]
+        assert any(
+            node.get("type") == "string" and node.get("format") == "date-time"
+            for node in _nodes(schema) if isinstance(node, dict)
+        ), (schema_name, field_name, schema)
     assert FAKE_CHANNEL_SECRET not in json.dumps(document)
     runtime.close()
 
@@ -593,4 +608,199 @@ def test_channel_read_and_toggle_parity_between_telegram_and_management_api(tmp_
         api_result = copy.deepcopy(config.get()["channels"])
 
     assert api_result == telegram_result
+    runtime.close()
+
+
+def test_channel_control_lifetime_is_scoped_to_app_runtime_with_injection_seam(tmp_path):
+    app, runtime = _build_app(tmp_path)
+    other_root = tmp_path / "other-runtime"
+    other_root.mkdir()
+    _, other_runtime = _build_app(other_root)
+    request = SimpleNamespace(app=app)
+
+    first = channels_router.get_channel_control(request, runtime)
+    assert channels_router.get_channel_control(request, runtime) is first
+    assert first._operation_registry is runtime.operation_registry
+    assert first._operation_store is runtime.operations
+    assert first._audit_sink is runtime.audit_sink
+
+    replacement = channels_router.get_channel_control(request, other_runtime)
+    assert replacement is not first
+    assert replacement._operation_registry is other_runtime.operation_registry
+    assert app.state.management_channel_control_runtime is other_runtime
+
+    injected = ChannelControl()
+    app.state.management_channel_control = injected
+    del app.state.management_channel_control_runtime
+    assert channels_router.get_channel_control(request, runtime) is injected
+    assert not hasattr(channels_router, "_controls")
+
+    runtime.close()
+    other_runtime.close()
+
+
+def test_channel_api_normalizes_all_absolute_times_to_rfc3339_utc(tmp_path, monkeypatch):
+    snapshot = {
+        "version": 1,
+        "source": "fixed-provider",
+        "balances": [],
+        "windows": [{
+            "id": "fixed-window",
+            "label": "Fixed window",
+            "kind": "window",
+            "reset_at": "2023-11-15T06:13:20+08:00",
+            "start_at": "2023-11-14T22:13:20Z",
+            "end_at": "3600",
+        }],
+        "counters": [],
+        "notices": [],
+        "partial": False,
+    }
+    monkeypatch.setattr(channel_service.provider_usage, "spec_for", lambda channel: object())
+    monkeypatch.setattr(channel_service.provider_usage, "cached", lambda channel: {
+        "status": "fresh",
+        "fetched_at": 1_700_000_000_000,
+        "error_at": 1_700_003_600_000,
+        "snapshot": snapshot,
+    })
+    app, runtime = _build_app(tmp_path)
+    body = _manual_create("UTC Channel")
+    monkeypatch.setattr(
+        channel_service.quota_errors,
+        "active_quota_cooldown",
+        lambda row, now_ms=None: row.get("model") == "quota-model",
+    )
+    body["models"] = [
+        {"real": "permanent-model", "alias": "permanent-model"},
+        {"real": "temporary-model", "alias": "temporary-model"},
+        {"real": "quota-model", "alias": "quota-model"},
+    ]
+    with TestClient(app) as client:
+        auth = _session(client)
+        created = client.post(
+            "/api/management/v1/channels", json=body, headers=auth,
+        )
+        assert created.status_code == 201, created.text
+        cooldown.record_error(
+            "api:UTC Channel", "permanent-model", "fixed", cooldown_until=-1,
+        )
+        cooldown.record_error(
+            "api:UTC Channel", "temporary-model", "fixed",
+            cooldown_until=4_102_444_800_000,
+        )
+        cooldown.record_error(
+            "api:UTC Channel", "quota-model", "fixed",
+            cooldown_until=4_102_448_400_000,
+        )
+        response = client.get(
+            "/api/management/v1/channels/api:UTC%20Channel", headers=auth,
+        )
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    usage = data["providerUsage"]
+    assert usage["fetchedAt"] == "2023-11-14T22:13:20Z"
+    assert usage["errorAt"] == "2023-11-14T23:13:20Z"
+    window = usage["snapshot"]["windows"][0]
+    assert window["resetAt"] == "2023-11-14T22:13:20Z"
+    assert window["startAt"] == "2023-11-14T22:13:20Z"
+    assert window["endAt"] is None
+    runtime_models = {item["real"]: item for item in data["runtimeModels"]}
+    assert runtime_models["permanent-model"]["cooldownKind"] == "permanent"
+    assert runtime_models["permanent-model"]["cooldownUntil"] is None
+    assert runtime_models["temporary-model"]["cooldownKind"] == "temporary"
+    assert runtime_models["temporary-model"]["cooldownUntil"] == "2100-01-01T00:00:00Z"
+    assert runtime_models["quota-model"]["cooldownKind"] == "quota"
+    assert runtime_models["quota-model"]["cooldownUntil"] == "2100-01-01T01:00:00Z"
+    assert "-1" not in json.dumps(runtime_models["permanent-model"])
+    assert "+08:00" not in response.text
+    runtime.close()
+
+
+def test_runtime_audit_and_http_polled_failures_are_stable_and_secret_free(tmp_path, monkeypatch):
+    app, runtime = _build_app(tmp_path)
+    exception_marker = "fixed-original-exception"
+
+    async def exploding_discovery(*args, **kwargs):
+        raise RuntimeError(f"{exception_marker}:{FAKE_CHANNEL_SECRET}")
+
+    async def exploding_probe(*args, **kwargs):
+        raise RuntimeError(f"{exception_marker}:{FAKE_CHANNEL_SECRET}")
+
+    monkeypatch.setattr(channel_service, "run_model_discovery", exploding_discovery)
+    monkeypatch.setattr(channel_service.probe, "probe_with_progress", exploding_probe)
+    wire_payloads = []
+    with TestClient(app) as client:
+        auth = _session(client)
+        create_response = client.post(
+            "/api/management/v1/channels",
+            json=_manual_create("Audited Channel"),
+            headers={**auth, "X-Request-Id": "request-channel-create-audit"},
+        )
+        assert create_response.status_code == 201, create_response.text
+        wire_payloads.append(create_response.text)
+
+        requests = (
+            ("request-channel-discovery-failure", "/api/management/v1/channel-model-discoveries", {
+                "source": "draft",
+                "baseUrl": "https://provider.example.test",
+                "apiKey": FAKE_CHANNEL_SECRET,
+                "protocol": "anthropic",
+            }),
+            ("request-channel-probe-failure", "/api/management/v1/channel-drafts/probes", {
+                "name": "failure-draft",
+                "baseUrl": "https://provider.example.test",
+                "apiKey": FAKE_CHANNEL_SECRET,
+                "protocol": "anthropic",
+                "model": "model-real",
+            }),
+        )
+        failed_operations = []
+        for request_id, path, body in requests:
+            submitted = client.post(
+                path, json=body, headers={**auth, "X-Request-Id": request_id},
+            )
+            assert submitted.status_code == 202, submitted.text
+            wire_payloads.append(submitted.text)
+            terminal = _wait_operation(client, auth, submitted.json()["data"]["id"])
+            failed_operations.append((request_id, terminal))
+            wire_payloads.append(json.dumps(terminal))
+
+    for request_id, operation in failed_operations:
+        assert operation["status"] == "failed", (request_id, operation)
+        assert operation["error"] == {
+            "code": "UPSTREAM_ERROR",
+            "message": "UPSTREAM_ERROR",
+            "retryable": True,
+        }
+        assert operation["result"] is None
+    audits = runtime.state_store.audit_snapshot()
+    channel_audit = next(
+        row for row in audits
+        if row["action"] == "channel.create" and row["target"] == "api:Audited Channel"
+    )
+    assert channel_audit == {
+        "actor": "administrator",
+        "action": "channel.create",
+        "target": "api:Audited Channel",
+        "result": "succeeded",
+        "request_id": "request-channel-create-audit",
+        "occurred_at": channel_audit["occurred_at"],
+    }
+    assert channel_audit["occurred_at"] > 0
+    operation_audits = {
+        row["request_id"]: row for row in audits
+        if row["action"] == "operation.create"
+        and row["request_id"] in {item[0] for item in failed_operations}
+    }
+    assert set(operation_audits) == {item[0] for item in failed_operations}
+    assert all(
+        row["actor"] == "administrator"
+        and row["target"].startswith("op_")
+        and row["result"] == "queued"
+        and row["occurred_at"] > 0
+        for row in operation_audits.values()
+    )
+    evidence = json.dumps(audits) + "".join(wire_payloads)
+    assert FAKE_CHANNEL_SECRET not in evidence
+    assert exception_marker not in evidence
     runtime.close()

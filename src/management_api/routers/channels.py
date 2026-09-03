@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from threading import RLock
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Header, Path, Query, Request, Response, status
@@ -77,8 +77,6 @@ from ..schemas.operations import (
 
 
 router = APIRouter()
-_controls: dict[int, tuple[ManagementRuntime, ChannelControl]] = {}
-_controls_lock = RLock()
 
 _CHANNEL_EXAMPLE = {
     "id": "api:example-channel",
@@ -188,20 +186,23 @@ def _no_content_responses() -> dict:
 
 
 def get_channel_control(
+    request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
 ) -> ChannelControl:
-    key = id(runtime)
-    with _controls_lock:
-        current = _controls.get(key)
-        if current is not None and current[0] is runtime:
-            return current[1]
-        control = ChannelControl(
-            operation_registry=runtime.operation_registry,
-            operation_store=runtime.operations,
-            audit_sink=runtime.audit_sink,
-        )
-        _controls[key] = (runtime, control)
-        return control
+    current = getattr(request.app.state, "management_channel_control", None)
+    owner = getattr(request.app.state, "management_channel_control_runtime", None)
+    # Owner absence is the explicit composition/test injection seam. Controls
+    # created here are replaced whenever the app's runtime owner changes.
+    if isinstance(current, ChannelControl) and (owner is None or owner is runtime):
+        return current
+    current = ChannelControl(
+        operation_registry=runtime.operation_registry,
+        operation_store=runtime.operations,
+        audit_sink=runtime.audit_sink,
+    )
+    request.app.state.management_channel_control = current
+    request.app.state.management_channel_control_runtime = runtime
+    return current
 
 
 def _meta(request: Request) -> ResponseMeta:
@@ -225,6 +226,45 @@ def _compatibility_data(revision, compatibility) -> ChannelCompatibilityData:
     )
 
 
+def _utc_time(value: object, *, milliseconds: bool = False) -> datetime | None:
+    """Return only defensible absolute timestamps, normalized to UTC."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(
+                    text[:-1] + "+00:00" if text.endswith("Z") else text
+                )
+            except ValueError:
+                return None
+        else:
+            if milliseconds:
+                if number <= 0:
+                    return None
+                seconds = number / 1000
+            elif abs(number) >= 100_000_000_000:
+                seconds = number / 1000
+            elif abs(number) >= 1_000_000_000:
+                seconds = number
+            else:
+                return None
+            try:
+                parsed = datetime.fromtimestamp(seconds, timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
 def _usage_metric(raw: dict) -> ProviderUsageMetricData:
     return ProviderUsageMetricData(
         id=raw.get("id"),
@@ -238,11 +278,11 @@ def _usage_metric(raw: dict) -> ProviderUsageMetricData:
         total=raw.get("total"),
         remaining=raw.get("remaining"),
         usedPercent=raw.get("used_percent"),
-        resetAt=raw.get("reset_at"),
+        resetAt=_utc_time(raw.get("reset_at")),
         resetInSeconds=raw.get("reset_in_seconds"),
         status=raw.get("status"),
-        startAt=raw.get("start_at"),
-        endAt=raw.get("end_at"),
+        startAt=_utc_time(raw.get("start_at")),
+        endAt=_utc_time(raw.get("end_at")),
         distributionTotal=raw.get("distribution_total"),
     )
 
@@ -266,9 +306,9 @@ def _usage_data(usage) -> ProviderUsageData:
         stale=usage.stale,
         partial=usage.partial,
         source=usage.source,
-        fetchedAt=usage.fetched_at,
+        fetchedAt=_utc_time(usage.fetched_at, milliseconds=True),
         error=usage.error,
-        errorAt=usage.error_at,
+        errorAt=_utc_time(usage.error_at, milliseconds=True),
         snapshot=snapshot,
     )
 
@@ -324,7 +364,10 @@ def _runtime_models(view) -> list[ChannelRuntimeModelData]:
             averageConnectMilliseconds=perf.avg_connect_ms if perf else None,
             averageFirstByteMilliseconds=perf.avg_first_byte_ms if perf else None,
             score=perf.score if perf else None,
-            cooldownUntil=cd.cooldown_until if cd else None,
+            cooldownUntil=(
+                _utc_time(cd.cooldown_until, milliseconds=True)
+                if cd is not None and cd.cooldown_until != -1 else None
+            ),
             cooldownKind=cooldown_kind,
             errorCount=cd.error_count if cd else 0,
         ))

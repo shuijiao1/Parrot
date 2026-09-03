@@ -367,7 +367,7 @@ def _channel_health(ch) -> tuple[str, str]:
     if health is ChannelHealth.DISABLED:
         return "⬛", "已禁用"
     if health is ChannelHealth.PERMANENT_COOLDOWN:
-        return "🔴", f"永久冷却 ({ch.cooldown_count}模型)"
+        return "🔴", f"永久冷却 ({ch.permanent_cooldown_count}模型)"
     if health is ChannelHealth.QUOTA_COOLDOWN:
         return "🟠", f"配额冷却 ({ch.cooldown_count}模型)"
     if health is ChannelHealth.COOLDOWN:
@@ -1295,7 +1295,9 @@ def on_clear_errors(chat_id: int, message_id: int, cb_id: str, payload: str) -> 
         ui.answer_cb(cb_id, "短码已失效")
         return
     try:
-        _CONTROL.clear_channel_errors(_ctx(chat_id), f"api:{name}")
+        _CONTROL.clear_channel_errors(
+            _ctx(chat_id), f"api:{name}", telegram_compatibility=True,
+        )
     except ManagementError:
         pass
     ui.answer_cb(cb_id, "已清除")
@@ -1311,7 +1313,9 @@ def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, payload: str) -
         ui.answer_cb(cb_id, "短码已失效")
         return
     try:
-        _CONTROL.clear_channel_affinity(_ctx(chat_id), f"api:{name}")
+        _CONTROL.clear_channel_affinity(
+            _ctx(chat_id), f"api:{name}", telegram_compatibility=True,
+        )
     except ManagementError:
         pass
     ui.answer_cb(cb_id, "已清空亲和")
@@ -1327,7 +1331,7 @@ def on_clear_errors_all(chat_id: int, message_id: int, cb_id: str, page: int = 1
 
 
 def on_clear_affinity_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> None:
-    _CONTROL.clear_all_affinity(_ctx(chat_id))
+    _CONTROL.clear_all_affinity(_ctx(chat_id), telegram_compatibility=True)
     ui.answer_cb(cb_id, "已全部清空")
     show(chat_id, message_id, page=page)
 
@@ -1731,6 +1735,7 @@ async def _probe_with_progress_async(chat_id: int, msg_id: int, header: str,
                     cc_mimicry=ch.cc_mimicry,
                 ),
                 progress_cb=progress_cb,
+                telegram_compatibility=True,
             )
         else:
             result = await _CONTROL.probe_existing(
