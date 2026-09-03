@@ -29,13 +29,51 @@ callback_data 前缀：`ak:...`
 from __future__ import annotations
 
 import math
-import re
-import secrets
+import secrets  # kept as the shared randomness module patched by frozen tests
+from datetime import datetime, timezone
 from typing import Optional
 
-from ... import apikey_limiter, config, log_db
-from ...channel import registry
+from ...management_auth import AuthMethod, ManagementPrincipal
+from ...management_control import ManagementContext, ManagementError
+from ...management_control.apikey import ApiKeyControl, ApiKeySource
 from .. import menu_cache, states, ui
+
+
+_CONTROL = ApiKeyControl()
+
+
+def _control_context(chat_id: int = 0) -> ManagementContext:
+    return ManagementContext(
+        request_id=f"telegram-apikey:{chat_id}",
+        actor=ManagementPrincipal.administrator(
+            subject_id=f"telegram:{chat_id}",
+            auth_method=AuthMethod.TELEGRAM_ADMIN,
+            issued_at=datetime.now(timezone.utc),
+        ),
+    )
+
+
+def _entry_from_view(view) -> dict:
+    entry = {
+        "key": view.secret or "",
+        "enabled": view.enabled,
+        "allowedModels": list(view.allowed_models),
+        "allowImages": view.allow_images,
+        "allowVideos": view.allow_videos,
+    }
+    if view.limit_override is not None:
+        limits = {}
+        for key, value in (
+            ("enabled", view.limit_override.enabled),
+            ("maxConcurrent", view.limit_override.max_concurrent),
+            ("maxQueue", view.limit_override.max_queue),
+            ("queueWaitSeconds", view.limit_override.queue_wait_seconds),
+        ):
+            if value is not None:
+                limits[key] = value
+        if limits:
+            entry["limits"] = limits
+    return entry
 
 
 def _month_start_ts() -> float:
@@ -50,29 +88,19 @@ def _key_month_stats(name: str) -> Optional[dict]:
     return stats if stats and stats.get("total", 0) > 0 else None
 
 
-_KEY_PREFIX = "ccp-"
-_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_\-\.]{1,64}$")
-_CUSTOM_KEY_PATTERN = re.compile(r"^[A-Za-z0-9\-_.~+/=]{8,256}$")
-
-
 # ─── 工具 ─────────────────────────────────────────────────────────
 
 def _get_entry(name: str) -> Optional[dict]:
-    """取指定 name 的 apiKeys 条目（新结构 dict）。兼容尚未 normalize 的情况。"""
-    entry = (config.get().get("apiKeys") or {}).get(name)
-    if entry is None:
+    """读取兼容视图；冻结 TG 仍显示已保存 secret，API 永不调用此路径。"""
+    if not name:
         return None
-    if isinstance(entry, str):
-        return {
-            "key": entry,
-            "enabled": True,
-            "allowedModels": [],
-            "allowImages": False,
-            "allowVideos": False,
-        }
-    if isinstance(entry, dict):
-        return entry
-    return None
+    try:
+        view = _CONTROL.get_api_key(
+            _control_context(), name, include_secret=True, include_stats=False,
+        )
+    except ManagementError:
+        return None
+    return _entry_from_view(view)
 
 
 def _short_of(name: str) -> str:
@@ -136,7 +164,7 @@ def _source_label(src: str) -> str:
 
 
 def _limit_brief(name: str) -> str:
-    snap = apikey_limiter.key_snapshot(name)
+    snap = _limiter_dict(name)
     if not snap.get("enabled", True):
         return "关闭"
     max_c = "∞" if snap.get("unlimited") else str(snap.get("max_concurrent", 0))
@@ -226,75 +254,66 @@ def _clamp_page(page: int, total: int) -> int:
 
 
 def _all_key_names() -> list[str]:
-    keys = config.get().get("apiKeys") or {}
-    return list(keys.keys()) if isinstance(keys, dict) else []
+    return [
+        item.name for item in _CONTROL.snapshot_api_keys(_control_context())
+    ]
 
 
 def _all_api_key_values(exclude_name: Optional[str] = None) -> list[str]:
-    values: list[str] = []
-    for name, entry in (config.get().get("apiKeys") or {}).items():
-        if exclude_name is not None and name == exclude_name:
-            continue
-        if isinstance(entry, str):
-            key_value = entry
-        elif isinstance(entry, dict):
-            key_value = entry.get("key", "")
-        else:
-            key_value = ""
-        if key_value:
-            values.append(key_value)
-    return values
+    return list(_CONTROL.existing_secret_values(
+        _control_context(), exclude_key_id=exclude_name,
+    ))
 
 
 def _validate_custom_key(key: str, existing_keys: list[str]) -> Optional[str]:
-    if len(key) < 8:
-        return "key 太短，至少 8 个字符。"
-    if len(key) > 256:
-        return "key 太长，最多 256 个字符。"
-    if not _CUSTOM_KEY_PATTERN.fullmatch(key):
-        return "key 含非法字符。仅允许可见 ASCII 字母数字和 -_.~+/=，不允许空格、换行或控制字符。"
+    try:
+        _CONTROL.validate_custom_secret(key)
+    except ManagementError as exc:
+        code = exc.fields[0].code if exc.fields else ""
+        return {
+            "TOO_SHORT": "key 太短，至少 8 个字符。",
+            "TOO_LONG": "key 太长，最多 256 个字符。",
+            "INVALID_CHARACTERS": "key 含非法字符。仅允许可见 ASCII 字母数字和 -_.~+/=，不允许空格、换行或控制字符。",
+        }.get(code, "key 含非法字符。仅允许可见 ASCII 字母数字和 -_.~+/=，不允许空格、换行或控制字符。")
     if key in existing_keys:
         return "key 已被其他 key 使用，请换一个。"
     return None
 
 
-def _new_generated_key() -> str:
-    return f"{_KEY_PREFIX}{secrets.token_hex(24)}"
+def _create_api_key_entry(name: str, api_key: str, chat_id: int = 0) -> None:
+    _CONTROL.create_api_key(
+        _control_context(chat_id), name=name, mode=ApiKeySource.CUSTOM,
+        custom_secret=api_key,
+    )
 
 
-def _create_api_key_entry(name: str, api_key: str) -> None:
-    def _mutate(cfg):
-        cfg.setdefault("apiKeys", {})[name] = {
-            "key": api_key,
-            "enabled": True,
-            "allowedModels": [],
-            "allowImages": False,
-            "allowVideos": False,
-        }
-    config.update(_mutate)
+def _set_api_key_value(name: str, api_key: str, chat_id: int = 0) -> bool:
+    try:
+        _CONTROL.replace_api_key_secret(
+            _control_context(chat_id), name, custom_secret=api_key,
+            if_match=None, require_revision=False, reset_runtime=False,
+        )
+    except ManagementError:
+        return False
+    return True
 
 
-def _set_api_key_value(name: str, api_key: str) -> bool:
-    updated = False
-
-    def _mutate(cfg):
-        nonlocal updated
-        keys = cfg.setdefault("apiKeys", {})
-        entry = keys.get(name)
-        if isinstance(entry, str):
-            keys[name] = {
-                "key": api_key,
-                "enabled": True,
-                "allowedModels": [],
-                "allowImages": False,
-                "allowVideos": False,
-            }
-            updated = True
-        elif isinstance(entry, dict):
-            entry["key"] = api_key
-            updated = True
-    config.update(_mutate)
-    return updated
+def _limiter_dict(name: str) -> dict:
+    snap = _CONTROL.limiter_snapshot(_control_context(), name)
+    return {
+        "enabled": snap.enabled,
+        "in_flight": snap.in_flight,
+        "max_concurrent": snap.max_concurrent,
+        "max_queue": snap.max_queue,
+        "queue_wait_seconds": snap.queue_wait_seconds,
+        "waiting": snap.waiting,
+        "oldest_wait_seconds": snap.oldest_wait_seconds,
+        "unlimited": snap.unlimited,
+        "enabled_source": snap.enabled_source,
+        "max_concurrent_source": snap.max_concurrent_source,
+        "max_queue_source": snap.max_queue_source,
+        "queue_wait_source": snap.queue_wait_source,
+    }
 
 
 def _send_created(chat_id: int, name: str, api_key: str) -> None:
@@ -344,8 +363,11 @@ def _perm_summary_short(
 def _render_list(page: int = 1, *, snapshot: dict | None = None,
                  history_totals: dict[str, int] | None = None,
                  stats_loading: bool = False) -> tuple[str, dict]:
-    keys = (config.get().get("apiKeys") or {})
-    if not isinstance(keys, dict) or not keys:
+    listed = _CONTROL.snapshot_api_keys(
+        _control_context(), include_secret=True,
+    )
+    keys = {item.name: _entry_from_view(item) for item in listed}
+    if not keys:
         text = "🔑 <b>API Key 管理</b>\n当前: 0 个\n\n暂无 Key，点「➕ 添加」创建。"
         rows = [[ui.btn("➕ 添加", "ak:add")], [ui.btn("◀ 返回主菜单", "menu:main")]]
         return text, ui.inline_kb(rows)
@@ -609,7 +631,9 @@ def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1
         models = menu_cache.DETAIL_STATS.peek(model_key)
     if not models.fresh:
         menu_cache.DETAIL_STATS.request(
-            model_key, lambda: log_db.apikey_model_stats(name, since_ts=since),
+            model_key, lambda: _CONTROL.load_model_stats(
+                _control_context(chat_id), name, since_ts=since,
+            ),
         )
     # 旧详情中的按模型调用量、Token、缓存与金额不是可选增强；没有快照时
     # 保持列表不动，不能渲染一个静默删掉按模型区块的页面。
@@ -641,10 +665,12 @@ def on_add(chat_id: int, message_id: int, cb_id: str) -> None:
 
 def on_add_name_input(chat_id: int, text: str) -> None:
     name = (text or "").strip()
-    if not _NAME_PATTERN.match(name):
+    try:
+        _CONTROL.validate_name(name)
+    except ManagementError:
         ui.send(chat_id, "❌ 名称无效。允许字符：字母、数字、<code>_ - .</code>；长度 1-64。请重新输入：")
         return
-    if name in (config.get().get("apiKeys") or {}):
+    if _get_entry(name) is not None:
         ui.send(chat_id, f"❌ 名称 <code>{ui.escape_html(name)}</code> 已存在，请换一个：")
         return
 
@@ -669,14 +695,16 @@ def on_add_auto(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
         ui.answer_cb(cb_id, "会话已过期")
         show(chat_id, message_id)
         return
-    if name in (config.get().get("apiKeys") or {}):
+    if _get_entry(name) is not None:
         ui.answer_cb(cb_id, "名称已存在")
         states.set_state(chat_id, "ak_add_name")
         ui.edit(chat_id, message_id, f"❌ 名称 <code>{ui.escape_html(name)}</code> 已存在，请重新输入名称：")
         return
 
-    api_key = _new_generated_key()
-    _create_api_key_entry(name, api_key)
+    result = _CONTROL.create_api_key(
+        _control_context(chat_id), name=name, mode=ApiKeySource.GENERATED,
+    )
+    api_key = result.secret
     states.pop_state(chat_id)
     ui.answer_cb(cb_id, "已创建")
     _send_created(chat_id, name, api_key)
@@ -705,7 +733,7 @@ def on_add_key_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, "⚠ 会话已过期，请重新添加。")
         states.pop_state(chat_id)
         return
-    if name in (config.get().get("apiKeys") or {}):
+    if _get_entry(name) is not None:
         ui.send(chat_id, f"❌ 名称 <code>{ui.escape_html(name)}</code> 已存在，请重新添加。")
         states.pop_state(chat_id)
         return
@@ -715,7 +743,7 @@ def on_add_key_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, f"❌ {ui.escape_html(err)}\n请重新输入：")
         return
 
-    _create_api_key_entry(name, api_key)
+    _create_api_key_entry(name, api_key, chat_id)
     states.pop_state(chat_id)
     _send_created(chat_id, name, api_key)
 
@@ -746,8 +774,10 @@ def on_regen_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: i
         ui.answer_cb(cb_id, "未找到 Key")
         show(chat_id, message_id, page=page)
         return
-    api_key = _new_generated_key()
-    _set_api_key_value(name, api_key)
+    result = _CONTROL.regenerate_api_key(
+        _control_context(chat_id), name, require_plan=False, reset_runtime=False,
+    )
+    api_key = result.secret
     ui.answer_cb(cb_id, "已重新生成")
     _send_rekeyed(chat_id, name, api_key, page=page)
 
@@ -788,7 +818,7 @@ def on_rekey_input(chat_id: int, text: str) -> None:
     if err:
         ui.send(chat_id, f"❌ {ui.escape_html(err)}\n请重新输入：")
         return
-    _set_api_key_value(name, api_key)
+    _set_api_key_value(name, api_key, chat_id)
     states.pop_state(chat_id)
     _send_rekeyed(chat_id, name, api_key, page=page)
 
@@ -824,10 +854,10 @@ def on_del_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: int
         show(chat_id, message_id, page=page)
         return
 
-    def _mutate(cfg):
-        (cfg.get("apiKeys") or {}).pop(name, None)
-    config.update(_mutate)
-    apikey_limiter.forget_key(name)
+    _CONTROL.delete_api_key(
+        _control_context(chat_id), name, if_match=None,
+        require_confirmation=False, missing_ok=True,
+    )
 
     ui.answer_cb(cb_id, "已删除")
     page = _clamp_page(page, len(_all_key_names()))
@@ -849,21 +879,10 @@ def on_images_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page
         show(chat_id, message_id, page=page)
         return
 
-    def _mutate(cfg):
-        keys = cfg.setdefault("apiKeys", {})
-        cur = keys.get(name)
-        if isinstance(cur, str):
-            cur = {
-                "key": cur,
-                "enabled": True,
-                "allowedModels": [],
-                "allowImages": False,
-                "allowVideos": False,
-            }
-            keys[name] = cur
-        if isinstance(cur, dict):
-            cur["allowImages"] = not bool(cur.get("allowImages", False))
-    config.update(_mutate)
+    _CONTROL.update_api_key(
+        _control_context(chat_id), name,
+        changes={"allow_images": not bool(entry.get("allowImages", False))},
+    )
     ui.answer_cb(cb_id, "已切换")
     text, kb = _render_detail(name, page=page)
     if text:
@@ -878,21 +897,10 @@ def on_videos_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page
         show(chat_id, message_id, page=page)
         return
 
-    def _mutate(cfg):
-        keys = cfg.setdefault("apiKeys", {})
-        cur = keys.get(name)
-        if isinstance(cur, str):
-            cur = {
-                "key": cur,
-                "enabled": True,
-                "allowedModels": [],
-                "allowImages": False,
-                "allowVideos": False,
-            }
-            keys[name] = cur
-        if isinstance(cur, dict):
-            cur["allowVideos"] = not bool(cur.get("allowVideos", False))
-    config.update(_mutate)
+    _CONTROL.update_api_key(
+        _control_context(chat_id), name,
+        changes={"allow_videos": not bool(entry.get("allowVideos", False))},
+    )
     ui.answer_cb(cb_id, "已切换")
     text, kb = _render_detail(name, page=page)
     if text:
@@ -907,21 +915,10 @@ def on_key_enabled_toggle(chat_id: int, message_id: int, cb_id: str, short: str,
         show(chat_id, message_id, page=page)
         return
 
-    def _mutate(cfg):
-        keys = cfg.setdefault("apiKeys", {})
-        cur = keys.get(name)
-        if isinstance(cur, str):
-            cur = {
-                "key": cur,
-                "enabled": True,
-                "allowedModels": [],
-                "allowImages": False,
-                "allowVideos": False,
-            }
-            keys[name] = cur
-        if isinstance(cur, dict):
-            cur["enabled"] = not (cur.get("enabled") is not False)
-    config.update(_mutate)
+    _CONTROL.update_api_key(
+        _control_context(chat_id), name,
+        changes={"enabled": not (entry.get("enabled") is not False)},
+    )
     ui.answer_cb(cb_id, "已切换")
     text, kb = _render_detail(name, page=page)
     if text:
@@ -936,7 +933,7 @@ _LIMIT_STATE_PREFIX = "ak_limit_edit:"
 def _render_limit_detail(name: str, page: int = 1) -> tuple[str, dict]:
     entry = _get_entry(name) or {}
     raw_limits = entry.get("limits") if isinstance(entry.get("limits"), dict) else {}
-    snap = apikey_limiter.key_snapshot(name)
+    snap = _limiter_dict(name)
     max_c = "不限" if snap.get("unlimited") else str(snap.get("max_concurrent", 0))
     enabled_label = "开" if snap.get("enabled", True) else "关"
     oldest = int(snap.get("oldest_wait_seconds", 0) or 0)
@@ -989,22 +986,11 @@ def on_limit_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page:
         ui.answer_cb(cb_id, "未找到 Key")
         show(chat_id, message_id, page=page)
         return
-    cur = apikey_limiter.key_snapshot(name).get("enabled", True)
-    def _mutate(cfg):
-        keys = cfg.setdefault("apiKeys", {})
-        entry = keys.get(name)
-        if isinstance(entry, str):
-            entry = {
-                "key": entry,
-                "enabled": True,
-                "allowedModels": [],
-                "allowImages": False,
-                "allowVideos": False,
-            }
-            keys[name] = entry
-        if isinstance(entry, dict):
-            entry.setdefault("limits", {})["enabled"] = not bool(cur)
-    config.update(_mutate)
+    cur = _limiter_dict(name).get("enabled", True)
+    _CONTROL.update_api_key(
+        _control_context(chat_id), name,
+        changes={"limit_override": {"enabled": not bool(cur)}},
+    )
     ui.answer_cb(cb_id, "已切换")
     text, kb = _render_limit_detail(name, page=page)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
@@ -1016,11 +1002,9 @@ def on_limit_reset(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         ui.answer_cb(cb_id, "未找到 Key")
         show(chat_id, message_id, page=page)
         return
-    def _mutate(cfg):
-        entry = (cfg.setdefault("apiKeys", {}) or {}).get(name)
-        if isinstance(entry, dict):
-            entry.pop("limits", None)
-    config.update(_mutate)
+    _CONTROL.update_api_key(
+        _control_context(chat_id), name, changes={"limit_override": None},
+    )
     ui.answer_cb(cb_id, "已恢复默认")
     text, kb = _render_limit_detail(name, page=page)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
@@ -1072,29 +1056,11 @@ def on_limit_input(chat_id: int, action: str, text: str) -> None:
         ui.send(chat_id, "❌ 输入无效，请重新输入：")
         return
 
-    key_map = {"concurrent": "maxConcurrent", "queue": "maxQueue", "wait": "queueWaitSeconds"}
-    def _mutate(cfg):
-        keys = cfg.setdefault("apiKeys", {})
-        entry = keys.get(name)
-        if isinstance(entry, str):
-            entry = {
-                "key": entry,
-                "enabled": True,
-                "allowedModels": [],
-                "allowImages": False,
-                "allowVideos": False,
-            }
-            keys[name] = entry
-        if isinstance(entry, dict):
-            limits = entry.setdefault("limits", {})
-            k = key_map[field]
-            if value is None:
-                limits.pop(k, None)
-                if not limits:
-                    entry.pop("limits", None)
-            else:
-                limits[k] = value
-    config.update(_mutate)
+    key_map = {"concurrent": "max_concurrent", "queue": "max_queue", "wait": "queue_wait_seconds"}
+    _CONTROL.update_api_key(
+        _control_context(chat_id), name,
+        changes={"limit_override": {key_map[field]: value}},
+    )
     states.pop_state(chat_id)
     label = "继承默认" if value is None else (_fmt_duration(value) if field == "wait" else ("不限" if field == "concurrent" and value == 0 else str(value)))
     ui.send_result(chat_id, f"✅ {ui.escape_html(name)} 的{ {'concurrent':'并发上限','queue':'队列上限','wait':'最长等待'}[field] }已更新为 <code>{ui.escape_html(label)}</code>", back_label="◀ 返回请求限流", back_callback=f"ak:lim:{_callback_payload(short, page)}")
@@ -1106,32 +1072,13 @@ _PERM_STATE = "ak_perm_editing"
 
 
 def _configured_media_models() -> tuple[list[str], list[str]]:
-    xai_cfg = config.get().get("xaiOAuth") or {}
-    if not isinstance(xai_cfg, dict):
-        return [], []
-
-    def _clean(key: str) -> list[str]:
-        raw = xai_cfg.get(key) or []
-        if not isinstance(raw, list):
-            return []
-        out: list[str] = []
-        for item in raw:
-            model = str(item or "").strip()
-            if model and model not in out:
-                out.append(model)
-        return out
-
-    return _clean("imageModels"), _clean("videoModels")
+    images, videos = _CONTROL.configured_media_models(_control_context())
+    return list(images), list(videos)
 
 
 def _available_permission_models() -> list[str]:
     """文本渠道模型与已配置的 Imagine 媒体模型的稳定并集。"""
-    image_models, video_models = _configured_media_models()
-    out: list[str] = []
-    for model in [*registry.available_models(), *image_models, *video_models]:
-        if model and model not in out:
-            out.append(model)
-    return out
+    return list(_CONTROL.available_permission_models(_control_context()))
 
 
 def _permission_model_label(model: str) -> str:
@@ -1265,22 +1212,9 @@ def on_perm_save(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
         return
     checked = list(data.get("checked") or [])
 
-    def _mutate(cfg):
-        keys = cfg.setdefault("apiKeys", {})
-        entry = keys.get(name)
-        if isinstance(entry, str):
-            entry = {
-                "key": entry,
-                "enabled": True,
-                "allowedModels": [],
-                "allowImages": False,
-                "allowVideos": False,
-            }
-            keys[name] = entry
-        if not isinstance(entry, dict):
-            return
-        entry["allowedModels"] = checked
-    config.update(_mutate)
+    _CONTROL.update_api_key(
+        _control_context(chat_id), name, changes={"allowed_models": checked},
+    )
     states.pop_state(chat_id)
 
     ui.answer_cb(cb_id, "已保存")
@@ -1512,16 +1446,11 @@ def on_sort_reset(chat_id: int, message_id: int, cb_id: str) -> None:
     _show_sort(chat_id, message_id)
 
 
-def _save_key_order(draft: list[str]) -> None:
-    order = {name: i for i, name in enumerate(draft)}
-    def _mutate(cfg):
-        keys = cfg.get("apiKeys") or {}
-        if not isinstance(keys, dict):
-            return
-        ordered = {name: keys[name] for name in draft if name in keys}
-        rest = {name: entry for name, entry in keys.items() if name not in order}
-        cfg["apiKeys"] = {**ordered, **rest}
-    config.update(_mutate)
+def _save_key_order(draft: list[str], chat_id: int = 0) -> None:
+    _CONTROL.reorder_api_keys(
+        _control_context(chat_id), draft, if_match=None,
+        require_revision=False, require_complete=False,
+    )
 
 
 def on_sort_save(chat_id: int, message_id: int, cb_id: str) -> None:
@@ -1532,7 +1461,7 @@ def on_sort_save(chat_id: int, message_id: int, cb_id: str) -> None:
         return
     draft = list(data.get("draft") or [])
     page = max(1, int(data.get("page") or 1))
-    _save_key_order(draft)
+    _save_key_order(draft, chat_id)
     states.pop_state(chat_id)
     ui.answer_cb(cb_id, "已保存")
     ui.edit(
