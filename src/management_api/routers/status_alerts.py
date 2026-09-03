@@ -87,6 +87,7 @@ _ERRORS = (
     ManagementErrorCode.VALIDATION_FAILED,
     ManagementErrorCode.RESOURCE_NOT_FOUND,
     ManagementErrorCode.REVISION_CONFLICT,
+    ManagementErrorCode.STATE_CONFLICT,
     ManagementErrorCode.UPSTREAM_ERROR,
     ManagementErrorCode.SERVICE_NOT_READY,
 )

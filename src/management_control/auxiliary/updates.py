@@ -27,6 +27,7 @@ from .common import (
     invalid_field,
     require,
     revision_for,
+    rfc3339_utc,
     string_list,
 )
 
@@ -43,10 +44,12 @@ STAGE_ROLLED_BACK = "rolled_back"
 _ACTIVE_STAGES = {STAGE_BACKING_UP, STAGE_PULLING, STAGE_RESTARTING, STAGE_VERIFYING}
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _SECRET_PATTERNS = (
-    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s]+"),
-    re.compile(r"(?i)((?:access|refresh|session|api)[_-]?token\s*[:=]\s*)[^\s,;]+"),
-    re.compile(r"(?i)((?:password|secret|api[_-]?key)\s*[:=]\s*)[^\s,;]+"),
-    re.compile(r"(?i)(https?://[^\s:/]+:)[^@\s]+(@)"),
+    re.compile(r"(?i)(\bbearer\s+)[^\s,;]+"),
+    re.compile(
+        r"(?i)([\"']?[A-Za-z0-9_.-]*(?:token|key|password|secret)[\"']?\s*[:=]\s*[\"']?)"
+        r"[^\s\"',;}\]]+"
+    ),
+    re.compile(r"(?i)([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^@\s]+(@)"),
 )
 
 
@@ -91,7 +94,7 @@ class UpdateBackup:
     version: str
     target_version: str
     mode: str
-    created_at: str
+    created_at: str | None
     revision: str
 
 
@@ -110,12 +113,19 @@ class UpdateFailureLog:
     revision: str
 
 
+@dataclass(frozen=True, slots=True)
+class StagedUpdateSubmission:
+    operation: ManagementOperation
+    activation_plan_token: str | None
+
+
 @dataclass(slots=True)
 class _ActivationPlan:
     actor_key: str
-    revision: str
     target_version: str
     expires_at: datetime
+    revision: str | None = None
+    ready: bool = False
     consumed: bool = False
 
 
@@ -213,13 +223,13 @@ def _actor_key(context: ManagementContext) -> str:
 
 
 def _sanitize_log(value: str) -> str:
-    result = str(value or "")[-3500:]
+    result = str(value or "")
     for pattern in _SECRET_PATTERNS:
         if pattern.groups == 2:
             result = pattern.sub(r"\1[REDACTED]\2", result)
         else:
             result = pattern.sub(r"\1[REDACTED]", result)
-    return result
+    return result[-3500:]
 
 
 class UpdateControl:
@@ -330,7 +340,11 @@ class UpdateControl:
 
     def check(self, context: ManagementContext) -> UpdateCheckResult:
         require(context, Capability.WRITE)
-        self._updates.force_refresh()
+        try:
+            self._updates.force_refresh()
+        except Exception as exc:
+            audit(self._audit_sink, context, action="updates.check", target="updates", result="failed")
+            raise ManagementError(ManagementErrorCode.UPSTREAM_ERROR, retryable=True) from exc
         result = self.cached_check(context)
         audit(self._audit_sink, context, action="updates.check", target="updates")
         return result
@@ -365,7 +379,7 @@ class UpdateControl:
             "candidateVersion": candidate,
             "candidateName": cached.get("latest_name"),
             "changelog": cached.get("latest_body"),
-            "publishedAt": cached.get("latest_published_at"),
+            "publishedAt": rfc3339_utc(cached.get("latest_published_at")),
             "prerelease": bool(cached.get("latest_prerelease")),
             "releaseUrl": cached.get("latest_url"),
             "newer": self._updates.is_newer(candidate),
@@ -437,7 +451,7 @@ class UpdateControl:
             "version": str(row.get("version") or ""),
             "targetVersion": str(row.get("target_tag") or ""),
             "mode": str(row.get("mode") or ""),
-            "createdAt": str(row.get("ts") or ""),
+            "createdAt": rfc3339_utc(row.get("ts"), compact=True),
         }
         return UpdateBackup(
             ref=stable["ref"],
@@ -463,7 +477,7 @@ class UpdateControl:
         rows = [self._backup(row) for row in self._updates.backups()]
         if mode is not None:
             rows = [row for row in rows if row.mode == mode]
-        rows.sort(key=lambda row: (row.created_at, row.ref), reverse=sort == "createdAtDesc")
+        rows.sort(key=lambda row: (row.created_at or "", row.ref), reverse=sort == "createdAtDesc")
         total = len(rows)
         start = (page - 1) * page_size
         return UpdateBackupPage(
@@ -479,8 +493,9 @@ class UpdateControl:
         return self._updates.backups()
 
     def failure_log(self, context: ManagementContext) -> UpdateFailureLog:
-        require(context, Capability.READ)
+        require(context, Capability.LOG_BODY_READ)
         content = _sanitize_log(self._updates.failure_log())
+        audit(self._audit_sink, context, action="updates.failure-log.read", target="update-failure-log")
         return UpdateFailureLog(content=content, revision=revision_for({"content": content}))
 
     def failure_log_raw(self, context: ManagementContext) -> str:
@@ -599,49 +614,68 @@ class UpdateControl:
             while len(self._idempotency) > 500:
                 self._idempotency.popitem(last=False)
 
-    def stage_update(self, context: ManagementContext, version: str) -> ManagementOperation:
+    def stage_update(self, context: ManagementContext, version: str) -> StagedUpdateSubmission:
         require(context, Capability.UPDATE)
         version = self._validate_version(version)
         fingerprint = hashlib.sha256(version.encode()).hexdigest()
         with self._lock:
             existing = self._idempotent_existing(context, kind=self.STAGE_KIND, fingerprint=fingerprint)
             if existing is not None:
-                return existing
+                return StagedUpdateSubmission(operation=existing, activation_plan_token=None)
             if self._updates.busy():
                 raise ManagementError(ManagementErrorCode.OPERATION_ALREADY_RUNNING, retryable=True)
             if self._operation_registry is None:
                 raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY, retryable=True)
-            operation = self._operation_registry.create(
-                context,
-                kind=self.STAGE_KIND,
-                payload={"version": version, "actorKey": _actor_key(context)},
-                cancellable=False,
+            token, digest = self._new_plan(
+                actor_key=_actor_key(context),
+                target_version=version,
             )
+            try:
+                operation = self._operation_registry.create(
+                    context,
+                    kind=self.STAGE_KIND,
+                    payload={
+                        "version": version,
+                        "actorKey": _actor_key(context),
+                        "planDigest": digest,
+                    },
+                    cancellable=False,
+                )
+            except Exception:
+                self._plans.pop(digest, None)
+                raise
             self._remember_idempotency(
                 context,
                 kind=self.STAGE_KIND,
                 fingerprint=fingerprint,
                 operation_id=operation.id,
             )
-            return operation
+            return StagedUpdateSubmission(operation=operation, activation_plan_token=token)
 
-    def _new_plan(self, *, actor_key: str, target_version: str, revision: str) -> tuple[str, datetime]:
+    def _new_plan(self, *, actor_key: str, target_version: str) -> tuple[str, str]:
         token = secrets.token_urlsafe(32)
         digest = hashlib.sha256(token.encode()).hexdigest()
-        expires = self._clock() + self._plan_ttl
-        with self._lock:
-            self._plans[digest] = _ActivationPlan(
-                actor_key=actor_key,
-                revision=revision,
-                target_version=target_version,
-                expires_at=expires,
-            )
-        return token, expires
+        self._plans[digest] = _ActivationPlan(
+            actor_key=actor_key,
+            target_version=target_version,
+            expires_at=self._clock() + self._plan_ttl,
+        )
+        return token, digest
 
     def _start_stage(self, operation_id: str, context: ManagementContext, payload: Any) -> None:
         store = self._operation_store
         if store is None:
             raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY, retryable=True)
+
+        def fail() -> None:
+            with self._lock:
+                self._plans.pop(str(payload["planDigest"]), None)
+            store.fail(
+                operation_id,
+                code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value,
+                retryable=True,
+            )
 
         def run() -> None:
             store.mark_running(operation_id)
@@ -669,28 +703,27 @@ class UpdateControl:
             finally:
                 self._updates.set_progress(None)
             if not ok:
-                store.fail(
-                    operation_id,
-                    code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
-                    message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value,
-                    retryable=True,
-                )
+                fail()
                 return
-            state = self._state_without_auth()
-            token, expires = self._new_plan(
-                actor_key=str(payload["actorKey"]),
-                target_version=str(payload["version"]),
-                revision=state.revision,
-            )
-            store.succeed(
-                operation_id,
-                {
-                    "stagedVersion": payload["version"],
-                    "activationPlanToken": token,
-                    "expectedRevision": state.revision,
-                    "expiresAt": expires.isoformat(),
-                },
-            )
+            try:
+                state = self._state_without_auth()
+                with self._lock:
+                    plan = self._plans.get(str(payload["planDigest"]))
+                    if plan is None or plan.actor_key != str(payload["actorKey"]):
+                        raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+                    plan.revision = state.revision
+                    plan.ready = True
+                    expires_at = rfc3339_utc(plan.expires_at)
+                store.succeed(
+                    operation_id,
+                    {
+                        "stagedVersion": payload["version"],
+                        "expectedRevision": state.revision,
+                        "expiresAt": expires_at,
+                    },
+                )
+            except Exception:
+                fail()
 
         self._scheduler(run, "management-update-stage")
         audit(self._audit_sink, context, action="updates.stage", target=operation_id, result="queued")
@@ -742,6 +775,8 @@ class UpdateControl:
                 raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
             if plan.actor_key != _actor_key(context):
                 raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+            if not plan.ready or plan.revision is None:
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
             current = self._state_without_auth()
             if current.stage != STAGE_STAGED:
                 raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)

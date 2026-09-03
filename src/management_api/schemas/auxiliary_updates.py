@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import Field
 
 from .base import ResponseMeta, StrictSchema
+from .operations import ManagementOperationData
 
 
 class UpdateSettingsData(StrictSchema):
@@ -31,7 +33,7 @@ class UpdateCheckData(StrictSchema):
     candidateVersion: str | None
     candidateName: str | None
     changelog: str | None
-    publishedAt: str | None
+    publishedAt: datetime | None
     prerelease: bool
     releaseUrl: str | None
     newer: bool
@@ -51,7 +53,7 @@ class UpdateBackupData(StrictSchema):
     version: str
     targetVersion: str
     mode: str
-    createdAt: str
+    createdAt: datetime | None
     revision: str
 
 
@@ -74,6 +76,15 @@ class UpdateBackupListEnvelope(StrictSchema):
 class UpdateFailureLogData(StrictSchema):
     content: str
     revision: str
+
+
+class StageUpdateOperationData(ManagementOperationData):
+    activationPlanToken: str | None = Field(
+        default=None,
+        min_length=16,
+        max_length=256,
+        json_schema_extra={"writeOnly": True},
+    )
 
 
 class ActivateStagedUpdateRequest(StrictSchema):

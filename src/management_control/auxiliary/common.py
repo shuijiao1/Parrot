@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -99,6 +101,50 @@ def telegram_context(chat_id: int) -> ManagementContext:
             issued_at=datetime.now(timezone.utc),
         ),
     )
+
+
+def rfc3339_utc(value: Any, *, compact: bool = False) -> str | None:
+    """Normalize a supported production timestamp without echoing invalid input."""
+
+    parsed: datetime | None = None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            seconds = float(value)
+            if math.isfinite(seconds):
+                parsed = datetime.fromtimestamp(seconds, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            parsed = None
+    elif isinstance(value, str):
+        raw = value.strip()
+        if raw:
+            if compact:
+                try:
+                    parsed = datetime.strptime(raw, "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    parsed = None
+            if parsed is None and re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", raw):
+                try:
+                    seconds = float(raw)
+                    if math.isfinite(seconds):
+                        parsed = datetime.fromtimestamp(seconds, tz=timezone.utc)
+                except (OverflowError, OSError, ValueError):
+                    parsed = None
+            if parsed is None and re.search(r"[Tt ]\d{2}:?\d{2}", raw):
+                iso_value = raw[:-1] + "+00:00" if raw[-1:] in {"Z", "z"} else raw
+                try:
+                    parsed = datetime.fromisoformat(iso_value)
+                except ValueError:
+                    parsed = None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except (OverflowError, ValueError):
+        return None
 
 
 def string_list(value: Any) -> list[str]:

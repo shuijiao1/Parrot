@@ -142,6 +142,8 @@ def test_status_all_operations_list_filters_paging_revision_and_missing(tmp_path
             "hasNext": False,
         }
         assert incident["id"] == "inc-1"
+        assert incident["createdAt"] == "2026-01-02T03:04:05Z"
+        assert incident["updatedAt"] == "2026-01-02T03:05:05Z"
         assert incident["revision"].startswith("rev_")
 
         muted = client.post(
@@ -149,16 +151,23 @@ def test_status_all_operations_list_filters_paging_revision_and_missing(tmp_path
             headers={**headers, "If-Match": incident["revision"]},
         )
         assert muted.status_code == 200
-        assert muted.json()["data"]["muted"] is True
+        muted_data = muted.json()["data"]
+        assert muted_data["muted"] is True
+        assert muted_data["mutedAt"] == "1970-01-01T00:16:40Z"
         muted_list = client.get(
             BASE + "/status-alerts/incidents?view=muted&pageSize=1",
             headers=headers,
         )
         assert muted_list.status_code == 200
         assert muted_list.json()["meta"]["total"] == 1
-        assert muted_list.json()["data"]["items"][0]["id"] == "inc-1"
+        listed_muted = muted_list.json()["data"]["items"][0]
+        assert listed_muted["id"] == "inc-1"
+        assert listed_muted["revision"] == muted_data["revision"]
 
-        unmuted = client.delete(BASE + "/status-alerts/incidents/inc-1/mute", headers=headers)
+        unmuted = client.delete(
+            BASE + "/status-alerts/incidents/inc-1/mute",
+            headers={**headers, "If-Match": muted_data["revision"]},
+        )
         assert unmuted.status_code == 204
         missing = client.delete(BASE + "/status-alerts/incidents/missing/mute", headers=headers)
         assert missing.status_code == 404
@@ -190,3 +199,33 @@ def test_status_list_rejects_unknown_filter(tmp_path):
         )
         assert response.status_code == 422
         assert any(item["path"] == "view" for item in response.json()["error"]["fields"])
+
+
+def test_status_public_times_convert_offsets_and_invalid_values_to_utc_or_null(tmp_path):
+    app, _, fixture = build_auxiliary_app(tmp_path)
+    fixture.status_gateway.active["claude"][0]["created_at"] = "2026-01-02T11:04:05+08:00"
+    fixture.status_gateway.active["claude"][0]["updated_at"] = 1767323105
+    fixture.status_gateway.muted.append({
+        "provider": "openai",
+        "incident_id": "muted-invalid-time",
+        "name": "Muted",
+        "muted_at": "not-a-time",
+        "created_at": "also-not-a-time",
+        "updated_at": None,
+    })
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        active = client.get(
+            BASE + "/status-alerts/incidents?view=active&provider=claude",
+            headers=headers,
+        ).json()["data"]["items"][0]
+        assert active["createdAt"] == "2026-01-02T03:04:05Z"
+        assert active["updatedAt"] == "2026-01-02T03:05:05Z"
+
+        muted = client.get(
+            BASE + "/status-alerts/incidents?view=muted&provider=openai",
+            headers=headers,
+        ).json()["data"]["items"][0]
+        assert muted["createdAt"] is None
+        assert muted["updatedAt"] is None
+        assert muted["mutedAt"] is None

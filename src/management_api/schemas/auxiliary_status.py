@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import Field
@@ -44,12 +45,12 @@ class StatusIncidentData(StrictSchema):
     name: str
     impact: str
     status: str
-    createdAt: str | None
-    updatedAt: str | None
+    createdAt: datetime | None
+    updatedAt: datetime | None
     shortlink: str | None
     muted: bool
     active: bool
-    mutedAt: float | None = None
+    mutedAt: datetime | None = None
     revision: str
 
 

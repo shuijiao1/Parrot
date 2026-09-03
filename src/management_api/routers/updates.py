@@ -16,6 +16,7 @@ from ..schemas.base import DataEnvelope
 from ..schemas.operations import ManagementOperationData
 from ..schemas.auxiliary_updates import (
     ActivateStagedUpdateRequest,
+    StageUpdateOperationData,
     UpdateBackupData,
     UpdateBackupListData,
     UpdateBackupListEnvelope,
@@ -70,7 +71,7 @@ _BACKUPS_EXAMPLE = {
             "version": "0.31.13",
             "targetVersion": "0.32.0",
             "mode": "docker",
-            "createdAt": "20260102-030405",
+            "createdAt": "2026-01-02T03:04:05Z",
             "revision": "rev_example",
         }]
     },
@@ -95,6 +96,13 @@ _OPERATION_EXAMPLE = {
     },
     "meta": {"requestId": "request-example"},
 }
+_STAGE_OPERATION_EXAMPLE = {
+    "data": {
+        **_OPERATION_EXAMPLE["data"],
+        "activationPlanToken": "<one-time-stage-plan>",
+    },
+    "meta": _OPERATION_EXAMPLE["meta"],
+}
 _ERRORS = (
     ManagementErrorCode.INVALID_REQUEST,
     ManagementErrorCode.INVALID_OPERATION_STATE,
@@ -107,6 +115,7 @@ _ERRORS = (
     ManagementErrorCode.STATE_CONFLICT,
     ManagementErrorCode.VALIDATION_FAILED,
     ManagementErrorCode.OPERATION_ALREADY_RUNNING,
+    ManagementErrorCode.UPSTREAM_ERROR,
     ManagementErrorCode.SERVICE_NOT_READY,
     ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
 )
@@ -278,7 +287,7 @@ def list_update_backups(
 def get_update_failure_log(
     request: Request,
     controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
-    context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.LOG_BODY_READ))],
 ) -> DataEnvelope[UpdateFailureLogData]:
     value = controls.updates.failure_log(context)
     return DataEnvelope(
@@ -292,17 +301,22 @@ def get_update_failure_log(
     operation_id="stageUpdate",
     tags=["updates"],
     status_code=status.HTTP_202_ACCEPTED,
-    response_model=DataEnvelope[ManagementOperationData],
-    responses={**success_response(202, _OPERATION_EXAMPLE), **management_error_responses(*_ERRORS)},
+    response_model=DataEnvelope[StageUpdateOperationData],
+    responses={**success_response(202, _STAGE_OPERATION_EXAMPLE), **management_error_responses(*_ERRORS)},
 )
 def stage_update(
     version: Annotated[str, Path(min_length=1, max_length=128)],
     request: Request,
     controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
     context: Annotated[ManagementContext, Depends(require_capability(Capability.UPDATE))],
-) -> DataEnvelope[ManagementOperationData]:
-    operation = controls.updates.stage_update(context, version)
-    return DataEnvelope(data=operation_data(operation), meta=response_meta(request))
+) -> DataEnvelope[StageUpdateOperationData]:
+    submission = controls.updates.stage_update(context, version)
+    operation = operation_data(submission.operation)
+    data = StageUpdateOperationData(
+        **operation.model_dump(),
+        activationPlanToken=submission.activation_plan_token,
+    )
+    return DataEnvelope(data=data, meta=response_meta(request))
 
 
 @router.post(

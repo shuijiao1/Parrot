@@ -6,7 +6,14 @@ from typing import Annotated
 
 from fastapi import Depends, Request
 
-from src.management_control.auxiliary import AuxiliaryControls, get_auxiliary_controls
+from src.management_control.auxiliary import (
+    AuxiliaryControls,
+    ImageControl,
+    StatusAlertControl,
+    TranslationControl,
+    UpdateControl,
+    XaiMediaControl,
+)
 from src.management_control.operations import ManagementOperation
 
 from ..dependencies import ManagementRuntime, get_management_runtime, management_request_id
@@ -15,11 +22,27 @@ from ..schemas.operations import ManagementOperationData, OperationErrorData, Op
 
 
 def get_bound_auxiliary_controls(
+    request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
 ) -> AuxiliaryControls:
-    controls = get_auxiliary_controls()
-    controls.bind_operations(runtime.operations, runtime.operation_registry)
-    return controls
+    current = getattr(request.app.state, "management_auxiliary_controls", None)
+    owner = getattr(request.app.state, "management_auxiliary_controls_runtime", None)
+    # Owner-less controls are an explicit composition/test seam. API-created
+    # controls are runtime-owned and must never reuse Telegram's unaudited singleton.
+    if isinstance(current, AuxiliaryControls) and (owner is None or owner is runtime):
+        current.bind_operations(runtime.operations, runtime.operation_registry)
+        return current
+    current = AuxiliaryControls(
+        translation=TranslationControl(audit_sink=runtime.audit_sink),
+        status_alerts=StatusAlertControl(audit_sink=runtime.audit_sink),
+        updates=UpdateControl(audit_sink=runtime.audit_sink),
+        images=ImageControl(audit_sink=runtime.audit_sink),
+        xai_media=XaiMediaControl(audit_sink=runtime.audit_sink),
+    )
+    current.bind_operations(runtime.operations, runtime.operation_registry)
+    request.app.state.management_auxiliary_controls = current
+    request.app.state.management_auxiliary_controls_runtime = runtime
+    return current
 
 
 def response_meta(request: Request) -> ResponseMeta:

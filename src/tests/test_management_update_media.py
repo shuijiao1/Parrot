@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from urllib.parse import quote
 
+import pytest
 from fastapi.testclient import TestClient
 
+from src.management_auth import AuthMethod, Capability
+from src.management_control import ManagementContext, ManagementError
 from src.tests.management_auxiliary_support import bearer, build_auxiliary_app, create_session
 
 
@@ -52,6 +56,7 @@ def test_update_all_operations_prepare_commit_polling_and_replay(tmp_path):
         assert backups.status_code == 200
         assert backups.json()["meta"]["total"] == 1
         assert backups.json()["data"]["items"][0]["ref"] == "b2"
+        assert backups.json()["data"]["items"][0]["createdAt"] == "2026-02-02T03:04:05Z"
         assert backups.json()["data"]["items"][0]["revision"].startswith("rev_")
 
         failure_log = client.get(BASE + "/updates/failure-log", headers=headers)
@@ -62,16 +67,28 @@ def test_update_all_operations_prepare_commit_polling_and_replay(tmp_path):
         stage_headers = {**headers, "Idempotency-Key": "stage-0.32.0"}
         staged = client.post(BASE + "/updates/0.32.0/actions/stage", headers=stage_headers)
         assert staged.status_code == 202, staged.text
-        stage_operation_id = staged.json()["data"]["id"]
+        stage_data = staged.json()["data"]
+        stage_operation_id = stage_data["id"]
+        plan_token = stage_data["activationPlanToken"]
+        assert isinstance(plan_token, str) and len(plan_token) >= 16
         stage_terminal = _poll(client, headers, stage_operation_id)
         assert stage_terminal["status"] == "succeeded"
         plan = stage_terminal["result"]
-        assert plan["stagedVersion"] == "0.32.0"
+        assert plan == {
+            "stagedVersion": "0.32.0",
+            "expectedRevision": plan["expectedRevision"],
+            "expiresAt": "2026-01-02T00:10:00Z",
+        }
+        assert "activationPlanToken" not in str(stage_terminal)
+        assert plan_token not in str(stage_terminal)
+        assert plan_token not in repr(fixture.controls.updates._plans)
         assert fixture.update_gateway.stage_calls == ["0.32.0"]
 
         duplicate = client.post(BASE + "/updates/0.32.0/actions/stage", headers=stage_headers)
         assert duplicate.status_code == 202
         assert duplicate.json()["data"]["id"] == stage_operation_id
+        assert duplicate.json()["data"]["activationPlanToken"] is None
+        assert plan_token not in duplicate.text
         assert fixture.update_gateway.stage_calls == ["0.32.0"]
 
         conflicting = client.post(BASE + "/updates/0.33.0/actions/stage", headers=stage_headers)
@@ -85,7 +102,7 @@ def test_update_all_operations_prepare_commit_polling_and_replay(tmp_path):
         }
         activated = client.post(
             BASE + "/updates/staged/actions/restart",
-            json={"planToken": plan["activationPlanToken"]},
+            json={"planToken": plan_token},
             headers=activate_headers,
         )
         assert activated.status_code == 202, activated.text
@@ -95,7 +112,7 @@ def test_update_all_operations_prepare_commit_polling_and_replay(tmp_path):
 
         replay = client.post(
             BASE + "/updates/staged/actions/restart",
-            json={"planToken": plan["activationPlanToken"]},
+            json={"planToken": plan_token},
             headers=activate_headers,
         )
         assert replay.status_code == 409
@@ -125,11 +142,12 @@ def test_update_stage_requires_idempotency_and_activation_plan_expires(tmp_path)
             BASE + "/updates/0.32.0/actions/stage",
             headers={**headers, "Idempotency-Key": "stage-expiring"},
         )
+        plan_token = staged.json()["data"]["activationPlanToken"]
         plan = _poll(client, headers, staged.json()["data"]["id"])["result"]
         fixture.controls.updates._clock = lambda: datetime(2026, 1, 2, 1, tzinfo=timezone.utc)
         expired = client.post(
             BASE + "/updates/staged/actions/restart",
-            json={"planToken": plan["activationPlanToken"]},
+            json={"planToken": plan_token},
             headers={
                 **headers,
                 "Idempotency-Key": "activate-expired",
@@ -173,6 +191,7 @@ def test_image_and_xai_all_operations_no_oauth_secret_and_revision_conflict(tmp_
         assert account.status_code == 200, account.text
         account_data = account.json()["data"]
         assert "token" not in account.text.lower()
+        assert account_data["imageCooldownUntil"] is None
         disabled = client.patch(
             account_path,
             json={"enabled": False},
@@ -225,3 +244,216 @@ def test_image_cache_path_escape_and_xai_model_limits_are_rejected(tmp_path):
         )
         assert too_long.status_code == 422
         assert too_long.json()["error"]["fields"][0]["path"] == "imageModels[0]"
+
+
+def test_update_check_maps_upstream_failure_without_leaking_detail(tmp_path):
+    app, _, fixture = build_auxiliary_app(tmp_path)
+    marker = "UPSTREAM_PRIVATE_MARKER"
+
+    def fail_refresh():
+        raise RuntimeError(f"Bearer {marker}")
+
+    fixture.update_gateway.force_refresh = fail_refresh
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        response = client.post(BASE + "/updates/actions/check", headers=headers)
+        assert response.status_code == 502
+        assert response.json()["error"]["code"] == "UPSTREAM_ERROR"
+        assert response.json()["error"]["retryable"] is True
+        assert marker not in response.text
+    audits = fixture.audit.snapshot()
+    assert any(record.action == "updates.check" and record.result == "failed" for record in audits)
+    assert marker not in repr(audits)
+
+
+def test_update_failure_log_requires_body_capability_audits_and_redacts_markers(tmp_path):
+    app, runtime, fixture = build_auxiliary_app(tmp_path)
+    markers = [
+        "MANAGEMENT_KEY_MARKER",
+        "BOT_TOKEN_MARKER",
+        "CUSTOM_TOKEN_MARKER",
+        "CUSTOM_KEY_MARKER",
+        "PASSWORD_MARKER",
+        "SECRET_MARKER",
+        "BEARER_MARKER",
+        "SOCKS_MARKER",
+        "FTP_MARKER",
+    ]
+    fixture.update_gateway.failure_log = lambda: "\n".join([
+        f'managementKey="{markers[0]}"',
+        f"botToken={markers[1]}",
+        f"provider_token: {markers[2]}",
+        f"service_key={markers[3]}",
+        f"password={markers[4]}",
+        f"clientSecret={markers[5]}",
+        f"Authorization: Bearer {markers[6]}",
+        f"socks5://user:{markers[7]}@proxy.invalid:1080",
+        f"ftp://user:{markers[8]}@files.invalid/path",
+    ])
+    restricted = runtime.sessions.issue_for_principal(
+        subject_id="read-only",
+        auth_method=AuthMethod.MANAGEMENT_KEY,
+        roles=(),
+        capabilities=(Capability.READ,),
+    )
+    with pytest.raises(ManagementError) as denied:
+        fixture.controls.updates.failure_log(
+            ManagementContext(request_id="direct-read-only", actor=restricted.principal)
+        )
+    assert denied.value.code.value == "CAPABILITY_DENIED"
+
+    with TestClient(app) as client:
+        denied_response = client.get(
+            BASE + "/updates/failure-log",
+            headers=bearer(restricted.credential),
+        )
+        assert denied_response.status_code == 403
+        headers = bearer(create_session(client))
+        response = client.get(BASE + "/updates/failure-log", headers=headers)
+        assert response.status_code == 200
+        assert response.json()["data"]["content"].count("[REDACTED]") >= len(markers)
+        for marker in markers:
+            assert marker not in response.text
+
+    audits = fixture.audit.snapshot()
+    assert any(record.action == "updates.failure-log.read" for record in audits)
+    for marker in markers:
+        assert marker not in repr(audits)
+
+
+def test_stage_plan_is_actor_bound_and_failed_stage_cannot_activate(tmp_path):
+    cross_path = tmp_path / "cross-actor"
+    cross_path.mkdir()
+    app, _, _ = build_auxiliary_app(cross_path)
+    with TestClient(app) as client:
+        owner_headers = bearer(create_session(client))
+        staged = client.post(
+            BASE + "/updates/0.32.0/actions/stage",
+            headers={**owner_headers, "Idempotency-Key": "stage-cross-actor"},
+        )
+        token = staged.json()["data"]["activationPlanToken"]
+        result = _poll(client, owner_headers, staged.json()["data"]["id"])["result"]
+        other_headers = bearer(create_session(client))
+        denied = client.post(
+            BASE + "/updates/staged/actions/restart",
+            json={"planToken": token},
+            headers={
+                **other_headers,
+                "Idempotency-Key": "activate-cross-actor",
+                "If-Match": result["expectedRevision"],
+            },
+        )
+        assert denied.status_code == 409
+        assert denied.json()["error"]["code"] == "STATE_CONFLICT"
+        assert token not in denied.text
+
+    failed_path = tmp_path / "failed-stage"
+    failed_path.mkdir()
+    app, _, fixture = build_auxiliary_app(failed_path)
+    fixture.update_gateway.stage_ok = False
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        staged = client.post(
+            BASE + "/updates/0.32.0/actions/stage",
+            headers={**headers, "Idempotency-Key": "stage-fails"},
+        )
+        token = staged.json()["data"]["activationPlanToken"]
+        terminal = _poll(client, headers, staged.json()["data"]["id"])
+        assert terminal["status"] == "failed"
+        assert terminal["result"] is None
+        assert token not in str(terminal)
+        assert token not in repr(fixture.controls.updates._plans)
+        denied = client.post(
+            BASE + "/updates/staged/actions/restart",
+            json={"planToken": token},
+            headers={
+                **headers,
+                "Idempotency-Key": "activate-failed-stage",
+                "If-Match": "rev_not_ready",
+            },
+        )
+        assert denied.status_code == 409
+        assert fixture.update_gateway.activate_calls == 0
+        assert token not in denied.text
+
+
+def test_public_update_and_image_times_normalize_or_become_null(tmp_path):
+    app, _, fixture = build_auxiliary_app(tmp_path)
+    fixture.update_gateway.release["latest_published_at"] = 1767323045
+    fixture.media_gateway.image_cooldown_until = 1767323045
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        checked = client.post(BASE + "/updates/actions/check", headers=headers)
+        assert checked.json()["data"]["publishedAt"] == "2026-01-02T03:04:05Z"
+        account = client.get(
+            BASE + "/images/accounts/openai%3Auser%40example.com",
+            headers=headers,
+        )
+        assert account.json()["data"]["imageCooldownUntil"] == "2026-01-02T03:04:05Z"
+
+        fixture.update_gateway.release["latest_published_at"] = "not-a-time"
+        fixture.media_gateway.image_cooldown_until = "not-a-time"
+        assert client.post(BASE + "/updates/actions/check", headers=headers).json()["data"]["publishedAt"] is None
+        assert client.get(
+            BASE + "/images/accounts/openai%3Auser%40example.com",
+            headers=headers,
+        ).json()["data"]["imageCooldownUntil"] is None
+
+        fixture.update_gateway.backups = lambda: [
+            {
+                "ref": "valid-time",
+                "version": "0.31.13",
+                "target_tag": "0.32.0",
+                "mode": "docker",
+                "ts": "20260102-030405",
+            },
+            {
+                "ref": "invalid-time",
+                "version": "0.31.13",
+                "target_tag": "0.32.0",
+                "mode": "docker",
+                "ts": "not-a-time",
+            },
+        ]
+        backups = client.get(BASE + "/updates/backups", headers=headers).json()["data"]["items"]
+        backup = next(item for item in backups if item["ref"] == "invalid-time")
+        assert backup["createdAt"] is None
+
+
+def test_image_api_reconciles_all_legacy_account_identities(tmp_path):
+    app, _, fixture = build_auxiliary_app(tmp_path)
+    fixture.media_gateway.account_key = "openai:user@example.com:acct-1"
+    aliases = [
+        fixture.media_gateway.account_key,
+        f"oauth:{fixture.media_gateway.account_key}",
+        fixture.media_gateway.account_email,
+        f"openai:{fixture.media_gateway.account_email}",
+    ]
+    fixture.config.value["images"]["disabledAccounts"] = [*aliases, "unrelated-account"]
+    account_path = BASE + "/images/accounts/" + quote(fixture.media_gateway.account_key, safe="")
+
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        account = client.get(account_path, headers=headers).json()["data"]
+        assert account["imageEnabled"] is False
+
+        unchanged = client.patch(
+            account_path,
+            json={"enabled": False},
+            headers={**headers, "If-Match": account["revision"]},
+        )
+        assert unchanged.status_code == 200
+        assert fixture.config.value["images"]["disabledAccounts"] == [*aliases, "unrelated-account"]
+        authoritative = client.get(account_path, headers=headers).json()["data"]
+        assert unchanged.json()["data"]["revision"] == authoritative["revision"]
+
+        enabled = client.patch(
+            account_path,
+            json={"enabled": True},
+            headers={**headers, "If-Match": authoritative["revision"]},
+        )
+        assert enabled.status_code == 200
+        assert fixture.config.value["images"]["disabledAccounts"] == ["unrelated-account"]
+        assert enabled.json()["data"]["imageEnabled"] is True
+        final = client.get(account_path, headers=headers).json()["data"]
+        assert enabled.json()["data"]["revision"] == final["revision"]

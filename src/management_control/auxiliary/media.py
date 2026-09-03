@@ -23,6 +23,7 @@ from .common import (
     invalid_field,
     require,
     revision_for,
+    rfc3339_utc,
     string_list,
 )
 
@@ -45,7 +46,7 @@ class ImageAccountState:
     email: str
     oauth_enabled: bool
     image_enabled: bool
-    image_cooldown_until: float | None
+    image_cooldown_until: str | None
     missing_account_id: bool
     revision: str
 
@@ -215,8 +216,8 @@ class ImageControl:
             "oauthEnabled": bool(row.get("enabled")),
             "imageEnabled": not bool(row.get("image_disabled")),
             "imageCooldownUntil": (
-                float(row["image_cooldown_until"])
-                if row.get("image_cooldown_until") is not None
+                rfc3339_utc(row.get("image_cooldown_until"))
+                if row.get("image_cooldown_until") not in (None, "", 0, 0.0, "0")
                 else None
             ),
             "missingAccountId": bool(row.get("missing_account_id")),
@@ -246,6 +247,14 @@ class ImageControl:
                 return self._account(row)
         raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
 
+    @staticmethod
+    def _account_aliases(account_id: str, email: str) -> set[str]:
+        aliases = {account_id.strip().lower(), f"oauth:{account_id.strip()}".lower()}
+        normalized_email = email.strip().lower()
+        if normalized_email:
+            aliases.update({normalized_email, f"openai:{normalized_email}"})
+        return aliases
+
     def update_account(
         self,
         context: ManagementContext,
@@ -257,37 +266,39 @@ class ImageControl:
         require(context, Capability.WRITE)
         current = self.get_account(context, account_id)
         ensure_revision(expected_revision, current.revision)
+        aliases = self._account_aliases(current.account_id, current.email)
 
         def mutate(root: dict[str, Any]) -> None:
             section = root.setdefault("images", {})
             values = list(section.get("disabledAccounts") or [])
-            positions = {str(item).lower(): index for index, item in enumerate(values)}
-            index = positions.get(account_id.lower())
-            if enabled and index is not None:
-                values.pop(index)
-            elif not enabled and index is None:
-                values.append(account_id)
+            if enabled:
+                values = [item for item in values if str(item).strip().lower() not in aliases]
+            elif not any(str(item).strip().lower() in aliases for item in values):
+                values.append(current.account_id)
             section["disabledAccounts"] = values
 
-        self._config.update(mutate)
+        committed = self._config.update(mutate)
+        committed_values = list((committed.get("images") or {}).get("disabledAccounts") or [])
+        image_enabled = not any(str(item).strip().lower() in aliases for item in committed_values)
         audit(self._audit_sink, context, action="images.account.update", target=account_id)
-        # The OAuth list adapter may be eventually consistent in production. Build
-        # the authoritative image state from the known account plus the committed flag.
+        # The OAuth list adapter may be eventually consistent in production. Derive
+        # the returned image flag and revision from the committed authoritative set.
+        stable = {
+            "accountId": current.account_id,
+            "email": current.email,
+            "oauthEnabled": current.oauth_enabled,
+            "imageEnabled": image_enabled,
+            "imageCooldownUntil": current.image_cooldown_until,
+            "missingAccountId": current.missing_account_id,
+        }
         return ImageAccountState(
             account_id=current.account_id,
             email=current.email,
             oauth_enabled=current.oauth_enabled,
-            image_enabled=enabled,
+            image_enabled=image_enabled,
             image_cooldown_until=current.image_cooldown_until,
             missing_account_id=current.missing_account_id,
-            revision=revision_for({
-                "accountId": current.account_id,
-                "email": current.email,
-                "oauthEnabled": current.oauth_enabled,
-                "imageEnabled": enabled,
-                "imageCooldownUntil": current.image_cooldown_until,
-                "missingAccountId": current.missing_account_id,
-            }),
+            revision=revision_for(stable),
         )
 
     def toggle_account_direct(self, context: ManagementContext, account_id: str) -> None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import Field
 
 from .base import StrictSchema
@@ -33,7 +35,7 @@ class ImageAccountStateData(StrictSchema):
     email: str
     oauthEnabled: bool
     imageEnabled: bool
-    imageCooldownUntil: float | None
+    imageCooldownUntil: datetime | None
     missingAccountId: bool
     revision: str
 

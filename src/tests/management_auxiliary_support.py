@@ -175,6 +175,7 @@ class FakeUpdates:
         self.update_state = {"stage": STAGE_IDLE, "mode": "docker"}
         self.progress = None
         self.stage_calls: list[str] = []
+        self.stage_ok = True
         self.activate_calls = 0
         self.cancel_calls = 0
 
@@ -212,8 +213,8 @@ class FakeUpdates:
 
     def backups(self):
         return [
-            {"ref": "b2", "version": "0.31.13", "target_tag": "0.32.0", "mode": "docker", "ts": "20260202"},
-            {"ref": "b1", "version": "0.31.12", "target_tag": "0.31.13", "mode": "src", "ts": "20260101"},
+            {"ref": "b2", "version": "0.31.13", "target_tag": "0.32.0", "mode": "docker", "ts": "20260202-030405"},
+            {"ref": "b1", "version": "0.31.12", "target_tag": "0.31.13", "mode": "src", "ts": "20260101-010203"},
         ]
 
     def failure_log(self):
@@ -224,6 +225,8 @@ class FakeUpdates:
 
     def stage(self, version, *, chat_id=None, notify_msg_id=None):
         self.stage_calls.append(version)
+        if not self.stage_ok:
+            return False, "failed with private upstream detail"
         if self.progress:
             self.progress("backing_up", "backup")
             self.progress("pulling", "pull")
@@ -269,6 +272,9 @@ class FakeMedia:
             "videoJobTtlSeconds": 10800,
             "mediaRequestTimeoutSeconds": 180,
         }
+        self.account_key = "openai:user@example.com"
+        self.account_email = "user@example.com"
+        self.image_cooldown_until: Any = 0
 
     @property
     def data_dir(self):
@@ -280,13 +286,22 @@ class FakeMedia:
         return value
 
     def image_accounts(self):
-        disabled = {str(item).lower() for item in self.image_settings().get("disabledAccounts", [])}
+        disabled = {
+            str(item).strip().lower()
+            for item in self.image_settings().get("disabledAccounts", [])
+        }
+        aliases = {
+            self.account_key.lower(),
+            f"oauth:{self.account_key}".lower(),
+            self.account_email.lower(),
+            f"openai:{self.account_email}".lower(),
+        }
         return [{
-            "account_key": "openai:user@example.com",
-            "email": "user@example.com",
+            "account_key": self.account_key,
+            "email": self.account_email,
             "enabled": True,
-            "image_disabled": "openai:user@example.com" in disabled,
-            "image_cooldown_until": 0,
+            "image_disabled": bool(disabled & aliases),
+            "image_cooldown_until": self.image_cooldown_until,
             "missing_account_id": False,
         }]
 

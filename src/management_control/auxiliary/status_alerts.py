@@ -21,6 +21,7 @@ from .common import (
     invalid_field,
     require,
     revision_for,
+    rfc3339_utc,
     string_list,
 )
 
@@ -51,7 +52,7 @@ class StatusIncident:
     shortlink: str | None
     muted: bool
     active: bool
-    muted_at: float | None
+    muted_at: str | None
     revision: str
 
 
@@ -313,12 +314,12 @@ class StatusAlertControl:
             "name": str(row.get("name") or ""),
             "impact": str(row.get("impact") or "none").lower(),
             "status": str(row.get("status") or "").lower(),
-            "createdAt": row.get("created_at"),
-            "updatedAt": row.get("updated_at"),
+            "createdAt": rfc3339_utc(row.get("created_at")),
+            "updatedAt": rfc3339_utc(row.get("updated_at")),
             "shortlink": row.get("shortlink"),
             "muted": muted,
             "active": active,
-            "mutedAt": float(row["muted_at"]) if row.get("muted_at") is not None else None,
+            "mutedAt": rfc3339_utc(row.get("muted_at")),
         }
         return StatusIncident(
             id=stable["id"],
@@ -418,7 +419,17 @@ class StatusAlertControl:
         ensure_revision(expected_revision, current_revision)
         self._status.mute(provider, incident_id, str(row.get("name") or ""))
         audit(self._audit_sink, context, action="status-alerts.incident.mute", target=incident_id)
-        return self._incident(provider, row, muted=True, active=False)
+        muted_row = next(
+            (
+                item for item in self._status.list_muted()
+                if str(item.get("provider") or "") == provider
+                and str(item.get("incident_id") or item.get("id") or "") == incident_id
+            ),
+            None,
+        )
+        if muted_row is None:
+            raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+        return self._incident(provider, muted_row, muted=True, active=False)
 
     def mute_direct(self, context: ManagementContext, provider: str, incident_id: str, name: str) -> None:
         require(context, Capability.WRITE)

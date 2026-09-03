@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import ast
+import copy
+import json
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from src import config
+from src.management_api.routers.auxiliary_support import get_bound_auxiliary_controls
+from src.management_api.routers.updates import router as updates_router
 from src.management_auth import AuthMethod
 from src.tests.management_auxiliary_support import bearer, build_auxiliary_app, create_session
+from src.tests.test_management_api_foundation import build_app
 
 
 ROUTES = [
@@ -151,7 +157,26 @@ def test_openapi_has_exact_auxiliary_operations_typed_schemas_and_examples(tmp_p
         assert "422" in operation["responses"]
     serialized = repr(document)
     assert "top-secret" not in serialized
-    assert document["components"]["schemas"]["ActivateStagedUpdateRequest"]["properties"]["planToken"]["writeOnly"] is True
+    schemas = document["components"]["schemas"]
+    assert schemas["ActivateStagedUpdateRequest"]["properties"]["planToken"]["writeOnly"] is True
+    assert schemas["StageUpdateOperationData"]["properties"]["activationPlanToken"]["writeOnly"] is True
+    assert "502" in operations["checkForUpdates"]["responses"]
+
+    def is_date_time(property_schema):
+        return property_schema.get("format") == "date-time" or any(
+            item.get("format") == "date-time" for item in property_schema.get("anyOf", [])
+        )
+
+    for schema_name, fields in {
+        "StatusIncidentData": ("createdAt", "updatedAt", "mutedAt"),
+        "UpdateCheckData": ("publishedAt",),
+        "UpdateBackupData": ("createdAt",),
+        "ImageAccountStateData": ("imageCooldownUntil",),
+    }.items():
+        for field in fields:
+            assert is_date_time(schemas[schema_name]["properties"][field]), (schema_name, field)
+    backup_example = operations["listUpdateBackups"]["responses"]["200"]["content"]["application/json"]["example"]
+    assert backup_example["data"]["items"][0]["createdAt"] == "2026-01-02T03:04:05Z"
     for name in (
         "TranslationSettingsData",
         "StatusAlertSettingsData",
@@ -211,3 +236,57 @@ def test_auxiliary_routers_have_no_direct_config_runtime_or_updater_imports():
             if isinstance(node, ast.ImportFrom) and node.module
         }
         assert imports.isdisjoint(forbidden), (path, imports & forbidden)
+
+
+def test_production_auxiliary_dependency_binds_runtime_audit_without_override(
+    tmp_path, monkeypatch,
+):
+    private_config = {
+        "updateChecker": {
+            "enabled": True,
+            "includePrerelease": False,
+            "autoUpdate": False,
+            "intervalSeconds": 3600,
+            "ignoredVersions": [],
+        }
+    }
+    config_path = tmp_path / "private-config.json"
+    config_path.write_text(json.dumps(private_config), encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(config, "_cache", copy.deepcopy(private_config))
+    monkeypatch.setattr(config, "_mtime", config_path.stat().st_mtime)
+    monkeypatch.setattr(config, "_reload_callbacks", [])
+
+    app, runtime, _ = build_app(tmp_path)
+    app.include_router(updates_router, prefix="/api/management/v1")
+    assert get_bound_auxiliary_controls not in app.dependency_overrides
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        response = client.patch(
+            "/api/management/v1/updates/settings",
+            json={"intervalSeconds": 7200},
+            headers={**headers, "X-Request-Id": "production-audit-probe"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["data"]["intervalSeconds"] == 7200
+
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    assert persisted["updateChecker"]["intervalSeconds"] == 7200
+    records = runtime.state_store.audit_snapshot()
+    assert any(
+        row["action"] == "updates.settings.update"
+        and row["request_id"] == "production-audit-probe"
+        for row in records
+    )
+    controls = app.state.management_auxiliary_controls
+    assert app.state.management_auxiliary_controls_runtime is runtime
+    assert all(
+        control._audit_sink is runtime.audit_sink
+        for control in (
+            controls.translation,
+            controls.status_alerts,
+            controls.updates,
+            controls.images,
+            controls.xai_media,
+        )
+    )
