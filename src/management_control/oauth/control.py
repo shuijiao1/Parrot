@@ -399,14 +399,15 @@ class OAuthControl(
                     conflict_account_id=existing[0] if existing else None,
                 )
             )
-        token, plan = self._import_plans.create(
+        import_id, import_secret, plan = self._import_plans.create_split(
             actor_subject_id=context.actor.subject_id,
             kind="import",
             revision=_revision(self.backend.list_accounts()),
             payload=tuple(safe_entries),
         )
         return OAuthImportPreview(
-            import_id=token,
+            import_id=import_id,
+            import_secret=import_secret,
             candidates=tuple(candidates),
             errors=tuple(problems),
             expires_at=plan.expires_at,
@@ -414,10 +415,19 @@ class OAuthControl(
 
     @audit_failures("oauth.import.commit", target="oauthImport")
     def commit_import(
-        self, context: ManagementContext, import_id: str, decisions: Iterable[OAuthImportDecision],
+        self,
+        context: ManagementContext,
+        import_id: str,
+        import_secret: str,
+        decisions: Iterable[OAuthImportDecision],
     ) -> OAuthImportCommitResult:
         self._require(context, Capability.SECRETS_WRITE)
-        plan = self._import_plans.consume(import_id, actor_subject_id=context.actor.subject_id, kind="import")
+        plan = self._import_plans.consume_parts(
+            import_id,
+            import_secret,
+            actor_subject_id=context.actor.subject_id,
+            kind="import",
+        )
         current_revision = _revision(self.backend.list_accounts())
         if current_revision != plan.revision:
             raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
@@ -445,7 +455,7 @@ class OAuthControl(
                 if result.get("status") != "added":
                     raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
                 added.append(str(result.get("account_key") or self.backend.account_id(entry)))
-        self._audit(context, "oauth.import.commit", import_id.partition(".")[0])
+        self._audit(context, "oauth.import.commit", import_id)
         return OAuthImportCommitResult(tuple(added), tuple(replaced), tuple(skipped))
 
     def list_invalid_accounts(self, context: ManagementContext, *, page: PageSpec) -> OAuthAccountPage:

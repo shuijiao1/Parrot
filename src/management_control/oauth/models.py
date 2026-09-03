@@ -183,6 +183,7 @@ class OAuthMutationResult:
 @dataclass(frozen=True, slots=True)
 class OAuthLoginFlow:
     flow_id: str
+    flow_secret: str = field(repr=False)
     provider: OAuthProvider
     auth_url: str | None
     instruction: str | None
@@ -217,6 +218,7 @@ class OAuthImportProblem:
 @dataclass(frozen=True, slots=True)
 class OAuthImportPreview:
     import_id: str
+    import_secret: str = field(repr=False)
     candidates: tuple[OAuthImportCandidate, ...]
     errors: tuple[OAuthImportProblem, ...]
     expires_at: datetime

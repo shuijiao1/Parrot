@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import hmac
 from typing import Iterable
 
 from src.management_auth.principal import AuthMethod, Capability
@@ -49,6 +51,7 @@ class OAuthAccountMutationControlMixin:
         account_id: str,
         old_account: dict,
         entry: dict,
+        flow_binding: tuple[str, str] | None = None,
     ) -> None:
         payload = {
             "account_id": account_id,
@@ -61,6 +64,11 @@ class OAuthAccountMutationControlMixin:
             # bearer plan remains bounded, process-local, actor-bound and 10m TTL.
             "entry": copy.deepcopy(entry),
         }
+        if flow_binding is not None:
+            payload["flow_id"] = flow_binding[0]
+            payload["flow_secret_verifier"] = hashlib.sha256(
+                flow_binding[1].encode("utf-8"),
+            ).digest()
         token, _ = self._replace_plans.create(
             actor_subject_id=context.actor.subject_id,
             kind="replace",
@@ -74,11 +82,20 @@ class OAuthAccountMutationControlMixin:
         context: ManagementContext,
         token: str,
         candidate: dict | None = None,
+        flow_binding: tuple[str, str] | None = None,
     ) -> OAuthMutationResult:
         plan = self._replace_plans.inspect(
             token, actor_subject_id=context.actor.subject_id, kind="replace",
         )
         payload = plan.payload
+        bound_flow_id = payload.get("flow_id")
+        if bound_flow_id is not None:
+            if flow_binding is None or flow_binding[0] != bound_flow_id:
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            if flow_binding[1]:
+                supplied = hashlib.sha256(flow_binding[1].encode("utf-8")).digest()
+                if not hmac.compare_digest(supplied, payload["flow_secret_verifier"]):
+                    raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
         bound_entry = payload["entry"]
         if candidate is not None and (
             self.backend.account_id(candidate) != payload["candidate_identity"]
@@ -108,6 +125,7 @@ class OAuthAccountMutationControlMixin:
         entry: dict,
         *,
         replace_plan_token: str | None = None,
+        flow_binding: tuple[str, str] | None = None,
     ) -> OAuthMutationResult:
         required = [
             field for field in ("email", "access_token", "refresh_token")
@@ -127,6 +145,7 @@ class OAuthAccountMutationControlMixin:
                 account_id=existing[0],
                 old_account=existing[1],
                 entry=entry,
+                flow_binding=flow_binding,
             )
         result = self.backend.add_account_if_absent(copy.deepcopy(entry))
         if result.get("status") != "added":
@@ -139,6 +158,7 @@ class OAuthAccountMutationControlMixin:
                     account_id=existing[0],
                     old_account=existing[1],
                     entry=entry,
+                    flow_binding=flow_binding,
                 )
             raise ManagementError(ManagementErrorCode.IDENTITY_CONFLICT)
         account_id = str(result.get("account_key") or self.backend.account_id(entry))
@@ -174,19 +194,26 @@ class OAuthAccountMutationControlMixin:
         self,
         context: ManagementContext,
         flow_id: str,
+        flow_secret: str,
         command: CompleteOAuthLoginCommand,
     ) -> OAuthMutationResult:
         self._require(context, Capability.SECRETS_WRITE)
         try:
             if command.replace_plan_token:
                 result = self._commit_replace_plan(
-                    context, command.replace_plan_token,
+                    context,
+                    command.replace_plan_token,
+                    flow_binding=(flow_id, flow_secret),
                 )
             else:
                 completed = self._flows.complete(
-                    context.actor.subject_id, flow_id, command,
+                    context.actor.subject_id, flow_id, flow_secret, command,
                 )
-                result = self._create_entry(context, completed.entry)
+                result = self._create_entry(
+                    context,
+                    completed.entry,
+                    flow_binding=(flow_id, flow_secret),
+                )
         except BaseException:
             self._audit(context, "oauth.login.complete", "oauthLogin", "failed")
             raise

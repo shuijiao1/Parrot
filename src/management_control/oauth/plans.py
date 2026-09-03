@@ -1,9 +1,9 @@
 """Bounded one-shot OAuth flow/plan storage.
 
-The store is transport neutral. Public tokens are random bearer capabilities; only a
-SHA-256 verifier is retained for ordinary plans. Import/login payloads may contain
-credentials and therefore remain process-local, bounded, short-lived, and are never
-placed in Operation results or audit details.
+The store is transport neutral. Capabilities may travel as one bearer token or as a
+public opaque ID plus a separate bearer secret; only a SHA-256 verifier is retained.
+Import/login payloads may contain credentials and therefore remain process-local,
+bounded, short-lived, and are never placed in Operation results or audit details.
 """
 
 from __future__ import annotations
@@ -100,6 +100,54 @@ class OneShotPlanStore(Generic[PayloadT]):
             self._records[plan_id] = _Record(plan=plan, verifier=self._digest(secret))
         return token, plan
 
+    def create_split(
+        self,
+        *,
+        actor_subject_id: str,
+        kind: str,
+        revision: str,
+        payload: PayloadT,
+    ) -> tuple[str, str, StoredPlan[PayloadT]]:
+        """Create a capability whose public ID and bearer secret travel separately."""
+        token, plan = self.create(
+            actor_subject_id=actor_subject_id,
+            kind=kind,
+            revision=revision,
+            payload=payload,
+        )
+        _, separator, secret = token.partition(".")
+        if not separator:  # Defensive: create() always emits ``plan_id.secret``.
+            raise RuntimeError("invalid generated one-shot token")
+        return plan.plan_id, secret, plan
+
+    def _resolve_parts(
+        self,
+        plan_id: str,
+        secret: str,
+        *,
+        actor_subject_id: str,
+        kind: str,
+        consume: bool,
+    ) -> StoredPlan[PayloadT]:
+        public_id = str(plan_id or "")
+        supplied = self._digest(str(secret or ""))
+        now = self._now()
+        with self._lock:
+            record = self._records.get(public_id)
+            expected = record.verifier if record is not None else bytes(len(supplied))
+            valid = hmac.compare_digest(supplied, expected)
+            if record is None or not valid:
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            plan = record.plan
+            if plan.expires_at <= now:
+                del self._records[public_id]
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            if plan.actor_subject_id != actor_subject_id or plan.kind != kind:
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            if consume:
+                del self._records[public_id]
+            return plan
+
     def _resolve(
         self,
         token: str,
@@ -111,23 +159,13 @@ class OneShotPlanStore(Generic[PayloadT]):
         plan_id, separator, secret = str(token or "").partition(".")
         # Always hash a value and compare a same-sized digest before returning a
         # public failure, avoiding a fast path for malformed/unknown tokens.
-        supplied = self._digest(secret if separator else "")
-        now = self._now()
-        with self._lock:
-            record = self._records.get(plan_id)
-            expected = record.verifier if record is not None else bytes(len(supplied))
-            valid = hmac.compare_digest(supplied, expected)
-            if record is None or not valid:
-                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
-            plan = record.plan
-            if plan.expires_at <= now:
-                del self._records[plan_id]
-                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
-            if plan.actor_subject_id != actor_subject_id or plan.kind != kind:
-                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
-            if consume:
-                del self._records[plan_id]
-            return plan
+        return self._resolve_parts(
+            plan_id,
+            secret if separator else "",
+            actor_subject_id=actor_subject_id,
+            kind=kind,
+            consume=consume,
+        )
 
     def inspect(self, token: str, *, actor_subject_id: str, kind: str) -> StoredPlan[PayloadT]:
         return self._resolve(
@@ -140,6 +178,38 @@ class OneShotPlanStore(Generic[PayloadT]):
     def consume(self, token: str, *, actor_subject_id: str, kind: str) -> StoredPlan[PayloadT]:
         return self._resolve(
             token,
+            actor_subject_id=actor_subject_id,
+            kind=kind,
+            consume=True,
+        )
+
+    def inspect_parts(
+        self,
+        plan_id: str,
+        secret: str,
+        *,
+        actor_subject_id: str,
+        kind: str,
+    ) -> StoredPlan[PayloadT]:
+        return self._resolve_parts(
+            plan_id,
+            secret,
+            actor_subject_id=actor_subject_id,
+            kind=kind,
+            consume=False,
+        )
+
+    def consume_parts(
+        self,
+        plan_id: str,
+        secret: str,
+        *,
+        actor_subject_id: str,
+        kind: str,
+    ) -> StoredPlan[PayloadT]:
+        return self._resolve_parts(
+            plan_id,
+            secret,
             actor_subject_id=actor_subject_id,
             kind=kind,
             consume=True,

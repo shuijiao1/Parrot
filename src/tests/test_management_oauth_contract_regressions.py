@@ -214,6 +214,101 @@ def test_public_text_and_operation_results_redact_all_credential_shapes(tmp_path
         client.__exit__(None, None, None)
 
 
+def test_http_sanitizer_redacts_leak_matrix_without_erasing_public_metadata_or_prose(tmp_path):
+    client, headers, _, _, backend = auth_client(tmp_path)
+    try:
+        marker = "P1_R3_CREDENTIAL_MARKER_9x"
+        basic = base64.b64encode(f"user:{marker}".encode()).decode()
+        ordinary = (
+            "Basic routing mode", "basic routing mode",
+            "Bearer support is enabled", "bearer support is enabled",
+            "Bearer routing mode", "Bearer monkey",
+            "monkey=value", "MONKEY=value", "hockey=goal",
+            "turkey=dinner", "donkey=value", "passkey=value",
+            "keyboard=value", "channelKey=oauth:public-channel",
+            "credentialConfigured=true", "tokenCount=7", "sessionCount=2",
+            "account_key=oauth:public-account",
+        )
+        sensitive = (
+            f"token={marker}",
+            f"key={marker}",
+            f"secret={marker}",
+            f"credential={marker}",
+            f"providerToken={marker}",
+            f"provider_secret={marker}",
+            f"PROVIDER_CREDENTIAL={marker}",
+            f"authorization=Bearer {marker}",
+            f"cookie={marker}",
+            f"session={marker}",
+            f"Bearer {marker}",
+            f"Basic {basic}",
+            rf'{{\"refresh_token\":\"{marker} with spaces\"}}',
+            "https://URL_USERNAME_ONLY_MARKER@example.invalid/path",
+            f"socks5://URL_USERNAME_MARKER:{marker}@example.invalid/path",
+            rf"https:\/\/ESCAPED_URL_USER_MARKER:{marker}@example.invalid/path",
+            r"https:\/\/UNICODE_AT_USER_MARKER\u0040example.invalid/path",
+        )
+        raw = " | ".join((*ordinary, *sensitive))
+        backend.cooldowns[0]["last_error"] = raw
+
+        response = request(client, "GET", f"/oauth/accounts/{ACCOUNT_ID}", None, headers)
+        assert response.status_code == 200, response.text
+        message = response.json()["data"]["runtimeErrors"][0]["message"]
+        assert all(value in message for value in ordinary)
+        assert marker not in message and basic not in message
+        assert all(
+            value not in message
+            for value in (
+                "URL_USERNAME_ONLY_MARKER",
+                "URL_USERNAME_MARKER",
+                "ESCAPED_URL_USER_MARKER",
+                "UNICODE_AT_USER_MARKER",
+            )
+        )
+        assert backend.cooldowns[0]["last_error"] == raw
+
+        backend.sync_result = {
+            "action": "updated",
+            "account_key": ACCOUNT_ID,
+            "channelKey": "oauth:public-channel",
+            "credentialConfigured": True,
+            "tokenCount": 7,
+            "sessionCount": 2,
+            "providerToken": marker,
+            "provider_secret": marker,
+            "PROVIDER_CREDENTIAL": marker,
+            "message": raw,
+        }
+        started = request(
+            client, "POST", f"/oauth/accounts/{ACCOUNT_ID}/models/actions/sync", None, headers,
+        )
+        operation = client.get(
+            f"/api/management/v1/operations/{started.json()['data']['id']}", headers=headers,
+        )
+        result = operation.json()["data"]["result"]
+        assert result["accountId"] == ACCOUNT_ID
+        assert result["channelKey"] == "oauth:public-channel"
+        assert result["credentialConfigured"] is True
+        assert result["tokenCount"] == 7
+        assert result["sessionCount"] == 2
+        assert marker not in operation.text and basic not in operation.text
+        assert backend.sync_result["providerToken"] == marker
+
+        public_keys = (
+            "channelKey", "credentialConfigured", "tokenCount", "sessionCount",
+            "account_key", "monkey", "MONKEY", "hockey", "turkey", "donkey",
+            "passkey", "keyboard",
+        )
+        sensitive_keys = (
+            "token", "key", "secret", "credential", "providerToken",
+            "provider_secret", "PROVIDER_CREDENTIAL", "authorization", "cookie", "session",
+        )
+        assert all(not is_sensitive_key(key) for key in public_keys)
+        assert all(is_sensitive_key(key) for key in sensitive_keys)
+    finally:
+        client.__exit__(None, None, None)
+
+
 def test_runtime_reuses_audit_bound_control_and_audits_success_and_failure(tmp_path):
     from src import config
 
@@ -390,12 +485,32 @@ def test_replace_plan_is_stable_bound_explicit_and_login_conflict_needs_no_reexc
             client,
             "POST",
             f"/oauth/login-flows/{flow['flowId']}/complete",
-            {"code": "provider-code", "state": state},
+            {"flowSecret": flow["flowSecret"], "code": "provider-code", "state": state},
             headers,
         )
         assert login_conflict.status_code == 409
         assert backend.provider_exchange_count == 1
         login_token = replace_token(login_conflict)
+        wrong_flow_secret = request(
+            client,
+            "POST",
+            f"/oauth/login-flows/{flow['flowId']}/complete",
+            {"flowSecret": "wrong-secret-value", "replacePlanToken": login_token},
+            headers,
+        )
+        cross_flow_id = request(
+            client,
+            "POST",
+            f"/oauth/login-flows/{flow['flowId']}-other/complete",
+            {"replacePlanToken": login_token},
+            headers,
+        )
+        assert wrong_flow_secret.status_code == cross_flow_id.status_code == 400
+        assert wrong_flow_secret.json()["error"]["code"] == "INVALID_OPERATION_STATE"
+        assert cross_flow_id.json()["error"]["code"] == "INVALID_OPERATION_STATE"
+        assert backend.get_account("openai:flow@example.test:flow-workspace")["access_token"] == "old-flow-access"
+        assert backend.provider_exchange_count == 1
+
         committed = request(
             client,
             "POST",
@@ -424,7 +539,9 @@ def test_concurrent_login_complete_exchanges_and_commits_at_most_once():
     def complete():
         barrier.wait()
         try:
-            return control.complete_login_flow(context, flow.flow_id, command).status
+            return control.complete_login_flow(
+                context, flow.flow_id, flow.flow_secret, command,
+            ).status
         except ManagementError as exc:
             return exc.code
 

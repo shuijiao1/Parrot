@@ -117,16 +117,15 @@ class OAuthFlowService:
             auth_url = params.login_url
             payload.update(uuid=params.uuid, verifier=params.verifier)
             instruction = "Complete browser login, then submit completed=true."
-        token, plan = self._flows.create(
+        flow_id, flow_secret, plan = self._flows.create_split(
             actor_subject_id=actor_subject_id,
             kind=f"login:{provider.value}",
             revision="",
             payload=payload,
         )
-        # The flow ID itself is the one-shot capability. It is intentionally not
-        # logged or persisted and is only accepted by the completion route.
         return OAuthLoginFlow(
-            flow_id=token,
+            flow_id=flow_id,
+            flow_secret=flow_secret,
             provider=provider,
             auth_url=auth_url,
             instruction=instruction,
@@ -137,17 +136,18 @@ class OAuthFlowService:
         self,
         actor_subject_id: str,
         flow_id: str,
+        flow_secret: str,
         command: CompleteOAuthLoginCommand,
     ) -> CompletedCredential:
-        plan_id = str(flow_id or "").partition(".")[0]
         # The provider is encoded in stored plan kind, not trusted from input.
         candidates = [provider for provider in OAuthProvider]
         plan = None
         provider = None
         for item in candidates:
             try:
-                plan = self._flows.inspect(
+                plan = self._flows.inspect_parts(
                     flow_id,
+                    flow_secret,
                     actor_subject_id=actor_subject_id,
                     kind=f"login:{item.value}",
                 )
@@ -161,8 +161,9 @@ class OAuthFlowService:
         self._validate_submission(provider, payload, command)
         # Atomic reservation follows side-effect-free validation and precedes
         # provider exchange. Exactly one concurrent completer can proceed.
-        self._flows.consume(
+        self._flows.consume_parts(
             flow_id,
+            flow_secret,
             actor_subject_id=actor_subject_id,
             kind=f"login:{provider.value}",
         )

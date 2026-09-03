@@ -159,7 +159,8 @@ class StartOAuthLoginFlowRequest(StrictSchema):
 
 
 class OAuthLoginFlowData(StrictSchema):
-    flowId: str = Field(json_schema_extra={"writeOnly": True})
+    flowId: str
+    flowSecret: str = Field(json_schema_extra={"writeOnly": True})
     provider: OAuthProvider
     authUrl: str | None = None
     instruction: str | None = None
@@ -167,6 +168,12 @@ class OAuthLoginFlowData(StrictSchema):
 
 
 class CompleteOAuthLoginFlowRequest(StrictSchema):
+    flowSecret: SecretStr | None = Field(
+        default=None,
+        min_length=16,
+        max_length=200,
+        json_schema_extra={"writeOnly": True},
+    )
     code: SecretStr | None = Field(default=None, json_schema_extra={"writeOnly": True})
     state: SecretStr | None = Field(default=None, json_schema_extra={"writeOnly": True})
     callbackUrl: SecretStr | None = Field(default=None, json_schema_extra={"writeOnly": True})
@@ -195,7 +202,8 @@ class OAuthImportProblemData(StrictSchema):
 
 
 class OAuthImportPreviewData(StrictSchema):
-    importId: str = Field(json_schema_extra={"writeOnly": True})
+    importId: str
+    importSecret: str = Field(json_schema_extra={"writeOnly": True})
     candidates: list[OAuthImportCandidateData]
     errors: list[OAuthImportProblemData]
     expiresAt: datetime
@@ -207,6 +215,7 @@ class OAuthImportDecisionRequest(StrictSchema):
 
 
 class CommitOAuthImportRequest(StrictSchema):
+    importSecret: SecretStr = Field(min_length=16, max_length=200, json_schema_extra={"writeOnly": True})
     decisions: list[OAuthImportDecisionRequest] = Field(max_length=10_000)
 
 

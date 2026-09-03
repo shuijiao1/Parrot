@@ -238,7 +238,7 @@ def reorder_oauth_accounts(
     operation_id="startOAuthLoginFlow",
     status_code=status.HTTP_201_CREATED,
     response_model=DataEnvelope[OAuthLoginFlowData],
-    responses=responses(201, {"flowId": "<one-time>", "provider": "openai", "authUrl": "https://example.invalid/login", "instruction": None, "expiresAt": "2026-01-02T03:34:05Z"}, ManagementErrorCode.UPSTREAM_ERROR),
+    responses=responses(201, {"flowId": "oflow_example", "flowSecret": "<one-time-secret>", "provider": "openai", "authUrl": "https://example.invalid/login", "instruction": None, "expiresAt": "2026-01-02T03:34:05Z"}, ManagementErrorCode.UPSTREAM_ERROR),
 )
 async def start_oauth_login_flow(
     body: Annotated[StartOAuthLoginFlowRequest, Body()],
@@ -250,6 +250,7 @@ async def start_oauth_login_flow(
     return DataEnvelope(
         data=OAuthLoginFlowData(
             flowId=result.flow_id,
+            flowSecret=result.flow_secret,
             provider=result.provider,
             authUrl=result.auth_url,
             instruction=result.instruction,
@@ -280,7 +281,13 @@ async def complete_oauth_login_flow(
         replace_plan_token=body.replacePlanToken.get_secret_value() if body.replacePlanToken else None,
     )
     try:
-        result = await asyncio.to_thread(control.complete_login_flow, context, flowId, command)
+        result = await asyncio.to_thread(
+            control.complete_login_flow,
+            context,
+            flowId,
+            body.flowSecret.get_secret_value() if body.flowSecret else "",
+            command,
+        )
     except OAuthReplaceRequired as error:
         return identity_conflict_response(error, request)
     return DataEnvelope(
@@ -293,7 +300,7 @@ async def complete_oauth_login_flow(
     "/oauth/imports/preview",
     operation_id="previewOAuthImport",
     response_model=DataEnvelope[OAuthImportPreviewData],
-    responses=responses(200, {"importId": "<one-time>", "candidates": [], "errors": [], "expiresAt": "2026-01-02T03:14:05Z"}),
+    responses=responses(200, {"importId": "oimport_example", "importSecret": "<one-time-secret>", "candidates": [], "errors": [], "expiresAt": "2026-01-02T03:14:05Z"}),
 )
 def preview_oauth_import(
     body: Annotated[PreviewOAuthImportRequest, Body()],
@@ -310,6 +317,7 @@ def preview_oauth_import(
     return DataEnvelope(
         data=OAuthImportPreviewData(
             importId=result.import_id,
+            importSecret=result.import_secret,
             candidates=[
                 OAuthImportCandidateData(
                     candidateId=item.candidate_id,
@@ -343,6 +351,7 @@ def commit_oauth_import(
     result = control.commit_import(
         context,
         importId,
+        body.importSecret.get_secret_value(),
         [OAuthImportDecision(item.candidateId, item.action) for item in body.decisions],
     )
     return DataEnvelope(

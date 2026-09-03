@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from src.management_api.routers.oauth import router as oauth_router
 from src.management_api.routers.oauth_support import get_oauth_control_dependency
 from src.management_auth import AuthMethod
-from src.management_control import ManagementError, ManagementErrorCode
+from src.management_control import BoundedAuditSink, ManagementError, ManagementErrorCode
 from src.management_control.oauth import (
     CompleteOAuthLoginCommand,
     CreateOAuthAccountCommand,
@@ -57,9 +57,9 @@ ROUTE_REQUESTS = [
     ("DELETE", f"/oauth/accounts/{ACCOUNT_ID}", None, {"If-Match": "revision"}),
     ("PUT", "/oauth/account-order", {"accountIds": [ACCOUNT_ID, INVALID_ID]}, {"If-Match": "revision"}),
     ("POST", "/oauth/login-flows", {"provider": "openai"}, {}),
-    ("POST", "/oauth/login-flows/oflow_invalid.invalid/complete", {"code": "code", "state": "state"}, {}),
+    ("POST", "/oauth/login-flows/oflow_invalid/complete", {"flowSecret": "invalid-secret-value", "code": "code", "state": "state"}, {}),
     ("POST", "/oauth/imports/preview", {"format": "openai", "payload": "[]"}, {}),
-    ("POST", "/oauth/imports/oimport_invalid.invalid/commit", {"decisions": []}, {}),
+    ("POST", "/oauth/imports/oimport_invalid/commit", {"importSecret": "invalid-secret-value", "decisions": []}, {}),
     ("GET", "/oauth/invalid-accounts", None, {}),
     ("POST", "/oauth/invalid-accounts/delete-plan", {"all": True}, {}),
     ("POST", "/oauth/invalid-accounts/delete", {"planToken": "odelete_invalid.invalid"}, {}),
@@ -133,13 +133,18 @@ def test_oauth_openapi_matches_owned_manifest_and_declares_security_and_secrets(
         "JsonOAuthCredential": ("payload",),
         "RefreshTokenOAuthCredential": ("refreshToken",),
         "CreateOAuthAccountRequest": ("replacePlanToken",),
-        "CompleteOAuthLoginFlowRequest": ("code", "state", "callbackUrl", "replacePlanToken"),
+        "OAuthLoginFlowData": ("flowSecret",),
+        "CompleteOAuthLoginFlowRequest": ("flowSecret", "code", "state", "callbackUrl", "replacePlanToken"),
         "PreviewOAuthImportRequest": ("payload",),
+        "OAuthImportPreviewData": ("importSecret",),
+        "CommitOAuthImportRequest": ("importSecret",),
         "CommitPlanRequest": ("planToken",),
     }
     for schema, fields in write_only.items():
         for field in fields:
             assert schemas[schema]["properties"][field]["writeOnly"] is True
+    assert "writeOnly" not in schemas["OAuthLoginFlowData"]["properties"]["flowId"]
+    assert "writeOnly" not in schemas["OAuthImportPreviewData"]["properties"]["importId"]
     assert all(schema.get("additionalProperties") is False for schema in schemas.values() if schema.get("type") == "object")
     serialized = json.dumps({key: operations[key] for key in operations}, ensure_ascii=False)
     assert "access-secret-in-storage" not in serialized
@@ -311,19 +316,19 @@ def test_login_import_invalid_delete_and_quota_plans_are_one_shot(tmp_path):
         state = parse_qs(urlparse(flow["authUrl"]).query)["state"][0]
         missing_state = request(
             client, "POST", f"/oauth/login-flows/{flow['flowId']}/complete",
-            {"code": "flow-code"}, headers,
+            {"flowSecret": flow["flowSecret"], "code": "flow-code"}, headers,
         )
         assert missing_state.status_code == 409
         assert missing_state.json()["error"]["code"] == "STATE_CONFLICT"
         completed = request(
             client, "POST", f"/oauth/login-flows/{flow['flowId']}/complete",
-            {"code": "flow-code", "state": state}, headers,
+            {"flowSecret": flow["flowSecret"], "code": "flow-code", "state": state}, headers,
         )
         assert completed.status_code == 200, completed.text
         assert completed.json()["data"]["accountId"] == "openai:flow@example.test:flow-workspace"
         replay = request(
             client, "POST", f"/oauth/login-flows/{flow['flowId']}/complete",
-            {"code": "flow-code", "state": state}, headers,
+            {"flowSecret": flow["flowSecret"], "code": "flow-code", "state": state}, headers,
         )
         assert replay.status_code == 400
         assert replay.json()["error"]["code"] == "INVALID_OPERATION_STATE"
@@ -340,14 +345,14 @@ def test_login_import_invalid_delete_and_quota_plans_are_one_shot(tmp_path):
         preview_data = preview.json()["data"]
         committed = request(
             client, "POST", f"/oauth/imports/{preview_data['importId']}/commit",
-            {"decisions": [{"candidateId": preview_data["candidates"][0]["candidateId"], "action": "overwrite"}]},
+            {"importSecret": preview_data["importSecret"], "decisions": [{"candidateId": preview_data["candidates"][0]["candidateId"], "action": "overwrite"}]},
             headers,
         )
         assert committed.status_code == 200, committed.text
         assert committed.json()["data"]["added"] == ["claude:import@example.test"]
         replay_import = request(
             client, "POST", f"/oauth/imports/{preview_data['importId']}/commit",
-            {"decisions": [{"candidateId": "candidate-1", "action": "overwrite"}]}, headers,
+            {"importSecret": preview_data["importSecret"], "decisions": [{"candidateId": "candidate-1", "action": "overwrite"}]}, headers,
         )
         assert replay_import.status_code == 400
         assert replay_import.json()["error"]["code"] == "INVALID_OPERATION_STATE"
@@ -361,7 +366,7 @@ def test_login_import_invalid_delete_and_quota_plans_are_one_shot(tmp_path):
         backend.get_account(ACCOUNT_ID)["label"] = "changed-after-preview"
         stale_commit = request(
             client, "POST", f"/oauth/imports/{stale_preview['importId']}/commit",
-            {"decisions": [{"candidateId": "candidate-1", "action": "overwrite"}]}, headers,
+            {"importSecret": stale_preview["importSecret"], "decisions": [{"candidateId": "candidate-1", "action": "overwrite"}]}, headers,
         )
         assert stale_commit.status_code == 409
         assert stale_commit.json()["error"]["code"] == "REVISION_CONFLICT"
@@ -401,6 +406,151 @@ def test_login_import_invalid_delete_and_quota_plans_are_one_shot(tmp_path):
         assert replay_reset.status_code == 400
     finally:
         client.__exit__(None, None, None)
+
+
+def test_login_and_import_capabilities_split_public_path_ids_from_body_secrets(tmp_path):
+    app, runtime, control, backend = oauth_app(tmp_path)
+    domain_audit = BoundedAuditSink()
+    control._audit_sink = domain_audit
+    request_urls = []
+
+    @app.middleware("http")
+    async def capture_request_url(request_, call_next):
+        request_urls.append(str(request_.url))
+        return await call_next(request_)
+
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        flows = [
+            request(client, "POST", "/oauth/login-flows", {"provider": "openai"}, headers).json()["data"]
+            for _ in range(2)
+        ]
+        for flow in flows:
+            assert flow["flowId"].startswith("oflow_")
+            assert "." not in flow["flowId"]
+            assert flow["flowSecret"] not in flow["flowId"]
+
+        state = parse_qs(urlparse(flows[0]["authUrl"]).query)["state"][0]
+        before_accounts = len(backend.accounts)
+        wrong_secret = request(
+            client,
+            "POST",
+            f"/oauth/login-flows/{flows[0]['flowId']}/complete",
+            {"flowSecret": "wrong-secret-value", "code": "flow-code", "state": state},
+            headers,
+        )
+        cross_flow = request(
+            client,
+            "POST",
+            f"/oauth/login-flows/{flows[0]['flowId']}/complete",
+            {"flowSecret": flows[1]["flowSecret"], "code": "flow-code", "state": state},
+            headers,
+        )
+        assert [wrong_secret.status_code, cross_flow.status_code] == [400, 400]
+        assert all(
+            item.json()["error"]["code"] == "INVALID_OPERATION_STATE"
+            for item in (wrong_secret, cross_flow)
+        )
+        assert backend.provider_exchange_count == 0
+        assert len(backend.accounts) == before_accounts
+
+        completed = request(
+            client,
+            "POST",
+            f"/oauth/login-flows/{flows[0]['flowId']}/complete",
+            {"flowSecret": flows[0]["flowSecret"], "code": "flow-code", "state": state},
+            headers,
+        )
+        assert completed.status_code == 200, completed.text
+        after_login_accounts = len(backend.accounts)
+        replay = request(
+            client,
+            "POST",
+            f"/oauth/login-flows/{flows[0]['flowId']}/complete",
+            {"flowSecret": flows[0]["flowSecret"], "code": "flow-code", "state": state},
+            headers,
+        )
+        assert replay.status_code == 400
+        assert backend.provider_exchange_count == 1
+        assert len(backend.accounts) == after_login_accounts
+
+        previews = []
+        for index in range(2):
+            candidate = {
+                "provider": "claude",
+                "email": f"split-import-{index}@example.test",
+                "access_token": f"split-import-access-{index}",
+                "refresh_token": f"split-import-refresh-{index}",
+            }
+            preview = request(
+                client,
+                "POST",
+                "/oauth/imports/preview",
+                {"format": "openai", "payload": json.dumps([candidate])},
+                headers,
+            )
+            assert preview.status_code == 200, preview.text
+            previews.append(preview.json()["data"])
+        for preview in previews:
+            assert preview["importId"].startswith("oimport_")
+            assert "." not in preview["importId"]
+            assert preview["importSecret"] not in preview["importId"]
+
+        decisions = [{"candidateId": "candidate-1", "action": "overwrite"}]
+        before_import_accounts = len(backend.accounts)
+        wrong_import = request(
+            client,
+            "POST",
+            f"/oauth/imports/{previews[0]['importId']}/commit",
+            {"importSecret": "wrong-secret-value", "decisions": decisions},
+            headers,
+        )
+        cross_import = request(
+            client,
+            "POST",
+            f"/oauth/imports/{previews[0]['importId']}/commit",
+            {"importSecret": previews[1]["importSecret"], "decisions": decisions},
+            headers,
+        )
+        assert [wrong_import.status_code, cross_import.status_code] == [400, 400]
+        assert all(
+            item.json()["error"]["code"] == "INVALID_OPERATION_STATE"
+            for item in (wrong_import, cross_import)
+        )
+        assert len(backend.accounts) == before_import_accounts
+
+        committed = request(
+            client,
+            "POST",
+            f"/oauth/imports/{previews[0]['importId']}/commit",
+            {"importSecret": previews[0]["importSecret"], "decisions": decisions},
+            headers,
+        )
+        assert committed.status_code == 200, committed.text
+        after_import_accounts = len(backend.accounts)
+        replay_import = request(
+            client,
+            "POST",
+            f"/oauth/imports/{previews[0]['importId']}/commit",
+            {"importSecret": previews[0]["importSecret"], "decisions": decisions},
+            headers,
+        )
+        assert replay_import.status_code == 400
+        assert len(backend.accounts) == after_import_accounts
+
+        capability_secrets = {
+            *(flow["flowSecret"] for flow in flows),
+            *(preview["importSecret"] for preview in previews),
+        }
+        assert all(secret not in url for secret in capability_secrets for url in request_urls)
+        assert all(
+            secret not in response.text
+            for secret in capability_secrets
+            for response in (wrong_secret, cross_flow, replay, wrong_import, cross_import, replay_import)
+        )
+        assert all(secret not in repr(runtime.state_store.audit_snapshot()) for secret in capability_secrets)
+        assert all(secret not in repr(domain_audit.snapshot()) for secret in capability_secrets)
+        assert all(secret not in json.dumps(app.openapi()) for secret in capability_secrets)
 
 
 def test_models_settings_preferences_defaults_actions_and_operations(tmp_path):
@@ -615,7 +765,7 @@ def test_control_login_flows_cover_every_supported_provider(provider):
             )
         else:
             command = CompleteOAuthLoginCommand(code="provider-code", state=state)
-    result = control.complete_login_flow(context, flow.flow_id, command)
+    result = control.complete_login_flow(context, flow.flow_id, flow.flow_secret, command)
     assert result.status == "created"
     account = backend.get_account(result.account_id)
     assert account is not None

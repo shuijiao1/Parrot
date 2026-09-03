@@ -25,21 +25,56 @@ _VOLATILE_CANDIDATE_FIELDS = {
     "last_model_sync_error",
     "last_model_sync_source",
 }
-_SENSITIVE_KEY_PARTS = ("credential", "password", "passwd", "secret", "session", "cookie", "token")
-_SENSITIVE_KEY_EXACT = {
+_SENSITIVE_KEY_WORDS = {
+    "authorization", "cookie", "credential", "key", "passwd", "password",
+    "secret", "session", "token",
+}
+_PUBLIC_KEY_NORMALIZED = {
+    "accountkey",
+    "channelkey",
+    "credentialconfigured",
+    "keycount",
+    "keyid",
+    "keyname",
+    "sessioncount",
+    "tokencount",
+}
+_KNOWN_CONCATENATED_SENSITIVE_KEYS = {
+    "accesstoken",
     "apikey",
-    "authorization",
-    "proxyauthorization",
-    "xapikey",
     "authheader",
     "authenticationheader",
+    "bottoken",
+    "challengecredential",
+    "clientsecret",
+    "exchangecredential",
+    "exchangesecret",
+    "githubtoken",
+    "idtoken",
+    "managementkey",
+    "proxyauthorization",
+    "refreshtoken",
+    "sessionsecret",
+    "sessiontoken",
+    "setcookie",
+    "upstreamsecret",
+    "webhookcredential",
+    "webhookkey",
+    "webhooksecret",
+    "webhooktoken",
+    "xapikey",
 }
 _URL_USERINFO_RE = re.compile(
-    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)"
-    r"(?P<username>[^\s/@:]+):(?P<password>[^\s/@]+)@"
+    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*:(?:\\*/){2})"
+    r"(?P<userinfo>[^/\s?#@\"']+)(?P<at>@|\\u0040)",
+    re.IGNORECASE,
 )
-_BEARER_RE = re.compile(r"(?i)\bBearer\s+(?P<value>[^\s,;]+)")
-_BASIC_RE = re.compile(r"(?i)\bBasic\s+(?P<value>[A-Za-z0-9+/=_-]{4,})")
+_BEARER_RE = re.compile(
+    r"(?i)(?P<prefix>\bBearer\s+)(?P<value>[A-Za-z0-9._~+/=-]+)"
+)
+_BASIC_RE = re.compile(
+    r"(?i)(?P<prefix>\bBasic\s+)(?P<value>[A-Za-z0-9._~+/=-]+)"
+)
 # Quoted/unquoted plain, JSON, and backslash-escaped JSON key/value forms.
 _KEY_VALUE_RE = re.compile(
     r"(?P<lead>(?:\\?[\"'])?)"
@@ -122,13 +157,12 @@ def utc_datetime(value: Any) -> datetime | None:
 
 
 def is_sensitive_key(key: object) -> bool:
+    """Classify credential keys by real word/case boundaries, not substrings."""
     raw = str(key)
     normalized = "".join(char for char in raw.casefold() if char.isalnum())
-    if normalized in {"accountkey", "keycount", "keyid", "keyname"}:
+    if normalized in _PUBLIC_KEY_NORMALIZED:
         return False
-    if normalized in _SENSITIVE_KEY_EXACT:
-        return True
-    if any(part in normalized for part in _SENSITIVE_KEY_PARTS):
+    if normalized in _KNOWN_CONCATENATED_SENSITIVE_KEYS:
         return True
     words: list[str] = []
     for part in re.split(r"[^A-Za-z0-9]+", raw):
@@ -139,23 +173,25 @@ def is_sensitive_key(key: object) -> bool:
         )
         words.extend(word.casefold() for word in (camel or [part]))
     word_set = set(words)
-    if (
-        word_set.intersection({"auth", "authentication", "authorization"})
-        and word_set.intersection({"header", "headers"})
-    ):
+    if word_set.intersection(_SENSITIVE_KEY_WORDS):
         return True
-    # Covers key/KEY_VALUE/api-key/apiKey/privateKey aliases while avoiding
-    # ordinary words such as monkey and keyboard.
-    return "key" in word_set
+    return bool(
+        word_set.intersection({"auth", "authentication"})
+        and word_set.intersection({"header", "headers"})
+    )
+
+
+def _looks_like_auth_credential(candidate: str) -> bool:
+    return len(candidate) >= 8 and (
+        not candidate.isalpha() or not (candidate.islower() or candidate.isupper())
+    )
 
 
 def _redact_bearer(match: re.Match[str]) -> str:
     value = match.group("value")
-    if value.casefold().strip(".:") in {
-        "authentication", "authorization", "credential", "header", "scheme", "support",
-    }:
+    if not _looks_like_auth_credential(value):
         return match.group(0)
-    return "Bearer [REDACTED]"
+    return match.group("prefix") + "[REDACTED]"
 
 
 def _redact_basic(match: re.Match[str]) -> str:
@@ -164,12 +200,12 @@ def _redact_basic(match: re.Match[str]) -> str:
     try:
         decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
     except (ValueError, TypeError):
+        decoded = b""
+    # RFC user-pass and opaque marker-shaped values are credentials. Plain
+    # lower/upper-case prose such as "Basic routing mode" remains untouched.
+    if b":" not in decoded and not _looks_like_auth_credential(token):
         return match.group(0)
-    # A Basic credential is RFC user-pass.  Do not erase prose such as
-    # "Basic authentication" merely because it resembles base64 characters.
-    if b":" not in decoded:
-        return match.group(0)
-    return match.group(0)[: match.group(0).lower().find("basic") + len("Basic")] + " [REDACTED]"
+    return match.group("prefix") + "[REDACTED]"
 
 
 def _redact_key_value(match: re.Match[str]) -> str:
@@ -194,7 +230,7 @@ def sanitize_text(value: object) -> str:
     """Redact credential-shaped fragments while preserving useful error prose."""
     text = str(value)
     text = _URL_USERINFO_RE.sub(
-        lambda match: f"{match.group('scheme')}[REDACTED]:[REDACTED]@",
+        lambda match: f"{match.group('scheme')}[REDACTED]{match.group('at')}",
         text,
     )
     text = _BEARER_RE.sub(_redact_bearer, text)
