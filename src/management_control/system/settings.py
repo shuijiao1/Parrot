@@ -95,6 +95,20 @@ class SettingsControl(DomainControl):
         self.config = config
 
     @staticmethod
+    def _dependency(callable_):
+        """Return a dependency result without retaining a raw failure chain."""
+        failed = False
+        try:
+            value = callable_()
+        except Exception:
+            failed = True
+        if failed:
+            raise ManagementError(
+                ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
+            )
+        return value
+
+    @staticmethod
     def _mapping(value: Any) -> Mapping[str, Any]:
         return value if isinstance(value, Mapping) else {}
 
@@ -259,7 +273,9 @@ class SettingsControl(DomainControl):
         reader = self._READERS.get(resource)
         if reader is None:
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
-        return getattr(self, reader)(self.config.get())
+        return self._dependency(
+            lambda: getattr(self, reader)(self.config.get()),
+        )
 
     def _update(
         self,
@@ -280,18 +296,40 @@ class SettingsControl(DomainControl):
             # post-commit read, DTO conversion, or audit failure point.
             self.config.update(mutator)
             return None
+        dependency_failed = False
+        revision_conflict = False
+        result = None
         try:
             with self.config.serialized_updates():
-                current = getattr(self, self._READERS[resource])(self.config.get())
-                self._check_revision(expected_revision, current.revision)
-                self.config.update(mutator)
-                result = getattr(self, self._READERS[resource])(self.config.get())
-        except ManagementError:
+                current = self._dependency(
+                    lambda: getattr(self, self._READERS[resource])(self.config.get()),
+                )
+                revision_conflict = (
+                    expected_revision is not None
+                    and expected_revision != current.revision
+                )
+                if not revision_conflict:
+                    self._dependency(lambda: self.config.update(mutator))
+                    result = self._dependency(
+                        lambda: getattr(self, self._READERS[resource])(self.config.get()),
+                    )
+        except Exception:
+            dependency_failed = True
+        if dependency_failed:
             self._audit(actual, action, resource, "failed")
-            raise
-        except Exception as exc:
+            raise ManagementError(
+                ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
+            )
+        if revision_conflict:
             self._audit(actual, action, resource, "failed")
-            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True) from exc
+            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+        if result is None:
+            # A transaction manager that suppresses a body failure is itself an
+            # unavailable dependency boundary, not a successful mutation.
+            self._audit(actual, action, resource, "failed")
+            raise ManagementError(
+                ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
+            )
         self._audit(actual, action, resource, "succeeded")
         return result
 

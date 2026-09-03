@@ -27,13 +27,22 @@ class ContentBlacklistControl(DomainControl):
         self.config = config
         self.registry = registry
 
-    def _channels(self) -> tuple[Any, ...]:
+    @staticmethod
+    def _dependency(callable_):
+        """Return a dependency result without retaining a raw failure chain."""
+        failed = False
         try:
-            return tuple(self.registry.all_channels())
-        except Exception as exc:
+            value = callable_()
+        except Exception:
+            failed = True
+        if failed:
             raise ManagementError(
                 ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
-            ) from exc
+            )
+        return value
+
+    def _channels(self) -> tuple[Any, ...]:
+        return self._dependency(lambda: tuple(self.registry.all_channels()))
 
     @staticmethod
     def _channel_maps(channels: Iterable[Any]) -> tuple[dict[str, str], dict[str, list[str]]]:
@@ -119,10 +128,22 @@ class ContentBlacklistControl(DomainControl):
         # Management channel writers already use config -> registry.  Following
         # that order here avoids the former registry -> config AB-BA deadlock and
         # makes the config and visibility inputs one stable read point.
-        with self.config.serialized_updates():
-            cfg = self.config.get()
-            channels = self._channels()
-            return self._snapshot_from(cfg, channels)
+        failed = False
+        result = None
+        try:
+            with self.config.serialized_updates():
+                cfg = self._dependency(self.config.get)
+                channels = self._channels()
+                result = self._dependency(
+                    lambda: self._snapshot_from(cfg, channels),
+                )
+        except Exception:
+            failed = True
+        if failed or result is None:
+            raise ManagementError(
+                ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
+            )
+        return result
 
     def get(self, context: ManagementContext | None) -> ContentBlacklist:
         self._read(context)
@@ -152,24 +173,63 @@ class ContentBlacklistControl(DomainControl):
         mutate,
     ) -> ContentBlacklist:
         actual = self._write(context, capability)
+        dependency_failed = False
+        revision_conflict = False
+        domain_error: ManagementError | None = None
+        result = None
+
+        def guarded_mutate(cfg):
+            nonlocal domain_error
+            try:
+                return mutate(cfg, channels)
+            except ManagementError as exc:
+                # Only errors raised by our mutation callback are public domain
+                # errors. A ManagementError raised by config/transaction code is
+                # still an untrusted dependency failure.
+                domain_error = exc
+                raise
+
         try:
             with self.config.serialized_updates():
                 channels = self._channels()
-                current = self._snapshot_from(self.config.get(), channels)
-                self._check_revision(expected_revision, current.revision)
-                updated = self.config.update(lambda cfg: mutate(cfg, channels))
-                # Blacklist mutation cannot change channel visibility.  Reusing
-                # the in-transaction registry snapshot avoids a post-commit
-                # dependency read while still returning the committed public DTO.
-                result = self._snapshot_from(updated, channels)
-        except ManagementError:
-            self._audit(actual, action, target, "failed")
-            raise
-        except Exception as exc:
+                current = self._dependency(
+                    lambda: self._snapshot_from(self.config.get(), channels),
+                )
+                revision_conflict = (
+                    expected_revision is not None
+                    and expected_revision != current.revision
+                )
+                if not revision_conflict:
+                    try:
+                        updated = self.config.update(guarded_mutate)
+                    except Exception as exc:
+                        if exc is not domain_error:
+                            dependency_failed = True
+                    if not dependency_failed and domain_error is None:
+                        # Blacklist mutation cannot change channel visibility.
+                        # Reusing this registry snapshot preserves config ->
+                        # registry lock order and the committed public revision.
+                        result = self._dependency(
+                            lambda: self._snapshot_from(updated, channels),
+                        )
+        except Exception:
+            dependency_failed = True
+        if dependency_failed:
             self._audit(actual, action, target, "failed")
             raise ManagementError(
                 ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
-            ) from exc
+            )
+        if revision_conflict:
+            self._audit(actual, action, target, "failed")
+            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+        if domain_error is not None:
+            self._audit(actual, action, target, "failed")
+            raise domain_error
+        if result is None:
+            self._audit(actual, action, target, "failed")
+            raise ManagementError(
+                ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
+            )
         self._audit(actual, action, target, "succeeded")
         return result
 
@@ -256,12 +316,15 @@ class ContentBlacklistControl(DomainControl):
             elif requested in by_channel:
                 target_id = projected_ids[requested]
             else:
+                missing = False
                 try:
                     target_id = self._canonical_live(
                         requested, channels, allow_display_name=True,
                     )
                 except ManagementError:
-                    raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND) from None
+                    missing = True
+                if missing:
+                    raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
             matching = [key for key, projected in projected_ids.items() if projected == target_id]
             if not matching:
                 raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
