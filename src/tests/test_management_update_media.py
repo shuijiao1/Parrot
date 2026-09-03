@@ -15,6 +15,12 @@ from src.tests.management_auxiliary_support import bearer, build_auxiliary_app, 
 
 BASE = "/api/management/v1"
 _SECRET_LOG_KEYS = (
+    "token",
+    "key",
+    "secret",
+    "credential",
+    "exchangeSecret",
+    "challengeCredential",
     "apiToken",
     "api_token",
     "apiKey",
@@ -300,6 +306,65 @@ def test_update_check_maps_upstream_failure_without_leaking_detail(tmp_path):
     assert marker not in repr(audits)
 
 
+def test_update_failure_log_sanitizer_redacts_generic_secret_keys_exactly():
+    marker = "P7-R3-MARKER-9x"
+    cases = (
+        (f"token={marker}", "token=[REDACTED]"),
+        (f"key: {marker}", "key: [REDACTED]"),
+        (f"secret='{marker}'", "secret='[REDACTED]'"),
+        (f"credential={marker}", "credential=[REDACTED]"),
+        (f"exchangeSecret={marker}", "exchangeSecret=[REDACTED]"),
+        (f"EXCHANGESECRET:{marker}", "EXCHANGESECRET:[REDACTED]"),
+        (f"challengeCredential={marker}", "challengeCredential=[REDACTED]"),
+        (f"webhookToken={marker}", "webhookToken=[REDACTED]"),
+        (f"WebhookKey={marker}", "WebhookKey=[REDACTED]"),
+        (f"webhook_secret={marker}", "webhook_secret=[REDACTED]"),
+        (f"WEBHOOK_CREDENTIAL={marker}", "WEBHOOK_CREDENTIAL=[REDACTED]"),
+        (f"webhookcredential={marker}", "webhookcredential=[REDACTED]"),
+        (f"WEBHOOKCREDENTIAL={marker}", "WEBHOOKCREDENTIAL=[REDACTED]"),
+        (f"webhook-credential={marker}", "webhook-credential=[REDACTED]"),
+        (f"rotation.credential={marker}", "rotation.credential=[REDACTED]"),
+        (
+            f'{{"outer":{{"providerCredential":"{marker}","safe":"ok"}}}}',
+            '{"outer":{"providerCredential":"[REDACTED]","safe":"ok"}}',
+        ),
+        (
+            rf'{{\"outer\":{{\"providerCredential\":\"{marker}\",\"safe\":\"ok\"}}}}',
+            r'{\"outer\":{\"providerCredential\":\"[REDACTED]\",\"safe\":\"ok\"}}',
+        ),
+    )
+    for raw, expected in cases:
+        assert _sanitize_log(raw) == expected
+
+
+def test_update_failure_log_sanitizer_preserves_business_text_and_targets_auth_credentials():
+    ordinary = "ordinary token count=42 basic routing mode; token usage is 42"
+    assert _sanitize_log(ordinary) == ordinary
+
+    non_auth = (
+        "Bearer capacity planning is enabled",
+        "bearer routing mode selected",
+        "Basic routing mode",
+        "basic authentication mode is configured",
+        "the basic and bearer routing modes are healthy",
+    )
+    for value in non_auth:
+        assert _sanitize_log(value) == value
+
+    credentials = (
+        (
+            "retry Bearer P7_TEST_BEARER_CREDENTIAL_9x after failure",
+            "retry Bearer [REDACTED] after failure",
+        ),
+        (
+            "retry Basic dXNlcjpwYXNz after failure",
+            "retry Basic [REDACTED] after failure",
+        ),
+    )
+    for raw, expected in credentials:
+        assert _sanitize_log(raw) == expected
+
+
 def test_update_failure_log_sanitizer_covers_plain_json_and_escaped_json():
     for index, key in enumerate(_SECRET_LOG_KEYS):
         for rendered_key in (key, key.upper()):
@@ -384,6 +449,18 @@ def test_update_failure_log_requires_body_capability_audits_and_redacts_markers(
             rows.append(json.dumps({key: marker}))
         else:
             rows.append(json.dumps({key: marker}).replace('"', r'\"'))
+    blocker_marker = "P7-R3-MARKER-9x"
+    rows.extend(
+        (
+            f"credential={blocker_marker}",
+            json.dumps({"nested": {"exchangeSecret": blocker_marker}}),
+            json.dumps({"nested": {"exchangeSecret": blocker_marker}}).replace('"', r'\"'),
+        )
+    )
+    markers.append(blocker_marker)
+    ordinary = "ordinary token count=42 basic routing mode; token usage is 42"
+    rows.append(ordinary)
+
     adjacent_rows = (
         ("Authorization: Basic HTTP_AUTH_BASIC_MARKER", ("HTTP_AUTH_BASIC_MARKER",)),
         ("Proxy-Authorization: Basic HTTP_PROXY_BASIC_MARKER", ("HTTP_PROXY_BASIC_MARKER",)),
@@ -427,6 +504,7 @@ def test_update_failure_log_requires_body_capability_audits_and_redacts_markers(
         content = response.json()["data"]["content"]
         assert "[REDACTED]" in content
         assert "health verification failed at backup step" in content
+        assert ordinary in content
         assert len(content) <= 3500
         for marker in markers:
             assert marker not in response.text

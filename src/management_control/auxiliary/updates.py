@@ -44,12 +44,11 @@ STAGE_ROLLED_BACK = "rolled_back"
 _ACTIVE_STAGES = {STAGE_BACKING_UP, STAGE_PULLING, STAGE_RESTARTING, STAGE_VERIFYING}
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _REDACTED = "[REDACTED]"
+_SECRET_SUFFIX_PATTERN = r"(?:token|key|secret|credential)"
 _SECRET_KEY_PATTERN = (
-    r"(?:api[-_]?token|api[-_]?key|apikey|x[-_]?api[-_]?key|"
-    r"access[-_]?token|refresh[-_]?token|id[-_]?token|management[-_]?key|"
-    r"bot[-_]?token|github[-_]?token|client[-_]?secret|session[-_]?token|session|"
-    r"password|passwd|cookie|set[-_]?cookie|"
-    r"(?:[a-z0-9]+[-_.])+(?:token|key|password|secret))"
+    rf"(?:{_SECRET_SUFFIX_PATTERN}|[a-z0-9]+{_SECRET_SUFFIX_PATTERN}|"
+    rf"(?:[a-z0-9]+[-_.])+(?:{_SECRET_SUFFIX_PATTERN}|password)|"
+    r"session|password|passwd|cookie|set[-_]?cookie)"
 )
 _ALL_SECRET_KEY_PATTERN = rf"(?:{_SECRET_KEY_PATTERN}|authorization|proxy[-_]?authorization)"
 _SECRET_KEY_WITH_BOUNDARIES = rf"(?<![A-Za-z0-9_-]){_SECRET_KEY_PATTERN}(?![A-Za-z0-9_-])"
@@ -69,12 +68,14 @@ _AUTH_ASSIGNMENT_RE = re.compile(
     r"(?![A-Za-z0-9_-])\s*=\s*)((?:bearer|basic)\s+)?[^\s,;}\]]+"
 )
 _PLAIN_SECRET_RE = re.compile(
-    rf"(?i)({_SECRET_KEY_WITH_BOUNDARIES}\s*[:=]\s*)[^\s,;}}\]]+"
+    rf"(?i)({_SECRET_KEY_WITH_BOUNDARIES}\s*[:=]\s*)[^\s\"',;}}\]]+"
 )
 _SECRET_HEADER_RE = re.compile(
     r"(?i)(\b(?:proxy[-_]?authorization|authorization|set-cookie|cookie)\b\s*:\s*)[^\r\n]*"
 )
-_STANDALONE_AUTH_RE = re.compile(r"(?i)(\b(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+")
+_STANDALONE_AUTH_RE = re.compile(
+    r"(?i)(\b(?:bearer|basic)\s+)([A-Za-z0-9._~+/=-]+)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +247,14 @@ def _actor_key(context: ManagementContext) -> str:
     return context.actor.session_id or context.actor.subject_id
 
 
+def _redact_standalone_auth(match: re.Match[str]) -> str:
+    candidate = match.group(2)
+    looks_credential = len(candidate) >= 8 and (
+        not candidate.isalpha() or not (candidate.islower() or candidate.isupper())
+    )
+    return match.group(1) + (_REDACTED if looks_credential else candidate)
+
+
 def _sanitize_log(value: str) -> str:
     result = _URL_USERINFO_RE.sub(rf"\1{_REDACTED}@", str(value or ""))
     for pattern in (_ESCAPED_JSON_SECRET_RE, _JSON_SECRET_RE, _QUOTED_SECRET_RE):
@@ -263,7 +272,7 @@ def _sanitize_log(value: str) -> str:
         return prefix + (scheme.group(1) if scheme else "") + _REDACTED
 
     result = _SECRET_HEADER_RE.sub(redact_header, result)
-    result = _STANDALONE_AUTH_RE.sub(rf"\1{_REDACTED}", result)
+    result = _STANDALONE_AUTH_RE.sub(_redact_standalone_auth, result)
     return result[-3500:]
 
 
