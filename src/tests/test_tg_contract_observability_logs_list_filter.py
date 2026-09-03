@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from src import config, log_db, oauth_manager
+from src import config, log_db, oauth_manager, status_monitor, update_checker
 from src.telegram import ui
 from src.telegram.menus import logs_menu
 from src.tests.tg_contract import assert_strict_equal, load_jsonl
@@ -66,7 +66,8 @@ def _install(case, monkeypatch):
     monkeypatch.setattr(ui, "channel_provider", lambda key: "")
     monkeypatch.setattr(ui, "channel_provider_custom_emoji_id", lambda key: None)
     monkeypatch.setattr(ui, "channel_provider_custom_emoji_html", lambda key: "")
-    monkeypatch.setattr(logs_menu, "_maybe_suffix_status_banner", lambda text: text + runtime.get("suffix", ""))
+    monkeypatch.setattr(status_monitor, "get_active_summary", lambda: runtime.get("statusBanner"))
+    monkeypatch.setattr(update_checker, "get_update_banner", lambda: runtime.get("updateBanner"))
     return capture, queries
 
 
