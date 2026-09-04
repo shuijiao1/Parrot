@@ -263,3 +263,68 @@ def test_import_and_invalid_delete_recheck_and_mutate_inside_one_batch_cas():
     assert stale_delete.value.code is ManagementErrorCode.REVISION_CONFLICT
     assert backend.get_account(INVALID_ID) is not None
     assert backend.get_account(second_invalid)["concurrent"] is True
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected_note", "other_note"),
+    [
+        (
+            "cursor",
+            "⚠️ 新额度快照保存失败，可稍后手动刷新。",
+            "⚠️ 新额度快照获取失败，可稍后手动刷新。",
+        ),
+        (
+            "openai",
+            "⚠️ 新额度快照获取失败，可稍后手动刷新。",
+            "⚠️ 新额度快照保存失败，可稍后手动刷新。",
+        ),
+    ],
+)
+def test_tg_overwrite_failure_note_keeps_provider_specific_frozen_wording(
+    monkeypatch, provider, expected_note, other_note,
+):
+    from src.telegram import ui
+    from src.telegram.menus import oauth_menu
+
+    account_id = f"{provider}:overwrite-identity"
+    entry = {
+        "provider": provider,
+        "email": f"{provider}@example.test",
+        "access_token": "new-access",
+        "refresh_token": "new-refresh",
+    }
+    state = {
+        "entry": entry,
+        "target_key": account_id,
+        "provider": provider,
+        "usage": {"window": "fake"},
+    }
+    owners = []
+    edits = []
+    monkeypatch.setattr(oauth_menu, "_overwrite_state", lambda *_args, **_kwargs: state)
+    monkeypatch.setattr(
+        oauth_menu.oauth_control,
+        "replace_account_entry",
+        lambda *_args, **_kwargs: {"status": "replaced"},
+    )
+    monkeypatch.setattr(
+        oauth_menu,
+        "_foreground_account_model_sync",
+        lambda *_args, **_kwargs: (
+            owners.append(account_id),
+            {"post_save": {"usage_error": RuntimeError("injected usage failure")}},
+        )[1],
+    )
+    monkeypatch.setattr(ui, "answer_cb", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        ui,
+        "edit",
+        lambda _chat, _message, text, **_kwargs: edits.append(text),
+    )
+
+    oauth_menu.on_oauth_overwrite_confirm(42, 100, "cb-confirm", "nonce")
+
+    assert owners == [account_id]
+    assert len(edits) == 1
+    assert expected_note in edits[0]
+    assert other_note not in edits[0]

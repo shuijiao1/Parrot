@@ -369,8 +369,11 @@ def on_oauth_overwrite_confirm(chat_id: int, message_id: int, cb_id: str, nonce:
     )
     post_save = sync_result.get("post_save") if isinstance(sync_result, dict) else {}
     quota_note = ""
-    if provider in {"cursor", "openai"} and post_save.get("usage_error") is not None:
-        quota_note = "\n⚠️ 新额度快照保存失败，可稍后手动刷新。"
+    if post_save.get("usage_error") is not None:
+        if provider == "cursor":
+            quota_note = "\n⚠️ 新额度快照保存失败，可稍后手动刷新。"
+        elif provider == "openai":
+            quota_note = "\n⚠️ 新额度快照获取失败，可稍后手动刷新。"
     ui.answer_cb(cb_id, "覆盖成功")
     ui.edit(
         chat_id, message_id,

@@ -3010,13 +3010,10 @@ def _openai_metadata_patch(entry: dict) -> dict:
     return candidate
 
 
-def find_exact_identity(entry: dict) -> tuple[str, dict] | None:
-    """Return the configured account whose canonical identity exactly matches ``entry``.
-
-    This is intentionally stricter than the legacy add-account matching rules: a
-    subject/email fallback that would change the canonical key is not a duplicate.
-    The returned account is a snapshot and must not be mutated by callers.
-    """
+def _find_exact_identity_in_config(
+    entry: dict, cfg: dict,
+) -> tuple[str, dict] | None:
+    """Find one canonical identity in an explicit config candidate."""
     provider = _normalize_provider(entry.get("provider"))
     if provider not in _VALID_PROVIDERS:
         raise ValueError(f"unsupported provider: {entry.get('provider')!r}")
@@ -3024,7 +3021,7 @@ def find_exact_identity(entry: dict) -> tuple[str, dict] | None:
     if not incoming_key.partition(":")[2]:
         return None
     matches = [
-        account for account in config.get().get("oauthAccounts", [])
+        account for account in cfg.get("oauthAccounts", [])
         if _acc_provider(account) == provider and _canonical_key(account) == incoming_key
     ]
     if len(matches) > 1:
@@ -3032,6 +3029,99 @@ def find_exact_identity(entry: dict) -> tuple[str, dict] | None:
     if not matches:
         return None
     return incoming_key, copy.deepcopy(matches[0])
+
+
+def find_exact_identity(entry: dict) -> tuple[str, dict] | None:
+    """Return the configured account whose canonical identity exactly matches ``entry``.
+
+    This is intentionally stricter than the legacy add-account matching rules: a
+    subject/email fallback that would change the canonical key is not a duplicate.
+    The returned account is a snapshot and must not be mutated by callers.
+    """
+    return _find_exact_identity_in_config(entry, config.get())
+
+
+def _replace_exact_identity_in_config(
+    cfg: dict,
+    expected_account_key: str,
+    entry: dict,
+    *,
+    expected_account: dict | None = None,
+) -> dict:
+    """Apply the established exact-identity replacement to one config candidate."""
+    provider = _normalize_provider(entry.get("provider"))
+    incoming = copy.deepcopy(entry)
+    incoming["provider"] = provider
+    required = ("email", "access_token", "refresh_token")
+    missing = [key for key in required if not incoming.get(key)]
+    if missing:
+        raise ValueError(f"missing required fields: {missing}")
+    incoming_key = _canonical_key(incoming)
+    if expected_account_key != incoming_key:
+        return {"status": "identity_conflict", "account_key": expected_account_key}
+
+    result = {"status": "missing", "account_key": expected_account_key}
+    accounts = cfg.setdefault("oauthAccounts", [])
+    indexes = [
+        index for index, account in enumerate(accounts)
+        if _canonical_key(account) == expected_account_key
+    ]
+    if not indexes:
+        return result
+    if len(indexes) != 1:
+        result["status"] = "identity_conflict"
+        return result
+    index = indexes[0]
+    current = accounts[index]
+    if expected_account is not None and current != expected_account:
+        result["status"] = "revision_conflict"
+        return result
+    current_key = _canonical_key(current)
+    if (
+        current_key != expected_account_key
+        or _acc_provider(current) != provider
+        or incoming_key != expected_account_key
+    ):
+        result["status"] = "identity_conflict"
+        return result
+
+    # Preserve every field not supplied by the fresh observation, then
+    # explicitly protect user settings from login defaults.  A successful
+    # interactive login recovers an account that was auto-disabled only
+    # because its previous credential failed authentication.
+    replacement = copy.deepcopy(current)
+    replacement.update(incoming)
+    if "maxConcurrent" in current:
+        replacement["maxConcurrent"] = copy.deepcopy(current["maxConcurrent"])
+    if current.get("disabled_reason") == "auth_error":
+        replacement["enabled"] = True
+        replacement["disabled_reason"] = None
+        replacement["disabled_until"] = None
+    else:
+        for key in ("enabled", "disabled_reason", "disabled_until"):
+            if key in current:
+                replacement[key] = copy.deepcopy(current[key])
+    if provider != "cursor" or not incoming.get("models"):
+        if "models" in current:
+            replacement["models"] = copy.deepcopy(current["models"])
+    if provider == "openai":
+        for key in ("codexDeviceInstallationId", "codexDeviceConvergenceEnabled"):
+            if key not in entry and key in current:
+                replacement[key] = copy.deepcopy(current[key])
+    if provider == "cursor":
+        for key in ("cursor_max_context_disabled_models", "cursor_disabled_models"):
+            if key not in entry and key in current:
+                replacement[key] = copy.deepcopy(current[key])
+        if not entry.get("cursor_profile_id") and current.get("cursor_profile_id"):
+            for key in ("email", "label", "cursor_profile_name", "cursor_profile_id", "cursor_email_verified"):
+                if key in current:
+                    replacement[key] = copy.deepcopy(current[key])
+    if _canonical_key(replacement) != expected_account_key:
+        result["status"] = "identity_conflict"
+        return result
+    accounts[index] = replacement
+    result.update(status="replaced", index=index, account=copy.deepcopy(replacement))
+    return result
 
 
 def replace_exact_identity(
@@ -3052,74 +3142,17 @@ def replace_exact_identity(
     missing = [key for key in required if not incoming.get(key)]
     if missing:
         raise ValueError(f"missing required fields: {missing}")
-    incoming_key = _canonical_key(incoming)
-    if expected_account_key != incoming_key:
+    if expected_account_key != _canonical_key(incoming):
         return {"status": "identity_conflict", "account_key": expected_account_key}
 
     result = {"status": "missing", "account_key": expected_account_key}
+
+    def mutate(cfg):
+        result.update(_replace_exact_identity_in_config(
+            cfg, expected_account_key, entry, expected_account=expected_account,
+        ))
+
     with config.serialized_updates():
-        def mutate(cfg):
-            accounts = cfg.setdefault("oauthAccounts", [])
-            indexes = [
-                index for index, account in enumerate(accounts)
-                if _canonical_key(account) == expected_account_key
-            ]
-            if not indexes:
-                return
-            if len(indexes) != 1:
-                result["status"] = "identity_conflict"
-                return
-            index = indexes[0]
-            current = accounts[index]
-            if expected_account is not None and current != expected_account:
-                result["status"] = "revision_conflict"
-                return
-            current_key = _canonical_key(current)
-            if (
-                current_key != expected_account_key
-                or _acc_provider(current) != provider
-                or incoming_key != expected_account_key
-            ):
-                result["status"] = "identity_conflict"
-                return
-
-            # Preserve every field not supplied by the fresh observation, then
-            # explicitly protect user settings from login defaults.  A successful
-            # interactive login recovers an account that was auto-disabled only
-            # because its previous credential failed authentication.
-            replacement = copy.deepcopy(current)
-            replacement.update(incoming)
-            if "maxConcurrent" in current:
-                replacement["maxConcurrent"] = copy.deepcopy(current["maxConcurrent"])
-            if current.get("disabled_reason") == "auth_error":
-                replacement["enabled"] = True
-                replacement["disabled_reason"] = None
-                replacement["disabled_until"] = None
-            else:
-                for key in ("enabled", "disabled_reason", "disabled_until"):
-                    if key in current:
-                        replacement[key] = copy.deepcopy(current[key])
-            if provider != "cursor" or not incoming.get("models"):
-                if "models" in current:
-                    replacement["models"] = copy.deepcopy(current["models"])
-            if provider == "openai":
-                for key in ("codexDeviceInstallationId", "codexDeviceConvergenceEnabled"):
-                    if key not in entry and key in current:
-                        replacement[key] = copy.deepcopy(current[key])
-            if provider == "cursor":
-                for key in ("cursor_max_context_disabled_models", "cursor_disabled_models"):
-                    if key not in entry and key in current:
-                        replacement[key] = copy.deepcopy(current[key])
-                if not entry.get("cursor_profile_id") and current.get("cursor_profile_id"):
-                    for key in ("email", "label", "cursor_profile_name", "cursor_profile_id", "cursor_email_verified"):
-                        if key in current:
-                            replacement[key] = copy.deepcopy(current[key])
-            if _canonical_key(replacement) != expected_account_key:
-                result["status"] = "identity_conflict"
-                return
-            accounts[index] = replacement
-            result.update(status="replaced", index=index, account=copy.deepcopy(replacement))
-
         if expected_account is None:
             config.update(mutate)
         else:
@@ -3182,6 +3215,20 @@ def reorder_accounts_if_unchanged(expected_order: list[str], wanted_order: list[
     return result
 
 
+def _mutate_channel_added_in_config(cfg: dict, channel_key: str, family: str) -> None:
+    """Apply ``sync_channel_added`` semantics to an unpublished config candidate."""
+    if not channel_key or not load_balancing.is_initialized(cfg):
+        return
+    lb = cfg.setdefault("loadBalancing", {})
+    unified = lb.get("channelPriorityOrder")
+    if isinstance(unified, list) and unified and channel_key not in unified:
+        unified.append(channel_key)
+    if family in {"anthropic", "openai"}:
+        legacy = lb.setdefault("priorityOrders", {}).setdefault(family, [])
+        if channel_key not in legacy:
+            legacy.append(channel_key)
+
+
 def add_account(entry: dict) -> None:
     """Serialize target resolution, snapshots, config publication, and state rename."""
     with config.serialized_updates():
@@ -3201,7 +3248,9 @@ def add_account_if_identity_absent(entry: dict) -> dict:
     return {"status": "added", "account_key": incoming_key}
 
 
-def _add_account_serialized(entry: dict) -> None:
+def _add_account_serialized(
+    entry: dict, *, candidate_config: dict | None = None,
+) -> dict:
     """entry 需至少含 email / access_token / refresh_token。
 
     支持可选字段：
@@ -3214,7 +3263,13 @@ def _add_account_serialized(entry: dict) -> None:
         (xAI 专属)
       - cursor_max_context_disabled_models（Cursor 每账号显式关闭 Max Context 的例外）
       - cursor_disabled_models（Cursor 每账号禁用的 canonical 模型）
+
+    When ``candidate_config`` is supplied, normalization and config/LB mutation
+    are applied only to that unpublished candidate. Runtime identity renames are
+    intentionally refused in this narrow mode; import callers already require
+    an exact canonical identity and guard legacy subject/email migration.
     """
+    active_config = candidate_config if candidate_config is not None else config.get()
     required = ("email", "access_token", "refresh_token")
     missing = [k for k in required if not entry.get(k)]
     if missing:
@@ -3363,7 +3418,7 @@ def _add_account_serialized(entry: dict) -> None:
 
     added = {"v": False}
     existing_target = None
-    for a in config.get().get("oauthAccounts", []):
+    for a in active_config.get("oauthAccounts", []):
         if provider == "openai":
             if _acc_provider(a) == provider and _canonical_key(a) == normalized_key:
                 existing_target = a
@@ -3389,12 +3444,12 @@ def _add_account_serialized(entry: dict) -> None:
     if existing_target is None or rename_new_key:
         channel_state.assert_reusable(f"oauth:{normalized_key}")
     if rename_new_key:
-        for account in config.get().get("oauthAccounts", []):
+        for account in active_config.get("oauthAccounts", []):
             if account is not existing_target and _canonical_key(account) == normalized_key:
                 raise ValueError(f"OAuth account identity already exists: {normalized_key}")
     existing_snapshot = copy.deepcopy(existing_target) if existing_target else None
     old_load_balancing = copy.deepcopy(
-        config.get().get("loadBalancing", {})
+        active_config.get("loadBalancing", {})
     )
 
     def mutate(cfg):
@@ -3511,21 +3566,92 @@ def _add_account_serialized(entry: dict) -> None:
                     break
         cfg["loadBalancing"] = copy.deepcopy(old_load_balancing)
 
-    if rename_new_key:
-        _rename_runtime_oauth_identity(
-            rename_old_key,
-            rename_new_key,
-            email=email,
-            config_mutator=mutate,
-            rollback_mutator=rollback,
-        )
+    family = "openai" if _is_openai_family_provider(provider) else "anthropic"
+    if candidate_config is not None:
+        if rename_new_key:
+            raise ValueError("conditional OAuth import cannot rename an identity")
+        mutate(candidate_config)
+        if added["v"]:
+            _mutate_channel_added_in_config(
+                candidate_config, f"oauth:{normalized_key}", family,
+            )
     else:
-        config.update(mutate)
-    if added["v"]:
-        load_balancing.sync_channel_added(
-            f"oauth:{normalized_key}",
-            "openai" if _is_openai_family_provider(provider) else "anthropic",
-        )
+        if rename_new_key:
+            _rename_runtime_oauth_identity(
+                rename_old_key,
+                rename_new_key,
+                email=email,
+                config_mutator=mutate,
+                rollback_mutator=rollback,
+            )
+        else:
+            config.update(mutate)
+        if added["v"]:
+            load_balancing.sync_channel_added(f"oauth:{normalized_key}", family)
+    return {"added": added["v"], "account_key": normalized_key}
+
+
+def _apply_import_candidate_to_config(
+    cfg: dict, item: dict, choice: str,
+) -> tuple[str, str]:
+    """Apply one import item only to ``cfg``; callers publish the whole batch."""
+    entry = copy.deepcopy(item["entry"])
+    existing = _find_exact_identity_in_config(entry, cfg)
+    if existing is not None:
+        account_key = existing[0]
+        if choice == "keep":
+            return "skipped", account_key
+        result = _replace_exact_identity_in_config(cfg, account_key, entry)
+        if result.get("status") != "replaced":
+            raise RuntimeError("conditional OAuth import replace failed")
+        return "replaced", account_key
+
+    result = _add_account_serialized(entry, candidate_config=cfg)
+    if not result.get("added"):
+        raise RuntimeError("conditional OAuth import add failed")
+    return "added", str(result["account_key"])
+
+
+def commit_import_batch_if_unchanged(
+    expected_accounts: list[dict],
+    candidates: Iterable[dict],
+    choices: dict[str, str],
+) -> dict:
+    """CAS and apply an import in one unpublished candidate config.
+
+    Every provider normalization, exact-identity replacement, account append,
+    and initialized load-balancing addition runs inside the sole ``config.update``
+    mutator. An exception at any item discards that candidate, so neither disk,
+    cache, nor config reload callbacks can observe a prefix of the batch.
+    """
+    outcome = {
+        "status": "revision_conflict",
+        "added": [],
+        "replaced": [],
+        "skipped": [],
+    }
+    batch = tuple(copy.deepcopy(tuple(candidates)))
+
+    def mutate(cfg: dict) -> None:
+        if cfg.get("oauthAccounts", []) != expected_accounts:
+            return
+        committed = {
+            "status": "committed",
+            "added": [],
+            "replaced": [],
+            "skipped": [],
+        }
+        for item in batch:
+            candidate_id = str(item["candidate_id"])
+            action, account_key = _apply_import_candidate_to_config(
+                cfg, item, choices[candidate_id],
+            )
+            committed[action].append(account_key)
+        outcome.clear()
+        outcome.update(committed)
+
+    config.update(mutate, skip_if_unchanged=True)
+    return outcome
 
 
 def delete_account(account_key: str) -> None:
@@ -3548,6 +3674,122 @@ def delete_account_if_unchanged(account_key: str, expected_account: dict) -> dic
             return {"status": "revision_conflict", "account_key": account_key}
         _delete_account_serialized(account_key)
     return {"status": "deleted", "account_key": account_key}
+
+
+def _remove_exact_account_from_config(cfg: dict, account_key: str) -> None:
+    """Remove one already-validated canonical identity from a config candidate."""
+    accounts = cfg.get("oauthAccounts", [])
+    kept = [account for account in accounts if _canonical_key(account) != account_key]
+    if len(accounts) - len(kept) != 1:
+        raise RuntimeError("conditional OAuth batch delete target changed")
+    cfg["oauthAccounts"] = kept
+
+
+def delete_invalid_accounts_batch_if_unchanged(
+    expected_accounts: Iterable[tuple[str, dict]],
+) -> dict:
+    """Delete an invalid-account batch through one candidate config publication.
+
+    Exact snapshots and ``auth_error`` state are validated before candidate
+    removals. Account and load-balancing changes are then applied to that same
+    deep-copied candidate. Runtime generations are retired before publication,
+    as in the single-account delete path, and durable/runtime cleanup runs only
+    after the complete candidate has been published successfully.
+    """
+    expected_batch = tuple(
+        (str(account_key), copy.deepcopy(expected))
+        for account_key, expected in expected_accounts
+    )
+    result = {"status": "missing"}
+    account_keys = tuple(account_key for account_key, _expected in expected_batch)
+    channel_keys = {f"oauth:{account_key}" for account_key in account_keys}
+
+    from . import affinity as _affinity, channel_state, concurrency
+    from . import cooldown as _cooldown, scorer as _scorer
+
+    with config.serialized_updates(), channel_state.mutation_lock:
+        retirement_plan = {
+            channel_key: sorted(channel_state.alias_sources(channel_key)) + [channel_key]
+            for channel_key in channel_keys
+        }
+        frozen_limits = {
+            generation_key: concurrency.capture_rename_limit(generation_key)
+            for generation_keys in retirement_plan.values()
+            for generation_key in generation_keys
+        }
+        for channel_key in channel_keys:
+            channel_state.retire_deleted(channel_key)
+
+        def mutate(cfg: dict) -> None:
+            accounts = cfg.get("oauthAccounts", [])
+            if len(account_keys) != len(set(account_keys)):
+                result["status"] = "identity_conflict"
+                return
+            for account_key, expected in expected_batch:
+                matches = [
+                    account for account in accounts
+                    if _canonical_key(account) == account_key
+                ]
+                if not matches:
+                    result["status"] = "missing"
+                    return
+                if len(matches) != 1:
+                    result["status"] = "identity_conflict"
+                    return
+                if matches[0] != expected:
+                    result["status"] = "revision_conflict"
+                    return
+                if matches[0].get("disabled_reason") != "auth_error":
+                    result["status"] = "state_conflict"
+                    return
+
+            for account_key in account_keys:
+                _remove_exact_account_from_config(cfg, account_key)
+            load_balancing.mutate_channels_removed(cfg, channel_keys)
+            result.update(status="deleted", count=len(account_keys))
+
+        try:
+            config.update(mutate, skip_if_unchanged=True)
+        except BaseException:
+            for channel_key in channel_keys:
+                channel_state.restore_deleted(channel_key)
+            raise
+        if result.get("status") != "deleted":
+            for channel_key in channel_keys:
+                channel_state.restore_deleted(channel_key)
+            return result
+
+        for channel_key, generation_keys in retirement_plan.items():
+            for generation_key in generation_keys:
+                concurrency.retire_channel(
+                    generation_key,
+                    frozen_max=frozen_limits[generation_key],
+                    deleted_target=channel_key,
+                )
+
+        for account_key in account_keys:
+            channel_key = f"oauth:{account_key}"
+            _scorer.clear_stats(channel_key)
+            _cooldown.clear(
+                channel_key, notify_recovered=False, resolve_alias=False,
+            )
+            _affinity.delete_by_channel(channel_key)
+            _affinity.client_delete_by_channel(channel_key)
+            state_db.quota_delete(account_key)
+            try:
+                from . import failover
+                failover.forget_codex_snapshot(account_key)
+                failover.forget_anthropic_snapshot(account_key)
+            except Exception:
+                pass
+            forget_openai_probe(account_key)
+            if account_key.startswith("cursor:"):
+                try:
+                    from .cursor_bridge import runtime as cursor_bridge_runtime
+                    cursor_bridge_runtime.drop_account(account_key)
+                except Exception:
+                    pass
+    return result
 
 
 def _delete_account_serialized(account_key: str) -> None:
