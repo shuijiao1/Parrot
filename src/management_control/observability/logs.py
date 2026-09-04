@@ -256,6 +256,14 @@ class LogsControl:
             return sanitize_credentials(text)
         return sanitize_credentials(parsed)
 
+    @classmethod
+    def _sanitize_parser_input(cls, value: Any) -> Any:
+        """Sanitize bodies without changing a SQLite text row into a dict input."""
+        clean = cls._sanitize_raw(value)
+        if isinstance(value, str) and isinstance(clean, (dict, list)):
+            return json.dumps(clean, ensure_ascii=False)
+        return clean
+
     def body_items(
         self,
         context: ManagementContext,
@@ -269,7 +277,7 @@ class LogsControl:
         page_size: int,
     ) -> LogBodyPageResult:
         raw = self._raw_body(context, log_id, kind)
-        clean = self._sanitize_raw(raw)
+        clean = self._sanitize_parser_input(raw)
         parsed = inspector.parse_request_body(clean) if kind is LogBodyKind.REQUEST else inspector.parse_response_body(clean)
         searched = inspector.filter_items(parsed, query)
         counts: dict[str, int] = {}
@@ -298,7 +306,7 @@ class LogsControl:
         item_id: str,
     ) -> dict[str, Any]:
         raw = self._raw_body(context, log_id, kind)
-        clean = self._sanitize_raw(raw)
+        clean = self._sanitize_parser_input(raw)
         items = inspector.parse_request_body(clean) if kind is LogBodyKind.REQUEST else inspector.parse_response_body(clean)
         try:
             seq = int(item_id.removeprefix("item_"))
@@ -327,13 +335,22 @@ class LogsControl:
     def configured_channels(self, context: ManagementContext) -> list[str]:
         require(context)
         values: list[str] = []
-        for channel in self.config.get().get("channels") or []:
-            if isinstance(channel, dict) and channel.get("name"):
-                values.append("api:" + str(channel["name"]))
-        for account in self.oauth_manager.list_accounts():
-            key = str(self.oauth_manager._account_key(account) or "")
-            if key:
-                values.append("oauth:" + key)
+        try:
+            for channel in self.config.get().get("channels") or []:
+                if not isinstance(channel, dict):
+                    continue
+                name = str(channel.get("name") or "").strip()
+                if name:
+                    values.append("api:" + name)
+        except Exception:
+            pass
+        try:
+            for account in self.oauth_manager.list_accounts():
+                key = str(self.oauth_manager._account_key(account) or "")
+                if key:
+                    values.append("oauth:" + key)
+        except Exception:
+            pass
         return values
 
 

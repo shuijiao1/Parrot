@@ -198,7 +198,11 @@ class MediaControl:
         require(context)
         total = int(self.media_db.count())
         pages = max(1, (max(0, total) + page_size - 1) // page_size)
-        normalized = max(1, min(int(page or 1), pages))
+        try:
+            normalized = int(page or 1)
+        except (TypeError, ValueError):
+            normalized = 1
+        normalized = max(1, min(normalized, pages))
         rows = self.media_db.recent(page_size, offset=(normalized - 1) * page_size)
         return copy.deepcopy(rows), copy.deepcopy(self.media_db.summary()), normalized, pages
 

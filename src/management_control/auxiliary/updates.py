@@ -337,7 +337,7 @@ class UpdateControl:
         self._updates.force_refresh()
         audit(self._audit_sink, context, action="updates.check", target="updates")
 
-    def set_settings_direct(self, context: ManagementContext, patch: dict[str, Any]) -> UpdateSettings:
+    def set_settings_direct(self, context: ManagementContext, patch: dict[str, Any]) -> None:
         require(context, Capability.WRITE)
 
         def mutate(root: dict[str, Any]) -> None:
@@ -345,7 +345,6 @@ class UpdateControl:
 
         self._config.update(mutate)
         audit(self._audit_sink, context, action="updates.settings.update", target="updates")
-        return self._settings_dto(self._effective(self._config.get()))
 
     def repository(self, context: ManagementContext) -> str:
         require(context, Capability.READ)
@@ -421,11 +420,10 @@ class UpdateControl:
         self._updates.remove_ignored(version)
         audit(self._audit_sink, context, action="updates.version.unignore", target=version)
 
-    def clear_ignored_direct(self, context: ManagementContext) -> UpdateSettings:
+    def clear_ignored_direct(self, context: ManagementContext) -> None:
         require(context, Capability.WRITE)
         self._updates.clear_ignored()
         audit(self._audit_sink, context, action="updates.versions.clear", target="ignored-versions")
-        return self._settings_dto(self._effective(self._config.get()))
 
     @staticmethod
     def _backup(row: dict[str, Any]) -> UpdateBackup:
@@ -549,10 +547,8 @@ class UpdateControl:
         chat_id: int,
         notify_msg_id: int,
         before_activate: Callable[[], None],
-    ) -> tuple[bool, str] | None:
+    ) -> tuple[bool, str]:
         require(context, Capability.UPDATE)
-        if str(self._updates.state().get("stage") or "") != STAGE_STAGED:
-            return None
         self._updates.save_state(chat_id=chat_id, notify_msg_id=notify_msg_id)
         before_activate()
         return self._updates.activate()

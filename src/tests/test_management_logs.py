@@ -386,7 +386,7 @@ def test_logs_nondefault_and_filter_options_delegate_one_sql_shaped_query_with_e
     }
 
 
-def test_response_parser_accepts_dict_without_changing_json_string_results():
+def test_response_parser_preserves_frozen_dict_raw_fallback_and_json_string_results():
     payload = {
         "choices": [{
             "message": {"role": "assistant", "content": "structured answer"},
@@ -398,9 +398,10 @@ def test_response_parser_accepts_dict_without_changing_json_string_results():
     from_dict = inspector.parse_response_body(payload)
     from_string = inspector.parse_response_body(json.dumps(payload))
 
-    assert from_dict == from_string
-    assert [item["kind"] for item in from_dict] == ["assistant", "finish", "usage"]
-    assert from_dict[0]["text"] == "structured answer"
+    assert [item["kind"] for item in from_dict] == ["raw_response"]
+    assert from_dict[0]["text"] == str(payload)
+    assert [item["kind"] for item in from_string] == ["assistant", "finish", "usage"]
+    assert from_string[0]["text"] == "structured answer"
 
 
 def test_logs_control_and_http_structure_sanitized_json_response_body(tmp_path):

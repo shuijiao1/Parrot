@@ -818,6 +818,6 @@ def toggle_visibility(chat_id: int, message_id: int, cb_id: str,
         return
     cur = _vis_get()
     new_val = not bool(cur.get(key, True))
-    _CONTROL.update_preferences(_CONTEXT, {key: new_val})
+    _CONTROL.update_preferences_direct(_CONTEXT, {key: new_val})
     ui.answer_cb(cb_id, "已显示" if new_val else "已隐藏")
     view_visibility(chat_id, message_id, "", period)

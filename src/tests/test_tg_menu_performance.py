@@ -103,11 +103,6 @@ def _patch_fast_common_loaders(m, monkeypatch, *, calls=None) -> None:
             calls.append(("period", threading.get_ident(), since))
         return _empty_period_snapshot()
 
-    def status_tps(since_ts):
-        if calls is not None:
-            calls.append(("status-tps", threading.get_ident(), since_ts))
-        return {}
-
     def lifetime():
         if calls is not None:
             calls.append(("lifetime", threading.get_ident(), None))
@@ -119,7 +114,6 @@ def _patch_fast_common_loaders(m, monkeypatch, *, calls=None) -> None:
         return {}
 
     monkeypatch.setattr(m["log_db"], "stats_period_snapshot", period)
-    monkeypatch.setattr(m["log_db"], "tps_by_channel_model", status_tps)
     monkeypatch.setattr(m["log_db"], "stats_lifetime", lifetime)
     monkeypatch.setattr(m["log_db"], "request_totals_by_apikey", history)
 
@@ -132,7 +126,6 @@ def _wait_common_preheated(menu_cache) -> None:
         menu_cache.PERIOD_STATS.peek(
             ("period", int(menu_cache.month_start_ts()))
         ).value is not None,
-        menu_cache.STATUS_TPS.peek("month").value is not None,
         menu_cache.LIFETIME_STATS.peek("lifetime").value is not None,
         menu_cache.HISTORY_TOTALS.peek("apikey-history").value is not None,
     )))
@@ -159,10 +152,6 @@ def test_central_scheduler_is_single_thread_serial_and_preheats(m, monkeypatch):
         enter("period", since)
         return _empty_period_snapshot()
 
-    def status_tps(since_ts):
-        enter("status-tps", since_ts)
-        return {}
-
     def lifetime():
         enter("lifetime", None)
         return _lifetime_snapshot()
@@ -172,7 +161,6 @@ def test_central_scheduler_is_single_thread_serial_and_preheats(m, monkeypatch):
         return {}
 
     monkeypatch.setattr(m["log_db"], "stats_period_snapshot", period)
-    monkeypatch.setattr(m["log_db"], "tps_by_channel_model", status_tps)
     monkeypatch.setattr(m["log_db"], "stats_lifetime", lifetime)
     monkeypatch.setattr(m["log_db"], "request_totals_by_apikey", history)
 
@@ -194,7 +182,7 @@ def test_central_scheduler_is_single_thread_serial_and_preheats(m, monkeypatch):
         int(menu_cache.today_start_ts()), int(menu_cache.month_start_ts()),
     })
     assert [kind for kind, _thread_id, _value in calls] == [
-        *(["period"] * period_jobs), "lifetime", "history", "status-tps",
+        *(["period"] * period_jobs), "lifetime", "history",
     ]
 
     menu_cache.stop()

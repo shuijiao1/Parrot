@@ -320,11 +320,6 @@ def _parse_responses_input(items: list[Item], inp: Any) -> None:
 # ─── Response parsing ────────────────────────────────────────────────
 
 def parse_response_body(raw: Any) -> list[Item]:
-    # API body sanitization intentionally returns parsed JSON objects.  Handle
-    # that representation directly while leaving the frozen Telegram string
-    # parsing path byte-for-byte equivalent below.
-    if isinstance(raw, dict):
-        return _parse_response_json(raw)
     text = str(raw or "")
     if not text:
         return []

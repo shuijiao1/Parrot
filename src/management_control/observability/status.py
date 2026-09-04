@@ -135,6 +135,18 @@ class StatusControl:
         require(context)
         return copy.deepcopy(self.concurrency.totals())
 
+    def channel_concurrency_snapshot(self, context: ManagementContext) -> list[dict[str, Any]]:
+        require(context)
+        return copy.deepcopy(self.concurrency.snapshot())
+
+    def apikey_concurrency_totals(self, context: ManagementContext) -> dict[str, Any]:
+        require(context)
+        return copy.deepcopy(self.apikey_limiter.totals())
+
+    def apikey_concurrency_snapshot(self, context: ManagementContext) -> list[dict[str, Any]]:
+        require(context)
+        return copy.deepcopy(self.apikey_limiter.snapshot())
+
     def stats_summary(self, context: ManagementContext, *, since_ts: float, family: str | None = None) -> dict:
         require(context)
         return copy.deepcopy(self.log_db.stats_summary(

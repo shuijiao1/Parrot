@@ -380,15 +380,12 @@ def _confirm_restart(chat_id: int, message_id: int, cb_id: str) -> None:
                 ui.truncate("🔄 <b>正在重启生效…</b>\n\n稍候将自动回填健康检查结果。"),
                 reply_markup=None)
 
-    result = _CONTROL.activate_direct(
+    ok, detail = _CONTROL.activate_direct(
         _ctx(chat_id),
         chat_id=chat_id,
         notify_msg_id=message_id,
         before_activate=_before_activate,
     )
-    if result is None:
-        return
-    ok, detail = result
     if not ok:
         ui.send(chat_id, f"❌ 重启触发失败：<code>{ui.escape_html(detail)}</code>")
 

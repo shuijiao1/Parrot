@@ -310,17 +310,7 @@ class StatsControl:
         values["revision"] = revision_for(values)
         return values
 
-    def update_preferences(
-        self,
-        context: ManagementContext,
-        patch: dict[str, bool],
-        *,
-        expected_revision: str | None = None,
-    ) -> dict[str, Any]:
-        require(context, Capability.WRITE)
-        current = self.get_preferences(context)
-        if expected_revision is not None and expected_revision != current["revision"]:
-            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+    def _write_preferences(self, context: ManagementContext, patch: dict[str, bool]) -> None:
         unknown = set(patch) - set(_PREF_KEYS)
         if unknown:
             raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
@@ -333,7 +323,25 @@ class StatsControl:
 
         self.config.update(mutate)
         self._audit(context, "stats.preferences.update", "succeeded")
+
+    def update_preferences(
+        self,
+        context: ManagementContext,
+        patch: dict[str, bool],
+        *,
+        expected_revision: str | None = None,
+    ) -> dict[str, Any]:
+        require(context, Capability.WRITE)
+        current = self.get_preferences(context)
+        if expected_revision is not None and expected_revision != current["revision"]:
+            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+        self._write_preferences(context, patch)
         return self.get_preferences(context)
+
+    def update_preferences_direct(self, context: ManagementContext, patch: dict[str, bool]) -> None:
+        """TG compatibility write without a post-commit DTO read-back."""
+        require(context, Capability.WRITE)
+        self._write_preferences(context, patch)
 
     def concurrency_enabled(self, context: ManagementContext) -> bool:
         require(context)

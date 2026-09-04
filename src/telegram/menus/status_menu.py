@@ -380,13 +380,13 @@ def _fmt_aklim_seconds(seconds: int) -> str:
     return f"{seconds}s"
 
 
-def _apikey_limiter_block(snapshot: dict) -> list[str]:
-    totals = snapshot["apiKeyTotals"]
+def _apikey_limiter_block() -> list[str]:
+    totals = _CONTROL.apikey_concurrency_totals(_CONTEXT)
     out = [
         f"  在途 <b>{totals['in_flight']}</b> · 排队 <b>{totals['waiting']}</b> · 追踪 {totals['tracked_keys']} 个 Key",
     ]
     interesting = [
-        r for r in snapshot["apiKeys"]
+        r for r in _CONTROL.apikey_concurrency_snapshot(_CONTEXT)
         if r.get("in_flight", 0) > 0 or r.get("waiting", 0) > 0
     ]
     if not interesting:
@@ -406,9 +406,9 @@ def _apikey_limiter_block(snapshot: dict) -> list[str]:
     return out
 
 
-def _concurrency_block(cc_cfg: dict, snapshot: dict) -> list[str]:
+def _concurrency_block(cc_cfg: dict) -> list[str]:
     """状态总览里的并发信息块：总计 + 配置 + 各渠道一行。"""
-    totals = snapshot["channelTotals"]
+    totals = _CONTROL.channel_concurrency_totals(_CONTEXT)
     default_max = int(cc_cfg.get("defaultMaxConcurrent", 0))
     queue_wait = int(cc_cfg.get("queueWaitSeconds", 30))
     out = [
@@ -418,7 +418,7 @@ def _concurrency_block(cc_cfg: dict, snapshot: dict) -> list[str]:
         f"  默认上限 <code>{default_max if default_max > 0 else '不限'}</code>"
         f" · 队列等待 <code>{queue_wait}s</code>",
     ]
-    snap = snapshot["channels"]
+    snap = _CONTROL.channel_concurrency_snapshot(_CONTEXT)
     # 只列"有在途 / 有排队 / 已饱和"的渠道，减少噪声
     interesting = [
         r for r in snap
@@ -469,7 +469,6 @@ def _compose() -> tuple[str, dict]:
     fastest_by_fam = _fastest_channels_by_family(top_per_family=5)
     problems = _problem_channels()
     quota_warn = _quota_warnings(80.0, cfg=cfg)
-    concurrency_snapshot = _CONTROL.concurrency_snapshot(_CONTEXT)
 
     # 月度 TPS 映射（只查一次）
     any_fastest = bool(fastest_by_fam.get("anthropic")) or bool(fastest_by_fam.get("openai"))
@@ -523,16 +522,16 @@ def _compose() -> tuple[str, dict]:
 
     # API Key 限流队列
     ak_cfg = cfg.get("apiKeyConcurrency") or {}
-    ak_totals = concurrency_snapshot["apiKeyTotals"]
+    ak_totals = _CONTROL.apikey_concurrency_totals(_CONTEXT)
     if bool(ak_cfg.get("enabled", True)) or ak_totals.get("in_flight", 0) > 0 or ak_totals.get("waiting", 0) > 0:
         lines += ["", "<b>🔑 API Key 队列:</b>"]
-        lines += _apikey_limiter_block(concurrency_snapshot)
+        lines += _apikey_limiter_block()
 
     # 并发队列（只要启用了并发限制就显示）
     cc_cfg = cfg.get("concurrency") or {}
     if bool(cc_cfg.get("enabled", True)):
         lines += ["", "<b>⚡ 渠道并发队列:</b>"]
-        lines += _concurrency_block(cc_cfg, concurrency_snapshot)
+        lines += _concurrency_block(cc_cfg)
 
     # 问题渠道
     if problems:

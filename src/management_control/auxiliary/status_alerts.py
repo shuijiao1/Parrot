@@ -181,19 +181,18 @@ class StatusAlertControl:
         require(context, Capability.READ)
         return self._dto(self._effective(self._config.get()))
 
-    def update_settings(
+    def _write_settings(
         self,
         context: ManagementContext,
         patch: dict[str, Any],
         *,
-        expected_revision: str | None = None,
-    ) -> StatusAlertSettings:
-        require(context, Capability.WRITE)
+        expected_revision: str | None,
+    ) -> None:
         value = copy.deepcopy(patch)
         if "intervalSeconds" in value:
             interval = value["intervalSeconds"]
-            if not isinstance(interval, int) or isinstance(interval, bool) or interval < 10 or interval > 86400:
-                raise invalid_field("intervalSeconds", "OUT_OF_RANGE", "must be between 10 and 86400")
+            if not isinstance(interval, int) or isinstance(interval, bool) or interval < 10:
+                raise invalid_field("intervalSeconds", "OUT_OF_RANGE", "must be at least 10")
         if "targets" in value:
             targets = string_list(value["targets"])
             unknown = [item for item in targets if item not in STATUS_PROVIDERS]
@@ -217,12 +216,24 @@ class StatusAlertControl:
         for provider in removed:
             self._status.forget_provider(provider)
         audit(self._audit_sink, context, action="status-alerts.settings.update", target="status-alerts")
+
+    def update_settings(
+        self,
+        context: ManagementContext,
+        patch: dict[str, Any],
+        *,
+        expected_revision: str | None = None,
+    ) -> StatusAlertSettings:
+        require(context, Capability.WRITE)
+        self._write_settings(context, patch, expected_revision=expected_revision)
         return self._dto(self._effective(self._config.get()))
 
-    def toggle_target(self, context: ManagementContext, provider: str) -> tuple[StatusAlertSettings, bool]:
-        """TG-compatible target toggle; preserves forget-before-config-update ordering."""
-
+    def update_settings_direct(self, context: ManagementContext, patch: dict[str, Any]) -> None:
+        """TG compatibility write without a post-commit DTO read-back."""
         require(context, Capability.WRITE)
+        self._write_settings(context, patch, expected_revision=None)
+
+    def _toggle_target(self, context: ManagementContext, provider: str) -> bool:
         if provider not in STATUS_PROVIDERS:
             raise invalid_field("provider", "UNKNOWN_PROVIDER", "unsupported provider")
         current = self.get_settings(context)
@@ -239,7 +250,18 @@ class StatusAlertControl:
 
         self._config.update(mutate)
         audit(self._audit_sink, context, action="status-alerts.target.toggle", target=provider)
-        return self._dto(self._effective(self._config.get())), removed
+        return removed
+
+    def toggle_target(self, context: ManagementContext, provider: str) -> tuple[StatusAlertSettings, bool]:
+        """Toggle a target and return the Management DTO plus removal flag."""
+        require(context, Capability.WRITE)
+        removed = self._toggle_target(context, provider)
+        return self.get_settings(context), removed
+
+    def toggle_target_direct(self, context: ManagementContext, provider: str) -> bool:
+        """TG compatibility toggle without a post-commit DTO read-back."""
+        require(context, Capability.WRITE)
+        return self._toggle_target(context, provider)
 
     def snapshot_active(self, context: ManagementContext) -> dict[str, list[dict[str, Any]]]:
         require(context, Capability.READ)

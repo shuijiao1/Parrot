@@ -46,7 +46,7 @@ def _cfg() -> dict:
 
 
 def _update_cfg(patch: dict, chat_id: int = 0) -> None:
-    _CONTROL.update_settings(_ctx(chat_id), patch)
+    _CONTROL.update_settings_direct(_ctx(chat_id), patch)
 
 
 def _format_active_block() -> str:
@@ -167,7 +167,7 @@ def _toggle_target(chat_id: int, message_id: int, cb_id: str, provider: str) -> 
     if provider not in STATUS_PROVIDERS:
         ui.answer_cb(cb_id, "未知 provider")
         return
-    _, removed = _CONTROL.toggle_target(_ctx(chat_id), provider)
+    removed = _CONTROL.toggle_target_direct(_ctx(chat_id), provider)
     msg = f"已移除 {provider}" if removed else f"已添加 {provider}"
     ui.answer_cb(cb_id, msg)
     show(chat_id, message_id)

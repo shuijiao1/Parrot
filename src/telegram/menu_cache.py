@@ -16,11 +16,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from ..management_control.observability import DEFAULT_STATS_CONTROL, DEFAULT_STATUS_CONTROL, telegram_context
+from ..management_control.observability import DEFAULT_STATS_CONTROL, telegram_context
 
 
 _STATS_CONTROL = DEFAULT_STATS_CONTROL
-_STATUS_CONTROL = DEFAULT_STATUS_CONTROL
 _CONTEXT = telegram_context()
 
 
@@ -332,8 +331,6 @@ class StatsRefreshCoordinator:
 
 # 常用快照的 freshness 与主动刷新周期一致。旧值即便过期也持续可读。
 PERIOD_STATS = SWRCache(60.0)
-# Status 页原有的本月 (channel, model) TPS 查询也由同一个线程维护。
-STATUS_TPS = SWRCache(60.0)
 LIFETIME_STATS = SWRCache(120.0)
 # 账户/渠道/Key 的按模型明细变化频率低，后台每 5 分钟统一刷新。
 DETAIL_STATS = SWRCache(300.0)
@@ -367,13 +364,6 @@ def _refresh_common_periods() -> bool:
 def _refresh_lifetime() -> bool:
     return LIFETIME_STATS.refresh_now(
         "lifetime", lambda: _STATS_CONTROL.lifetime_snapshot(_CONTEXT),
-    )
-
-
-def _refresh_status_tps() -> bool:
-    since = month_start_ts()
-    return STATUS_TPS.refresh_now(
-        "month", lambda: _STATUS_CONTROL.tps_by_channel_model(_CONTEXT, since_ts=since),
     )
 
 
@@ -489,9 +479,6 @@ COORDINATOR.register_periodic(
 COORDINATOR.register_periodic(
     "model-details", 300.0, _queue_model_detail_snapshots, priority=4,
 )
-COORDINATOR.register_periodic(
-    "status-tps", 60.0, _refresh_status_tps, priority=5,
-)
 
 
 def start() -> None:
@@ -558,7 +545,6 @@ def reset_for_tests() -> None:
     stop()
     for cache in (
         PERIOD_STATS,
-        STATUS_TPS,
         LIFETIME_STATS,
         DETAIL_STATS,
         WINDOW_STATS,
