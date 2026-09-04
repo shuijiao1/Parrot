@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import heapq
 import json
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -92,107 +91,39 @@ class LogBodyPageResult:
         return self.page * self.page_size < self.total
 
 
-_SCAN_CHUNK = 200
-
-
 class LogsControl:
     def __init__(self, *, log_db=log_db_module, config=config_module, oauth_manager=oauth_manager_module) -> None:
         self.log_db = log_db
         self.config = config
         self.oauth_manager = oauth_manager
 
-    @staticmethod
-    def _status_pushdown(statuses: tuple[RequestLogStatus, ...]) -> str | None:
-        return statuses[0].value if len(statuses) == 1 else None
-
-    def _base_filters(self, query: RequestLogQuery) -> dict[str, Any]:
-        return {
-            "status": self._status_pushdown(query.statuses),
-            "api_keys": list(query.api_keys) or None,
-            "models": list(query.models) or None,
-            "channel_keys": list(query.channels) or None,
-        }
-
-    @staticmethod
-    def _matches(row: dict[str, Any], query: RequestLogQuery) -> bool:
-        if len(query.statuses) > 1 and str(row.get("status") or "") not in {item.value for item in query.statuses}:
-            return False
-        protocol = str(row.get("protocol") or row.get("ingress_protocol") or "")
-        if query.protocols and protocol not in {item.value for item in query.protocols}:
-            return False
-        created = utc_datetime(row.get("created_at"))
-        if query.started_at is not None and (created is None or created < query.started_at):
-            return False
-        if query.ended_at is not None and (created is None or created > query.ended_at):
-            return False
-        if query.query:
-            needle = query.query.casefold()
-            values = (
-                row.get("request_id"), row.get("requested_model"), row.get("final_model"),
-                row.get("final_channel_key"), row.get("api_key_name"), row.get("error_message"),
-            )
-            if not any(needle in str(value or "").casefold() for value in values):
-                return False
-        return True
-
-    @staticmethod
-    def _sort_value(row: dict[str, Any], sort: RequestLogSort) -> Any:
-        if sort is RequestLogSort.STATUS:
-            return str(row.get("status") or "")
-        if sort is RequestLogSort.LATENCY:
-            return float(row.get("duration_ms") or row.get("total_time_ms") or 0)
-        if sort is RequestLogSort.MODEL:
-            return str(row.get("requested_model") or row.get("final_model") or "").casefold()
-        dt = utc_datetime(row.get("created_at"))
-        return dt.timestamp() if dt is not None else 0.0
-
     def list_logs(self, context: ManagementContext, query: RequestLogQuery) -> PageResult[dict[str, Any]]:
         require(context)
         started_at, ended_at = normalize_utc_range(query.started_at, query.ended_at)
         query = replace(query, started_at=started_at, ended_at=ended_at)
-        filters = self._base_filters(query)
-        requires_memory = bool(
-            len(query.statuses) > 1 or query.protocols or query.query
-            or query.started_at is not None or query.ended_at is not None
-            or query.sort is not RequestLogSort.CREATED_AT or not query.descending
+        rows, total = self.log_db.management_logs_page(
+            statuses=[item.value for item in query.statuses] or None,
+            api_keys=list(query.api_keys) or None,
+            models=list(query.models) or None,
+            channel_keys=list(query.channels) or None,
+            protocols=[item.value for item in query.protocols] or None,
+            query=query.query,
+            started_at=(query.started_at.timestamp() if query.started_at is not None else None),
+            ended_at=(query.ended_at.timestamp() if query.ended_at is not None else None),
+            sort=query.sort.value,
+            descending=query.descending,
+            page=query.page,
+            page_size=query.page_size,
         )
-        if not requires_memory:
-            total = int(self.log_db.recent_logs_count(**filters))
-            rows = self.log_db.recent_logs(
-                query.page_size,
-                offset=(query.page - 1) * query.page_size,
-                **filters,
-            )
-            return PageResult(
-                tuple(self._list_record(row) for row in rows),
-                query.page, query.page_size, total,
-            )
-        total_candidates = int(self.log_db.recent_logs_count(**filters))
-        matched = 0
-
-        def candidates():
-            nonlocal matched
-            for offset in range(0, total_candidates, _SCAN_CHUNK):
-                chunk = self.log_db.recent_logs(
-                    min(_SCAN_CHUNK, total_candidates - offset), offset=offset, **filters,
-                )
-                if not chunk:
-                    break
-                for row in chunk:
-                    if self._matches(row, query):
-                        matched += 1
-                        yield row
-
-        top_k = query.page * query.page_size
-        selector = heapq.nlargest if query.descending else heapq.nsmallest
-        selected = selector(
-            top_k, candidates(), key=lambda row: self._sort_value(row, query.sort),
-        )
-        start = (query.page - 1) * query.page_size
-        rows = selected[start:start + query.page_size]
+        billing = self.log_db.costs_for_logs(rows)
         return PageResult(
-            tuple(self._list_record(row) for row in rows),
-            query.page, query.page_size, matched,
+            tuple(
+                self._list_record(row, billing=billing.get(str(row.get("request_id") or "")))
+                for row in rows
+            ),
+            query.page,
+            query.page_size,
+            int(total),
         )
 
     def list_telegram(
@@ -241,9 +172,16 @@ class LogsControl:
             "unpricedSuccess": int(clean.get("unpriced_success") or 0),
         }
 
-    def _list_record(self, row: dict[str, Any]) -> dict[str, Any]:
+    def _list_record(
+        self,
+        row: dict[str, Any],
+        *,
+        billing: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         clean = sanitize_credentials(dict(row))
-        billing = self._billing_summary(self.log_db.cost_for_log(row))
+        billing = self._billing_summary(
+            self.log_db.cost_for_log(row) if billing is None else billing
+        )
         result = {
             "id": str(clean.get("request_id") or clean.get("id") or ""),
             "status": str(clean.get("status") or "unknown"),
@@ -267,41 +205,7 @@ class LogsControl:
 
     def filter_options(self, context: ManagementContext) -> dict[str, Any]:
         require(context)
-        total = int(self.log_db.recent_logs_count())
-        fields = {
-            "apiKeys": "api_key_name", "channels": "final_channel_key",
-            "statuses": "status", "protocols": "protocol",
-        }
-        counts_by_field: dict[str, dict[str, int]] = {
-            public: {} for public in (*fields, "models")
-        }
-        for offset in range(0, total, _SCAN_CHUNK):
-            rows = self.log_db.recent_logs(min(_SCAN_CHUNK, total - offset), offset=offset)
-            if not rows:
-                break
-            for row in rows:
-                for public, storage in fields.items():
-                    value = row.get(storage)
-                    if public == "protocols" and not value:
-                        value = row.get("ingress_protocol")
-                    if value:
-                        key = str(value)
-                        counts = counts_by_field[public]
-                        counts[key] = counts.get(key, 0) + 1
-                # The authoritative model filter is requested OR final.  Count
-                # both values, but only once when a row used the same model.
-                for value in {
-                    str(row.get("requested_model") or ""),
-                    str(row.get("final_model") or ""),
-                } - {""}:
-                    counts = counts_by_field["models"]
-                    counts[value] = counts.get(value, 0) + 1
-        result: dict[str, list[dict[str, Any]]] = {}
-        for public, counts in counts_by_field.items():
-            result[public] = [
-                {"value": value, "count": count}
-                for value, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-            ]
+        result = copy.deepcopy(self.log_db.management_log_filter_options())
         result["revision"] = revision_for(result)
         return result
 

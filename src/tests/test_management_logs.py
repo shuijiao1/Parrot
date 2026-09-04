@@ -28,6 +28,9 @@ def context():
 class FakeLogDb:
     def __init__(self):
         self.cost_calls = []
+        self.cost_batch_calls = []
+        self.page_calls = []
+        self.filter_options_calls = 0
         self.rows = [
             {
                 "request_id": "r3", "status": "error", "created_at": 300,
@@ -71,6 +74,75 @@ class FakeLogDb:
         field = {"apikey": "api_key_name", "model": "requested_model", "channel": "final_channel_key"}[kind]
         return sorted({row[field] for row in self.rows})
 
+    def management_logs_page(self, **kwargs):
+        self.page_calls.append(kwargs)
+        rows = list(self.rows)
+        if kwargs.get("statuses"):
+            rows = [row for row in rows if row["status"] in kwargs["statuses"]]
+        if kwargs.get("api_keys"):
+            rows = [row for row in rows if row["api_key_name"] in kwargs["api_keys"]]
+        if kwargs.get("models"):
+            rows = [row for row in rows if (
+                row.get("requested_model") in kwargs["models"]
+                or row.get("final_model") in kwargs["models"]
+            )]
+        if kwargs.get("channel_keys"):
+            rows = [row for row in rows if row["final_channel_key"] in kwargs["channel_keys"]]
+        if kwargs.get("protocols"):
+            rows = [row for row in rows if (
+                row.get("protocol") or row.get("ingress_protocol") or ""
+            ) in kwargs["protocols"]]
+        if kwargs.get("started_at") is not None:
+            rows = [row for row in rows if row["created_at"] >= kwargs["started_at"]]
+        if kwargs.get("ended_at") is not None:
+            rows = [row for row in rows if row["created_at"] <= kwargs["ended_at"]]
+        if kwargs.get("query"):
+            needle = kwargs["query"].casefold()
+            fields = (
+                "request_id", "requested_model", "final_model",
+                "final_channel_key", "api_key_name", "error_message",
+            )
+            rows = [row for row in rows if any(
+                needle in str(row.get(field) or "").casefold() for field in fields
+            )]
+        sort = kwargs.get("sort")
+        if sort == "status":
+            key = lambda row: str(row.get("status") or "")
+        elif sort == "latency":
+            key = lambda row: float(row.get("duration_ms") or row.get("total_time_ms") or 0)
+        elif sort == "model":
+            key = lambda row: str(row.get("requested_model") or row.get("final_model") or "").casefold()
+        else:
+            key = lambda row: row["created_at"]
+        rows.sort(key=key, reverse=bool(kwargs.get("descending")))
+        total = len(rows)
+        start = (kwargs["page"] - 1) * kwargs["page_size"]
+        return rows[start:start + kwargs["page_size"]], total
+
+    def management_log_filter_options(self):
+        self.filter_options_calls += 1
+        counts = {
+            "apiKeys": {}, "channels": {}, "statuses": {}, "protocols": {}, "models": {},
+        }
+        fields = {
+            "apiKeys": "api_key_name", "channels": "final_channel_key",
+            "statuses": "status", "protocols": "ingress_protocol",
+        }
+        for row in self.rows:
+            for public, field in fields.items():
+                value = row.get(field)
+                if value:
+                    counts[public][str(value)] = counts[public].get(str(value), 0) + 1
+            for value in {str(row.get("requested_model") or ""), str(row.get("final_model") or "")} - {""}:
+                counts["models"][value] = counts["models"].get(value, 0) + 1
+        return {
+            public: [
+                {"value": value, "count": count}
+                for value, count in sorted(values.items(), key=lambda item: (-item[1], item[0]))
+            ]
+            for public, values in counts.items()
+        }
+
     def cost_for_log(self, row):
         self.cost_calls.append(row["request_id"])
         ticks = {"r3": 300, "r2": 200, "r1": 100}.get(row["request_id"], 0)
@@ -83,6 +155,10 @@ class FakeLogDb:
             "costed_success": int(ticks > 0),
             "unpriced_success": 0,
         }
+
+    def costs_for_logs(self, rows):
+        self.cost_batch_calls.append([row["request_id"] for row in rows])
+        return {row["request_id"]: self.cost_for_log(row) for row in rows}
 
     def log_detail(self, request_id):
         row = next((row for row in self.rows if row["request_id"] == request_id), None)
@@ -259,10 +335,13 @@ def test_body_kind_counts_follow_search_before_kind_filter_and_page():
     )
 
 
-def test_logs_nondefault_and_filter_options_scan_in_bounded_chunks_with_exact_total():
+def test_logs_nondefault_and_filter_options_delegate_one_sql_shaped_query_with_exact_total():
     class LargeLogDb(FakeLogDb):
         def __init__(self):
             self.cost_calls = []
+            self.cost_batch_calls = []
+            self.page_calls = []
+            self.filter_options_calls = 0
             self.rows = [
                 {
                     "request_id": f"r{i:04d}",
@@ -295,13 +374,12 @@ def test_logs_nondefault_and_filter_options_scan_in_bounded_chunks_with_exact_to
     assert [item["id"] for item in result.items] == [
         row["request_id"] for row in expected[17:34]
     ]
-    assert len(db.limits) == 5
-    assert max(db.limits) <= 200
+    assert db.limits == []
+    assert len(db.page_calls) == 1
 
-    db.limits.clear()
     options = control.filter_options(context())
-    assert max(db.limits) <= 200
-    assert len(db.limits) == 5
+    assert db.limits == []
+    assert db.filter_options_calls == 1
     assert sum(item["count"] for item in options["statuses"]) == 1000
     assert {item["value"] for item in options["apiKeys"]} == {
         f"key-{index}" for index in range(5)
@@ -382,6 +460,7 @@ def test_logs_list_uses_authoritative_transport_and_page_billing_only(tmp_path):
 
     assert [item["id"] for item in result.items] == ["r3", "r2"]
     assert db.cost_calls == ["r3", "r2"]
+    assert db.cost_batch_calls == [["r3", "r2"]]
     assert len(db.cost_calls) <= result.page_size
     assert result.items[0]["transport"] == "websocket"
     assert result.items[0]["costTicks"] == 300
@@ -399,6 +478,7 @@ def test_logs_list_uses_authoritative_transport_and_page_billing_only(tmp_path):
     }
 
     db.cost_calls.clear()
+    db.cost_batch_calls.clear()
     client, _, controls, auth = build_client(tmp_path)
     controls.logs = control
     response = client.get(
@@ -406,6 +486,7 @@ def test_logs_list_uses_authoritative_transport_and_page_billing_only(tmp_path):
     )
     assert response.status_code == 200, response.text
     assert db.cost_calls == ["r3", "r2"]
+    assert db.cost_batch_calls == [["r3", "r2"]]
     assert response.json()["data"][0]["error"] == (
         "upstreamSecret=P4_SECRET_MARKER; ordinary upstream failure"
     )
