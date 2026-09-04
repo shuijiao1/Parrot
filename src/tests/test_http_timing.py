@@ -35,8 +35,12 @@ class _Connector:
     def __init__(self) -> None:
         self.stats = _Stats()
 
-    def create_httpx_client(self, **kwargs):
-        self.kwargs = kwargs
+    def create_httpx_client(self, *, timeout, byte_counter, timing):
+        self.kwargs = {
+            "timeout": timeout,
+            "byte_counter": byte_counter,
+            "timing": timing,
+        }
         return SimpleNamespace(aclose=self._close)
 
     async def _close(self):
@@ -108,11 +112,70 @@ def _request():
     )
 
 
+def _proxy_update_recorder(updates):
+    def update(
+        handle,
+        started_at=None,
+        connect_ms=None,
+        first_byte_ms=None,
+        idle_ms=None,
+        total_ms=None,
+        dns_ms=None,
+        tcp_ms=None,
+        proxy_tcp_ms=None,
+        proxy_tunnel_ms=None,
+        tls_ms=None,
+        target_tls_ms=None,
+        ws_handshake_ms=None,
+        request_upload_ms=None,
+        response_headers_wait_ms=None,
+        response_body_first_byte_wait_ms=None,
+        ended_at=None,
+        outcome=None,
+        error_detail=None,
+        bytes_up=None,
+        bytes_down=None,
+    ):
+        updates.append((handle, {
+            "started_at": started_at,
+            "connect_ms": connect_ms,
+            "first_byte_ms": first_byte_ms,
+            "idle_ms": idle_ms,
+            "total_ms": total_ms,
+            "dns_ms": dns_ms,
+            "tcp_ms": tcp_ms,
+            "proxy_tcp_ms": proxy_tcp_ms,
+            "proxy_tunnel_ms": proxy_tunnel_ms,
+            "tls_ms": tls_ms,
+            "target_tls_ms": target_tls_ms,
+            "ws_handshake_ms": ws_handshake_ms,
+            "request_upload_ms": request_upload_ms,
+            "response_headers_wait_ms": response_headers_wait_ms,
+            "response_body_first_byte_wait_ms": response_body_first_byte_wait_ms,
+            "ended_at": ended_at,
+            "outcome": outcome,
+            "error_detail": error_detail,
+            "bytes_up": bytes_up,
+            "bytes_down": bytes_down,
+        }))
+    return update
+
+
 def _patch_persistence(monkeypatch):
     inserted = []
     updates = []
 
-    def record(request_id, retry_id, order, proxy_name, started_at, **kwargs):
+    def record(
+        request_id,
+        retry_id,
+        order,
+        proxy_name,
+        started_at,
+        *,
+        round_id=None,
+        transport=None,
+        request_mode=None,
+    ):
         handle = f"route-{order}"
         inserted.append({
             "handle": handle,
@@ -121,15 +184,16 @@ def _patch_persistence(monkeypatch):
             "order": order,
             "proxy_name": proxy_name,
             "started_at": started_at,
-            **kwargs,
+            "round_id": round_id,
+            "transport": transport,
+            "request_mode": request_mode,
         })
         return handle
 
-    def update(handle, **kwargs):
-        updates.append((handle, dict(kwargs)))
-
     monkeypatch.setattr(http_runtime.log_db, "record_proxy_attempt", record)
-    monkeypatch.setattr(http_runtime.log_db, "update_proxy_attempt", update)
+    monkeypatch.setattr(
+        http_runtime.log_db, "update_proxy_attempt", _proxy_update_recorder(updates),
+    )
     monkeypatch.setattr(http_runtime.upstream, "get_client", lambda: object())
     return inserted, updates
 
@@ -391,7 +455,7 @@ async def test_terminal_timing_freezes_before_real_executor_queue(monkeypatch):
     monkeypatch.setattr(
         http_runtime.log_db,
         "update_proxy_attempt",
-        lambda handle, **kwargs: persisted.append((handle, kwargs)),
+        _proxy_update_recorder(persisted),
     )
     monkeypatch.setattr(asyncio, "to_thread", test_conftest._ORIG_TO_THREAD)
 
@@ -440,6 +504,7 @@ async def test_terminal_timing_freezes_before_real_executor_queue(monkeypatch):
 async def test_precommit_cancel_closes_owned_context_persists_cancel_and_rethrows(monkeypatch):
     _inserted, updates = _patch_persistence(monkeypatch)
     gate = asyncio.Event()
+    context_created = asyncio.Event()
     contexts = []
 
     monkeypatch.setattr(
@@ -450,13 +515,14 @@ async def test_precommit_cancel_closes_owned_context_persists_cancel_and_rethrow
     def open_stream(client, request):
         ctx = _Context(request, wait=gate)
         contexts.append(ctx)
+        context_created.set()
         return ctx
 
     monkeypatch.setattr(http_runtime, "open_stream", open_stream)
     task = asyncio.create_task(
         http_runtime.open_response_with_proxy_chain(**_open_kwargs())
     )
-    await asyncio.sleep(0)
+    await context_created.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

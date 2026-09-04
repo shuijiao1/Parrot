@@ -700,6 +700,48 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         await key_lease.release()
 
 
+async def _finish_cancelled_before_ws_candidate_transition(
+    result: _WsAttemptResult,
+    ch: Channel,
+    resolved_model: str,
+    request_id: str,
+    retry_count: int,
+    affinity_hit: int,
+    start_monotonic: float,
+) -> None:
+    """Terminalize a request cancelled after its pre-accept attempt returned."""
+
+    if result.request_finalized:
+        return
+    result.request_finalized = True
+    await await_ws_owned(asyncio.to_thread(
+        log_db.finish_error,
+        request_id,
+        "client disconnected",
+        retry_count,
+        final_channel_key=ch.key,
+        final_channel_type=ch.type,
+        final_model=resolved_model,
+        connect_ms=result.connect_ms,
+        first_token_ms=result.first_byte_ms,
+        idle_ms=result.idle_ms,
+        total_ms=result.total_ms,
+        final_round_id=result.round_id,
+        request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
+        http_status=499,
+        response_body=result.response_text or None,
+        affinity_hit=affinity_hit,
+        upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+        upstream_transport=result.upstream_transport,
+        proxy_name=result.proxy_name,
+        proxy_bytes_up=result.proxy_bytes.up,
+        proxy_bytes_down=result.proxy_bytes.down,
+        status="cancelled",
+        usage=result.usage,
+        usage_observed=result.usage_observed,
+    ))
+
+
 async def _run_ws_failover(
     websocket: WebSocket,
     *,
@@ -796,25 +838,32 @@ async def _run_ws_failover(
         last_result = result
         accepted = accepted or result.closed_after_accept or result.ok or result.connected
 
-        await asyncio.to_thread(
-            log_db.update_retry_attempt,
-            attempt_id,
-            final_round_id=result.round_id,
-            connect_ms=result.connect_ms,
-            first_byte_ms=result.first_byte_ms,
-            idle_ms=result.idle_ms,
-            total_ms=result.total_ms,
-            attempt_elapsed_ms=int((time.monotonic() - attempt_started_monotonic) * 1000),
-            ended_at=time.time(),
-            outcome=result.outcome,
-            error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
-            proxy_name=result.proxy_name,
-            bytes_up=result.proxy_bytes.up,
-            bytes_down=result.proxy_bytes.down,
-            response_body=result.response_text or None,
-            usage=result.usage,
-            usage_observed=result.usage_observed,
-        )
+        try:
+            await await_ws_owned(asyncio.to_thread(
+                log_db.update_retry_attempt,
+                attempt_id,
+                final_round_id=result.round_id,
+                connect_ms=result.connect_ms,
+                first_byte_ms=result.first_byte_ms,
+                idle_ms=result.idle_ms,
+                total_ms=result.total_ms,
+                attempt_elapsed_ms=int((time.monotonic() - attempt_started_monotonic) * 1000),
+                ended_at=time.time(),
+                outcome=result.outcome,
+                error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
+                proxy_name=result.proxy_name,
+                bytes_up=result.proxy_bytes.up,
+                bytes_down=result.proxy_bytes.down,
+                response_body=result.response_text or None,
+                usage=result.usage,
+                usage_observed=result.usage_observed,
+            ))
+        except asyncio.CancelledError:
+            await _finish_cancelled_before_ws_candidate_transition(
+                result, ch, resolved_model, request_id, retry_count,
+                affinity_hit, start_monotonic,
+            )
+            raise
 
         if result.outcome == "client_disconnected":
             # Cancellation is request-global. Never dispatch the abandoned
@@ -993,25 +1042,32 @@ async def _run_ws_failover(
                     result.proxy_name = attempt_proxy
                 last_result = result
                 accepted = accepted or result.closed_after_accept or result.ok or result.connected
-                await asyncio.to_thread(
-                    log_db.update_retry_attempt,
-                    attempt_id,
-                    final_round_id=result.round_id,
-                    connect_ms=result.connect_ms,
-                    first_byte_ms=result.first_byte_ms,
-                    idle_ms=result.idle_ms,
-                    total_ms=result.total_ms,
-                    attempt_elapsed_ms=int((time.monotonic() - attempt_started_monotonic2) * 1000),
-                    ended_at=time.time(),
-                    outcome=result.outcome,
-                    error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
-                    proxy_name=result.proxy_name,
-                    bytes_up=result.proxy_bytes.up,
-                    bytes_down=result.proxy_bytes.down,
-                    response_body=result.response_text or None,
-                    usage=result.usage,
-                    usage_observed=result.usage_observed,
-                )
+                try:
+                    await await_ws_owned(asyncio.to_thread(
+                        log_db.update_retry_attempt,
+                        attempt_id,
+                        final_round_id=result.round_id,
+                        connect_ms=result.connect_ms,
+                        first_byte_ms=result.first_byte_ms,
+                        idle_ms=result.idle_ms,
+                        total_ms=result.total_ms,
+                        attempt_elapsed_ms=int((time.monotonic() - attempt_started_monotonic2) * 1000),
+                        ended_at=time.time(),
+                        outcome=result.outcome,
+                        error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
+                        proxy_name=result.proxy_name,
+                        bytes_up=result.proxy_bytes.up,
+                        bytes_down=result.proxy_bytes.down,
+                        response_body=result.response_text or None,
+                        usage=result.usage,
+                        usage_observed=result.usage_observed,
+                    ))
+                except asyncio.CancelledError:
+                    await _finish_cancelled_before_ws_candidate_transition(
+                        result, ch, resolved_model, request_id, retry_count,
+                        affinity_hit, start_monotonic,
+                    )
+                    raise
                 if result.outcome == "client_disconnected":
                     if not result.request_finalized:
                         await _finalize_ws_attempt_after_accept(

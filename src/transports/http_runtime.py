@@ -135,6 +135,20 @@ async def close_proxy_client(client) -> None:
         pass
 
 
+async def _await_http_owned(awaitable):
+    """Let an ownership transition finish before propagating cancellation."""
+
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except BaseException:
+        try:
+            await task
+        except BaseException:
+            pass
+        raise
+
+
 def _new_proxy_bytes() -> dict[str, int]:
     return {"up": 0, "down": 0}
 
@@ -1273,6 +1287,98 @@ async def _drain_proxy_attempt_persistence() -> None:
         await asyncio.gather(*tuple(_proxy_persistence_tasks), return_exceptions=True)
 
 
+@dataclass
+class _HttpResponseOpenOwner:
+    """Own a route from client creation until ``OpenedHttpResponse`` handoff."""
+
+    route_type: str
+    response_mode: str
+    proxy_name: str | None
+    proxy_bytes: dict[str, int]
+    round_id: str | None = None
+    proxy_attempt_id: Any | None = None
+    proxy_client: Any | None = None
+    ctx: Any | None = None
+    timing: HttpAttemptTiming | None = None
+    transferred: bool = False
+    closed: bool = False
+    terminal_persistence_scheduled: bool = False
+
+    async def abort(
+        self,
+        outcome: str,
+        error_detail: str,
+        *,
+        wait_for_persistence: bool = False,
+    ) -> None:
+        if self.transferred:
+            return
+
+        snapshot = (
+            self.timing.finish(outcome, error_detail)
+            if self.timing is not None
+            else None
+        )
+        if not self.closed:
+            self.closed = True
+            ctx, self.ctx = self.ctx, None
+            client, self.proxy_client = self.proxy_client, None
+            try:
+                if ctx is not None:
+                    await close_response_context(ctx)
+            except BaseException:
+                pass
+            try:
+                await close_proxy_client(client)
+            except BaseException:
+                pass
+
+        if self.proxy_attempt_id is None or self.terminal_persistence_scheduled:
+            return
+        self.terminal_persistence_scheduled = True
+        if snapshot is not None:
+            if wait_for_persistence:
+                await _persist_frozen_proxy_attempt(
+                    self.proxy_attempt_id,
+                    snapshot,
+                    outcome=outcome,
+                    error_detail=error_detail,
+                    proxy_bytes=dict(self.proxy_bytes),
+                )
+            else:
+                _schedule_frozen_proxy_attempt_persistence(
+                    self.proxy_attempt_id,
+                    snapshot,
+                    outcome=outcome,
+                    error_detail=error_detail,
+                    proxy_bytes=self.proxy_bytes,
+                )
+            return
+
+        # Cancellation can arrive while record_proxy_attempt's worker is in
+        # flight, before the authoritative HTTP round timing is constructed.
+        # Keep its original started_at and terminalize only the fields known at
+        # this pre-round boundary.
+        try:
+            up, down = proxy_byte_snapshot(self.proxy_bytes)
+            await asyncio.to_thread(
+                log_db.update_proxy_attempt,
+                self.proxy_attempt_id,
+                ended_at=time.time(),
+                outcome=outcome,
+                error_detail=error_detail[:4000],
+                bytes_up=up,
+                bytes_down=down,
+            )
+        except Exception:
+            pass
+
+    def transfer(self) -> None:
+        if self.closed:
+            raise RuntimeError("cannot transfer an aborted HTTP response owner")
+        self.transferred = True
+
+
 async def finalize_opened_http_response(
     opened: OpenedHttpResponse,
     outcome: str,
@@ -1297,9 +1403,7 @@ async def finalize_opened_http_response(
 
 async def _finish_pre_header_round(
     *,
-    ctx,
-    proxy_client,
-    proxy_attempt_id,
+    owner: _HttpResponseOpenOwner,
     timing: HttpAttemptTiming,
     outcome: str,
     detail: str,
@@ -1309,22 +1413,15 @@ async def _finish_pre_header_round(
 ) -> AttemptResult:
     # The raised I/O result is the terminal boundary.  Freeze before dispatch
     # bookkeeping, socket cleanup, or an executor queue can extend the round.
-    snapshot = timing.finish(outcome, detail)
-    if persist_dispatch is not None:
-        await persist_dispatch()
-    if ctx is not None:
-        await close_response_context(ctx)
-    await close_proxy_client(proxy_client)
+    timing.finish(outcome, detail)
     result = _attempt_result(
         outcome, detail, bucket=proxy_bytes, proxy_name=proxy_name,
     )
-    _schedule_frozen_proxy_attempt_persistence(
-        proxy_attempt_id,
-        snapshot,
-        outcome=outcome,
-        error_detail=detail,
-        proxy_bytes=proxy_bytes,
-    )
+    try:
+        if persist_dispatch is not None:
+            await persist_dispatch()
+    finally:
+        await _await_http_owned(owner.abort(outcome, detail))
     return timing.apply_to(result, terminal=False)
 
 
@@ -1385,6 +1482,12 @@ async def open_response_with_proxy_chain(
         proxy_name_used = str(route_name) if connector is not None else None
         route_log_name = str(route_name) if connector is not None else "direct"
         proxy_bytes = _new_proxy_bytes()
+        owner = _HttpResponseOpenOwner(
+            route_type=str(route_type),
+            response_mode=response_mode,
+            proxy_name=proxy_name_used,
+            proxy_bytes=proxy_bytes,
+        )
         client = upstream.get_client()
         if bool(getattr(channel, "internal_loopback", False)):
             # The shared client may carry legacy SOCKS settings. A process-local
@@ -1401,6 +1504,7 @@ async def open_response_with_proxy_chain(
                 http2=False,
             )
             client = proxy_client
+            owner.proxy_client = proxy_client
         proxy_attempt_id = None
         proxy_attempt_order += 1
         proxy_started_at = time.time()
@@ -1421,6 +1525,7 @@ async def open_response_with_proxy_chain(
                     timing=late_timing,
                 )
                 client = proxy_client
+                owner.proxy_client = proxy_client
             except Exception as exc:
                 connector.stats.total_failures += 1
                 connector.stats.last_error = str(exc)[:200]
@@ -1430,12 +1535,24 @@ async def open_response_with_proxy_chain(
                     bucket=proxy_bytes,
                     proxy_name=proxy_name_used,
                 )
-                await close_proxy_client(proxy_client)
+                await _await_http_owned(owner.abort(
+                    last_pre_header.outcome,
+                    last_pre_header.error_detail or "proxy client error",
+                ))
                 continue
+            except BaseException as exc:
+                await _await_http_owned(owner.abort(
+                    "cancelled" if isinstance(exc, asyncio.CancelledError) else "transport_error",
+                    f"proxy client setup aborted: {exc}",
+                    wait_for_persistence=True,
+                ))
+                raise
 
         round_id = str(uuid.uuid4())
-        try:
-            proxy_attempt_id = await asyncio.to_thread(
+        owner.round_id = round_id
+
+        async def record_route_attempt() -> None:
+            owner.proxy_attempt_id = await asyncio.to_thread(
                 log_db.record_proxy_attempt,
                 request_id, retry_attempt_id, proxy_attempt_order,
                 route_log_name, time.time(),
@@ -1443,8 +1560,26 @@ async def open_response_with_proxy_chain(
                 transport="http",
                 request_mode=f"http_{response_mode}",
             )
+
+        try:
+            await _await_http_owned(record_route_attempt())
+        except asyncio.CancelledError:
+            await _await_http_owned(owner.abort(
+                "cancelled",
+                "upstream HTTP route cancelled while recording proxy attempt",
+                wait_for_persistence=True,
+            ))
+            raise
         except Exception:
-            proxy_attempt_id = None
+            owner.proxy_attempt_id = None
+        except BaseException as exc:
+            await _await_http_owned(owner.abort(
+                "transport_error",
+                f"upstream HTTP route aborted while recording proxy attempt: {exc}",
+                wait_for_persistence=True,
+            ))
+            raise
+        proxy_attempt_id = owner.proxy_attempt_id
 
         # The trace callback itself must remain non-blocking. It captures the
         # authoritative physical-send timestamp; the surrounding coroutine then
@@ -1464,13 +1599,13 @@ async def open_response_with_proxy_chain(
                 return
             dispatch_state["persisted"] = True
             try:
-                await asyncio.to_thread(
+                await _await_http_owned(asyncio.to_thread(
                     log_db.mark_retry_attempt_dispatch,
                     retry_attempt_id,
                     upstream_req.body,
                     dispatch_metadata=getattr(upstream_req, "dispatch_metadata", None),
                     dispatched_at=dispatch_state["at"],
-                )
+                ))
             except Exception:
                 # Billing diagnostics must never break the proxy path.
                 pass
@@ -1483,6 +1618,7 @@ async def open_response_with_proxy_chain(
             on_dispatch=note_dispatch,
         )
         late_timing.target = timing
+        owner.timing = timing
 
         async def trace_with_dispatch(name: str, info: dict[str, Any]) -> None:
             was_dispatched = timing.dispatch_started
@@ -1509,6 +1645,7 @@ async def open_response_with_proxy_chain(
                     extensions={"trace": trace_with_dispatch},
                 ),
             )
+            owner.ctx = ctx
         except Exception as exc:
             last_pre_header = _with_timing(timing, _attempt_result(
                 connection_lifecycle_outcome(
@@ -1518,21 +1655,21 @@ async def open_response_with_proxy_chain(
                 bucket=proxy_bytes,
                 proxy_name=proxy_name_used,
             ))
-            snapshot = timing.finish(
-                last_pre_header.outcome, last_pre_header.error_detail,
-            )
-            await close_proxy_client(proxy_client)
+            await _await_http_owned(owner.abort(
+                last_pre_header.outcome,
+                last_pre_header.error_detail or "send build error",
+            ))
             if connector is not None:
                 connector.stats.total_failures += 1
                 connector.stats.last_error = str(exc)[:200]
-            _schedule_frozen_proxy_attempt_persistence(
-                proxy_attempt_id,
-                snapshot,
-                outcome=last_pre_header.outcome,
-                error_detail=last_pre_header.error_detail,
-                proxy_bytes=proxy_bytes,
-            )
             continue
+        except BaseException as exc:
+            await _await_http_owned(owner.abort(
+                "cancelled" if isinstance(exc, asyncio.CancelledError) else "transport_error",
+                f"upstream HTTP send build aborted: {exc}",
+                wait_for_persistence=True,
+            ))
+            raise
 
         try:
             upstream_resp = await timing.wait_for(ctx.__aenter__(), round_timeouts)
@@ -1541,10 +1678,8 @@ async def open_response_with_proxy_chain(
                 # High-level API return is the authoritative final-header boundary.
                 timing.mark_connection_complete()
         except asyncio.CancelledError:
-            await asyncio.shield(_finish_pre_header_round(
-                ctx=ctx,
-                proxy_client=proxy_client,
-                proxy_attempt_id=proxy_attempt_id,
+            await _await_http_owned(_finish_pre_header_round(
+                owner=owner,
                 timing=timing,
                 outcome="cancelled",
                 detail="upstream HTTP round cancelled before response commit",
@@ -1556,9 +1691,7 @@ async def open_response_with_proxy_chain(
         except BusinessTimeoutError as exc:
             detail = f"{exc.outcome} while opening upstream response"
             last_pre_header = await _finish_pre_header_round(
-                ctx=ctx,
-                proxy_client=proxy_client,
-                proxy_attempt_id=proxy_attempt_id,
+                owner=owner,
                 timing=timing,
                 outcome=exc.outcome,
                 detail=detail,
@@ -1576,9 +1709,7 @@ async def open_response_with_proxy_chain(
             outcome = classify_httpx_timeout(exc)
             detail = f"{outcome}: {exc}"
             last_pre_header = await _finish_pre_header_round(
-                ctx=ctx,
-                proxy_client=proxy_client,
-                proxy_attempt_id=proxy_attempt_id,
+                owner=owner,
                 timing=timing,
                 outcome=outcome,
                 detail=detail,
@@ -1595,9 +1726,7 @@ async def open_response_with_proxy_chain(
         except httpx.ConnectError as exc:
             detail = f"connect error: {exc}"
             last_pre_header = await _finish_pre_header_round(
-                ctx=ctx,
-                proxy_client=proxy_client,
-                proxy_attempt_id=proxy_attempt_id,
+                owner=owner,
                 timing=timing,
                 outcome="connect_error",
                 detail=detail,
@@ -1614,9 +1743,7 @@ async def open_response_with_proxy_chain(
         except Exception as exc:
             detail = f"transport: {exc}"
             last_pre_header = await _finish_pre_header_round(
-                ctx=ctx,
-                proxy_client=proxy_client,
-                proxy_attempt_id=proxy_attempt_id,
+                owner=owner,
                 timing=timing,
                 outcome=connection_lifecycle_outcome(
                     exc, http_phase="pre_headers",
@@ -1632,33 +1759,65 @@ async def open_response_with_proxy_chain(
             if timing.dispatch_started:
                 return OpenedHttpResponse(error=last_pre_header)
             continue
+        except BaseException as exc:
+            await _await_http_owned(_finish_pre_header_round(
+                owner=owner,
+                timing=timing,
+                outcome=(
+                    "cancelled"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else "transport_error"
+                ),
+                detail=f"upstream HTTP round aborted before response commit: {exc}",
+                proxy_name=proxy_name_used,
+                proxy_bytes=proxy_bytes,
+                persist_dispatch=persist_dispatch,
+            ))
+            raise
 
         open_snapshot = timing.snapshot()
         connect_ms = open_snapshot.connect_ms
-        await _persist_frozen_proxy_attempt(
-            proxy_attempt_id,
-            open_snapshot,
-            outcome="open",
-            error_detail=None,
-            proxy_bytes=proxy_bytes,
-        )
-        if connector is not None:
-            connector.stats.total_successes += 1
-            connector.stats.last_success_ts = time.time()
-            if connect_ms is not None:
-                connector.stats.last_latency_ms = connect_ms
+        try:
+            await _await_http_owned(_persist_frozen_proxy_attempt(
+                proxy_attempt_id,
+                open_snapshot,
+                outcome="open",
+                error_detail=None,
+                proxy_bytes=proxy_bytes,
+            ))
+            if connector is not None:
+                connector.stats.total_successes += 1
+                connector.stats.last_success_ts = time.time()
+                if connect_ms is not None:
+                    connector.stats.last_latency_ms = connect_ms
 
-        return OpenedHttpResponse(
-            ctx=ctx,
-            response=upstream_resp,
-            connect_ms=connect_ms,
-            timing=timing,
-            proxy_name=proxy_name_used,
-            proxy_bytes=proxy_bytes,
-            proxy_client=proxy_client,
-            proxy_attempt_id=proxy_attempt_id,
-            round_timeouts=round_timeouts,
-        )
+            opened = OpenedHttpResponse(
+                ctx=ctx,
+                response=upstream_resp,
+                connect_ms=connect_ms,
+                timing=timing,
+                proxy_name=proxy_name_used,
+                proxy_bytes=proxy_bytes,
+                proxy_client=proxy_client,
+                proxy_attempt_id=proxy_attempt_id,
+                round_timeouts=round_timeouts,
+            )
+            owner.transfer()
+            return opened
+        except asyncio.CancelledError:
+            await _await_http_owned(owner.abort(
+                "cancelled",
+                "upstream HTTP round cancelled before response handoff",
+                wait_for_persistence=True,
+            ))
+            raise
+        except BaseException as exc:
+            await _await_http_owned(owner.abort(
+                "transport_error",
+                f"upstream HTTP round aborted before response handoff: {exc}",
+                wait_for_persistence=True,
+            ))
+            raise
 
     return OpenedHttpResponse(
         error=last_pre_header or AttemptResult(

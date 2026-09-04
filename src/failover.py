@@ -1531,6 +1531,51 @@ async def _run_compact_map_reduce_rescue(
 
 # ─── 主入口 ───────────────────────────────────────────────────────
 
+
+class _PendingStreamResponseOwner:
+    """Own stream resources until the Response is attached for ASGI consumption."""
+
+    def __init__(self, abort_callback) -> None:
+        self._abort_callback = abort_callback
+        self._abort_task: asyncio.Task | None = None
+        self._transferred = False
+
+    def transfer(self) -> None:
+        if self._abort_task is not None:
+            raise RuntimeError("cannot transfer an aborting stream response")
+        self._transferred = True
+
+    async def abort(self) -> None:
+        if self._transferred:
+            return
+        if self._abort_task is None:
+            self._abort_task = asyncio.create_task(self._abort_callback())
+        await await_ws_owned(self._abort_task)
+
+
+def _set_pending_stream_owner(result: AttemptResult, abort_callback) -> AttemptResult:
+    result._pending_stream_owner = _PendingStreamResponseOwner(abort_callback)
+    return result
+
+
+async def _abort_pending_stream_result(result: AttemptResult | None) -> None:
+    owner = getattr(result, "_pending_stream_owner", None)
+    if owner is None:
+        return
+    try:
+        await await_ws_owned(owner.abort())
+    except BaseException:
+        # Preserve the exception that triggered the abort. Resource/log cleanup is
+        # internally best-effort and must not replace caller cancellation.
+        pass
+
+
+def _transfer_pending_stream_result(result: AttemptResult) -> None:
+    owner = getattr(result, "_pending_stream_owner", None)
+    if owner is not None:
+        owner.transfer()
+
+
 async def run_failover(
     schedule_result: ScheduleResult,
     body: dict,
@@ -1709,6 +1754,7 @@ async def run_failover(
 
         release_done = False
         slot_phase_complete = False
+        pending_stream_result: AttemptResult | None = None
 
         def _release_once(_key=channel_state.effect_key(ch)):
             nonlocal release_done
@@ -1765,6 +1811,7 @@ async def run_failover(
                     terminal_release=_release_once,
                 )
             result = _request_invalid_result_if_needed(result)
+            pending_stream_result = result
             last_result = result
             quota_exhaustion = bounded_account_quota_error(result)
             if not result.success and not result.stream_started:
@@ -1774,7 +1821,7 @@ async def run_failover(
             if _attempt_proxy and not result.proxy_name:
                 result.proxy_name = _attempt_proxy
 
-            await asyncio.to_thread(
+            retry_update = asyncio.to_thread(
                 log_db.update_retry_attempt,
                 attempt_id,
                 final_round_id=result.round_id,
@@ -1798,9 +1845,14 @@ async def run_failover(
                 usage=getattr(result, "usage", None),
                 usage_observed=getattr(result, "usage_observed", None),
             )
+            if getattr(result, "_pending_stream_owner", None) is not None:
+                await await_ws_owned(retry_update)
+            else:
+                await retry_update
             slot_phase_complete = True
         finally:
             if not slot_phase_complete:
+                await _abort_pending_stream_result(pending_stream_result)
                 _release_once()
 
         # No later await may retain a completed non-stream/error upstream slot.
@@ -1978,8 +2030,14 @@ async def run_failover(
                 result.response = local_web_tools.maybe_wrap_anthropic_json_response_as_sse(result.response)
             if result.success and candidate_openai_local_web_loop and downstream_stream_requested:
                 result.response = local_web_tools.maybe_wrap_responses_json_response_as_sse(result.response)
-            _attach_release_to_response(result.response, _release_once)
-            return result.response
+            try:
+                _attach_release_to_response(result.response, _release_once)
+                _transfer_pending_stream_result(result)
+                return result.response
+            except BaseException:
+                await _abort_pending_stream_result(result)
+                _release_once()
+                raise
         # 非成功：立即释放 slot，进入下一候选
         _release_once()
 
@@ -2233,6 +2291,7 @@ async def run_failover(
                 ch, resolved_model = payload  # type: ignore[assignment]
                 release_done2 = False
                 slot_phase_complete2 = False
+                pending_stream_result2: AttemptResult | None = None
 
                 def _release_q(_key=channel_state.effect_key(ch)):
                     nonlocal release_done2
@@ -2286,6 +2345,7 @@ async def run_failover(
                             terminal_release=_release_q,
                         )
                     result = _request_invalid_result_if_needed(result)
+                    pending_stream_result2 = result
                     last_result = result
                     if not result.success and not result.stream_started:
                         structured_attempts.append(
@@ -2293,7 +2353,7 @@ async def run_failover(
                         )
                     if _attempt_proxy2 and not result.proxy_name:
                         result.proxy_name = _attempt_proxy2
-                    await asyncio.to_thread(
+                    retry_update = asyncio.to_thread(
                         log_db.update_retry_attempt,
                         attempt_id,
                         final_round_id=result.round_id,
@@ -2317,9 +2377,14 @@ async def run_failover(
                         usage=getattr(result, "usage", None),
                         usage_observed=getattr(result, "usage_observed", None),
                     )
+                    if getattr(result, "_pending_stream_owner", None) is not None:
+                        await await_ws_owned(retry_update)
+                    else:
+                        await retry_update
                     slot_phase_complete2 = True
                 finally:
                     if not slot_phase_complete2:
+                        await _abort_pending_stream_result(pending_stream_result2)
                         _release_q()
 
                 if (result.success and (candidate_local_web_loop or candidate_openai_local_web_loop)) or (
@@ -2337,8 +2402,14 @@ async def run_failover(
                             fp_query, channel_state.effect_key(ch), resolved_model,
                             prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
                         )
-                    _attach_release_to_response(result.response, _release_q)
-                    return result.response
+                    try:
+                        _attach_release_to_response(result.response, _release_q)
+                        _transfer_pending_stream_result(result)
+                        return result.response
+                    except BaseException:
+                        await _abort_pending_stream_result(result)
+                        _release_q()
+                        raise
                 _release_q()
                 if result.outcome == "request_invalid":
                     status = int(result.http_status or 400)
@@ -3834,6 +3905,7 @@ async def _consume_oauth_responses_ws_stream(
             request_elapsed_ms=request_elapsed_ms,
             http_status=499, affinity_hit=affinity_hit,
             response_body=_identity_log_text(tracker.get_full_response(), identity_state) or None,
+            status="cancelled",
             usage=tracker.usage,
             usage_observed=tracker.usage_observed,
             upstream_protocol="openai-responses", upstream_transport="ws",
@@ -3978,7 +4050,7 @@ async def _consume_oauth_responses_ws_stream(
         status_code=200,
         media_type="text/event-stream",
     )
-    return AttemptResult(
+    result = AttemptResult(
         outcome="success",
         success=True,
         stream_started=True,
@@ -3991,6 +4063,18 @@ async def _consume_oauth_responses_ws_stream(
         proxy_bytes_down=proxy_bytes.down,
         translator_ctx=translator_ctx,
     )
+
+    async def abort_before_response_handoff() -> None:
+        try:
+            if not state["finalized"]:
+                await finalize_disconnect()
+        finally:
+            try:
+                await upstream_ws.close()
+            except BaseException:
+                pass
+
+    return _set_pending_stream_owner(result, abort_before_response_handoff)
 
 
 # ─── 单渠道尝试 ──────────────────────────────────────────────────
@@ -5302,4 +5386,13 @@ async def _consume_stream(
         proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
         proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
     )
-    return timing.apply_to(result, terminal=False) if timing is not None else result
+    if timing is not None:
+        timing.apply_to(result, terminal=False)
+
+    async def abort_before_response_handoff() -> None:
+        try:
+            await _finalize_client_cancelled()
+        finally:
+            await _close_stream_resources()
+
+    return _set_pending_stream_owner(result, abort_before_response_handoff)
