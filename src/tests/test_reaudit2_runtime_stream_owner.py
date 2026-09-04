@@ -212,31 +212,58 @@ async def test_cancel_outer_retry_open_update_aborts_unstarted_http_stream_befor
     assert context.exit_calls == 1
     assert client.close_calls == 1
     assert slot_releases == [channel.key]
-    assert sum(row["outcome"] == "open" for row in logs.retry_updates) == 1
-    assert sum(
-        row["outcome"] == "client_disconnected" for row in logs.retry_updates
-    ) == 1
-    assert len(logs.request_terminals) == 1
-    assert logs.request_terminals[0]["status"] == "cancelled"
-    assert logs.request_terminals[0]["http_status"] == 499
-    assert sum(
-        row["outcome"] == "client_disconnected" for row in logs.proxy_updates
-    ) == 1
+    assert [row["outcome"] for row in logs.retry_updates] == [
+        "open", "client_disconnected",
+    ]
+    assert all(
+        row["attempt_id"] == logs.retry_records[0]["handle"]
+        for row in logs.retry_updates
+    )
+    assert [
+        (row["status"], row["http_status"]) for row in logs.request_terminals
+    ] == [("cancelled", 499)]
+    assert [row["outcome"] for row in logs.proxy_updates] == [
+        "client_disconnected",
+    ]
+    assert logs.proxy_updates[0]["proxy_attempt_id"] == opened.proxy_attempt_id
+    assert logs.proxy_updates[0]["ended_at"] is not None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("queued", [False, True], ids=["candidate", "queued"])
-async def test_responses_ws_cancel_during_preaccept_retry_update_terminalizes_all_owners_once(
+@pytest.mark.parametrize(
+    ("queued", "blocked_write"),
+    [
+        (False, "record_retry_attempt"),
+        (False, "update_pending"),
+        (False, "update_retry_attempt"),
+        (True, "record_retry_attempt"),
+        (True, "update_retry_attempt"),
+    ],
+    ids=[
+        "candidate-retry-record",
+        "candidate-pending-update",
+        "candidate-retry-terminal",
+        "queued-retry-record",
+        "queued-retry-terminal",
+    ],
+)
+async def test_responses_ws_cancel_during_preaccept_log_update_terminalizes_all_owners_once(
     monkeypatch,
     queued,
+    blocked_write,
 ):
     logs = _StrictLogFakes()
     insert_pending = logs.insert_pending
     record_retry = logs.record_retry_attempt
     update_retry = logs.update_retry_attempt
     finish_error = logs.finish_error
+
+    def update_pending(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr(responses_ws.log_db, "insert_pending", insert_pending)
     monkeypatch.setattr(responses_ws.log_db, "record_retry_attempt", record_retry)
+    monkeypatch.setattr(responses_ws.log_db, "update_pending", update_pending)
     monkeypatch.setattr(responses_ws.log_db, "update_retry_attempt", update_retry)
     monkeypatch.setattr(responses_ws.log_db, "finish_error", finish_error)
 
@@ -350,7 +377,9 @@ async def test_responses_ws_cancel_during_preaccept_retry_update_terminalizes_al
     monkeypatch.setattr(
         responses_ws,
         "_pick_non_direct_proxy_name",
-        lambda ch, resolved_model: None,
+        lambda ch, resolved_model: (
+            "proxy-a" if blocked_write == "update_pending" else None
+        ),
     )
 
     slot_releases: list[str] = []
@@ -422,8 +451,14 @@ async def test_responses_ws_cancel_during_preaccept_retry_update_terminalizes_al
     retry_worker_entered = asyncio.Event()
     allow_retry_worker = asyncio.Event()
 
+    blocked_func = {
+        "record_retry_attempt": record_retry,
+        "update_pending": update_pending,
+        "update_retry_attempt": update_retry,
+    }[blocked_write]
+
     async def controlled_to_thread(func, /, *args, **kwargs):
-        if func is update_retry:
+        if func is blocked_func:
             retry_worker_entered.set()
             await allow_retry_worker.wait()
         return func(*args, **kwargs)
@@ -438,12 +473,16 @@ async def test_responses_ws_cancel_during_preaccept_retry_update_terminalizes_al
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert upstream_ws.close_calls == 1
+    assert upstream_ws.close_calls == (
+        1 if blocked_write == "update_retry_attempt" else 0
+    )
     assert slot_releases == [channel.key]
     assert lease.release_calls == 1
-    assert len(logs.retry_updates) == 1
-    assert logs.retry_updates[0]["outcome"] == "connect_error"
+    assert [row["outcome"] for row in logs.retry_updates] == [
+        "connect_error" if blocked_write == "update_retry_attempt" else "cancelled"
+    ]
+    assert logs.retry_updates[0]["attempt_id"] == logs.retry_records[0]["handle"]
     assert logs.retry_updates[0]["ended_at"] is not None
-    assert len(logs.request_terminals) == 1
-    assert logs.request_terminals[0]["status"] == "cancelled"
-    assert logs.request_terminals[0]["http_status"] == 499
+    assert [
+        (row["status"], row["http_status"]) for row in logs.request_terminals
+    ] == [("cancelled", 499)]

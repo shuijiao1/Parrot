@@ -289,7 +289,7 @@ async def _persist_ws_route_round(
     )
     if route_attempt_id is not None:
         try:
-            await asyncio.to_thread(
+            await await_ws_owned(asyncio.to_thread(
                 log_db.update_proxy_attempt,
                 route_attempt_id,
                 started_at=snapshot.started_at,
@@ -303,7 +303,7 @@ async def _persist_ws_route_round(
                 error_detail=(error_detail or "")[:4000] if error_detail else None,
                 bytes_up=proxy_bytes.up,
                 bytes_down=proxy_bytes.down,
-            )
+            ))
         except Exception:
             pass
     return snapshot
@@ -742,6 +742,54 @@ async def _finish_cancelled_before_ws_candidate_transition(
     ))
 
 
+async def _finish_cancelled_before_ws_attempt_handoff(
+    *,
+    ch: Channel,
+    resolved_model: str,
+    request_id: str,
+    retry_count: int,
+    affinity_hit: int,
+    start_monotonic: float,
+    attempt_started_monotonic: float,
+    attempt_id,
+    proxy_name: str | None,
+    upstream_transport: str,
+) -> None:
+    """Settle a WS ingress attempt whose transport owner was not entered yet."""
+
+    result = _WsAttemptResult(
+        outcome="cancelled",
+        error_detail="cancelled before upstream attempt handoff",
+        proxy_name=proxy_name,
+        upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+        upstream_transport=upstream_transport,
+    )
+    if attempt_id is not None:
+        await asyncio.to_thread(
+            log_db.update_retry_attempt,
+            attempt_id,
+            attempt_elapsed_ms=int(
+                (time.monotonic() - attempt_started_monotonic) * 1000
+            ),
+            ended_at=time.time(),
+            outcome="cancelled",
+            error_detail="cancelled before upstream attempt handoff",
+            proxy_name=proxy_name,
+            bytes_up=0,
+            bytes_down=0,
+            settle=False,
+        )
+    await _finish_cancelled_before_ws_candidate_transition(
+        result,
+        ch,
+        resolved_model,
+        request_id,
+        retry_count,
+        affinity_hit,
+        start_monotonic,
+    )
+
+
 async def _run_ws_failover(
     websocket: WebSocket,
     *,
@@ -802,21 +850,29 @@ async def _run_ws_failover(
             channel_key=channel_state.effect_key(ch),
             channel_held=True,
         )
+        attempt_proxy = _pick_non_direct_proxy_name(ch, resolved_model)
+        attempt_started_monotonic = time.monotonic()
+        attempt_id = None
+        attempt_handed_off = False
+        upstream_transport = _responses_ws_upstream_transport(ch)
         try:
-            attempt_proxy = _pick_non_direct_proxy_name(ch, resolved_model)
-            attempt_started_monotonic = time.monotonic()
-            attempt_id = await asyncio.to_thread(
-                log_db.record_retry_attempt,
-                request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
-                proxy_name=attempt_proxy,
-                upstream_protocol=getattr(ch, "protocol", "openai-responses"),
-                client_visible_model=client_visible_model,
-            )
-            if attempt_proxy:
-                await asyncio.to_thread(
-                    log_db.update_pending, request_id, proxy_name=attempt_proxy,
+            async def _record_attempt() -> None:
+                nonlocal attempt_id
+                attempt_id = await asyncio.to_thread(
+                    log_db.record_retry_attempt,
+                    request_id, attempt_order, ch.key, ch.type, resolved_model,
+                    time.time(), proxy_name=attempt_proxy,
+                    upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+                    client_visible_model=client_visible_model,
                 )
 
+            await await_ws_owned(_record_attempt())
+            if attempt_proxy:
+                await await_ws_owned(asyncio.to_thread(
+                    log_db.update_pending, request_id, proxy_name=attempt_proxy,
+                ))
+
+            attempt_handed_off = True
             result = await _try_ws_channel(
                 websocket, first_obj=first_obj,
                 ch=ch, resolved_model=resolved_model, body=body,
@@ -830,6 +886,21 @@ async def _run_ws_failover(
                 attempt_start_monotonic=attempt_started_monotonic,
                 turn_capacity=turn_capacity,
             )
+        except asyncio.CancelledError:
+            if not attempt_handed_off:
+                await await_ws_owned(_finish_cancelled_before_ws_attempt_handoff(
+                    ch=ch,
+                    resolved_model=resolved_model,
+                    request_id=request_id,
+                    retry_count=retry_count,
+                    affinity_hit=affinity_hit,
+                    start_monotonic=start_monotonic,
+                    attempt_started_monotonic=attempt_started_monotonic,
+                    attempt_id=attempt_id,
+                    proxy_name=attempt_proxy,
+                    upstream_transport=upstream_transport,
+                ))
+            raise
         finally:
             await turn_capacity.cleanup_after_attempt(api_key_lease)
 
@@ -839,25 +910,28 @@ async def _run_ws_failover(
         accepted = accepted or result.closed_after_accept or result.ok or result.connected
 
         try:
-            await await_ws_owned(asyncio.to_thread(
-                log_db.update_retry_attempt,
-                attempt_id,
-                final_round_id=result.round_id,
-                connect_ms=result.connect_ms,
-                first_byte_ms=result.first_byte_ms,
-                idle_ms=result.idle_ms,
-                total_ms=result.total_ms,
-                attempt_elapsed_ms=int((time.monotonic() - attempt_started_monotonic) * 1000),
-                ended_at=time.time(),
-                outcome=result.outcome,
-                error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
-                proxy_name=result.proxy_name,
-                bytes_up=result.proxy_bytes.up,
-                bytes_down=result.proxy_bytes.down,
-                response_body=result.response_text or None,
-                usage=result.usage,
-                usage_observed=result.usage_observed,
-            ))
+            if not result.request_finalized:
+                await await_ws_owned(asyncio.to_thread(
+                    log_db.update_retry_attempt,
+                    attempt_id,
+                    final_round_id=result.round_id,
+                    connect_ms=result.connect_ms,
+                    first_byte_ms=result.first_byte_ms,
+                    idle_ms=result.idle_ms,
+                    total_ms=result.total_ms,
+                    attempt_elapsed_ms=int(
+                        (time.monotonic() - attempt_started_monotonic) * 1000
+                    ),
+                    ended_at=time.time(),
+                    outcome=result.outcome,
+                    error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
+                    proxy_name=result.proxy_name,
+                    bytes_up=result.proxy_bytes.up,
+                    bytes_down=result.proxy_bytes.down,
+                    response_body=result.response_text or None,
+                    usage=result.usage,
+                    usage_observed=result.usage_observed,
+                ))
         except asyncio.CancelledError:
             await _finish_cancelled_before_ws_candidate_transition(
                 result, ch, resolved_model, request_id, retry_count,
@@ -1013,16 +1087,24 @@ async def _run_ws_failover(
                     channel_key=channel_state.effect_key(ch),
                     channel_held=True,
                 )
+                attempt_proxy = _pick_non_direct_proxy_name(ch, resolved_model)
+                attempt_started_monotonic2 = time.monotonic()
+                attempt_id = None
+                attempt_handed_off2 = False
+                upstream_transport = _responses_ws_upstream_transport(ch)
                 try:
-                    attempt_proxy = _pick_non_direct_proxy_name(ch, resolved_model)
-                    attempt_started_monotonic2 = time.monotonic()
-                    attempt_id = await asyncio.to_thread(
-                        log_db.record_retry_attempt,
-                        request_id, attempt_order, ch.key, ch.type, resolved_model,
-                        time.time(), proxy_name=attempt_proxy,
-                        upstream_protocol=getattr(ch, "protocol", "openai-responses"),
-                        client_visible_model=client_visible_model,
-                    )
+                    async def _record_queued_attempt() -> None:
+                        nonlocal attempt_id
+                        attempt_id = await asyncio.to_thread(
+                            log_db.record_retry_attempt,
+                            request_id, attempt_order, ch.key, ch.type,
+                            resolved_model, time.time(), proxy_name=attempt_proxy,
+                            upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+                            client_visible_model=client_visible_model,
+                        )
+
+                    await await_ws_owned(_record_queued_attempt())
+                    attempt_handed_off2 = True
                     result = await _try_ws_channel(
                         websocket, first_obj=first_obj,
                         ch=ch, resolved_model=resolved_model, body=body,
@@ -1036,6 +1118,21 @@ async def _run_ws_failover(
                         attempt_start_monotonic=attempt_started_monotonic2,
                         turn_capacity=turn_capacity,
                     )
+                except asyncio.CancelledError:
+                    if not attempt_handed_off2:
+                        await await_ws_owned(_finish_cancelled_before_ws_attempt_handoff(
+                            ch=ch,
+                            resolved_model=resolved_model,
+                            request_id=request_id,
+                            retry_count=retry_count,
+                            affinity_hit=affinity_hit,
+                            start_monotonic=start_monotonic,
+                            attempt_started_monotonic=attempt_started_monotonic2,
+                            attempt_id=attempt_id,
+                            proxy_name=attempt_proxy,
+                            upstream_transport=upstream_transport,
+                        ))
+                    raise
                 finally:
                     await turn_capacity.cleanup_after_attempt(api_key_lease)
                 if result.proxy_name is None:
@@ -1043,25 +1140,28 @@ async def _run_ws_failover(
                 last_result = result
                 accepted = accepted or result.closed_after_accept or result.ok or result.connected
                 try:
-                    await await_ws_owned(asyncio.to_thread(
-                        log_db.update_retry_attempt,
-                        attempt_id,
-                        final_round_id=result.round_id,
-                        connect_ms=result.connect_ms,
-                        first_byte_ms=result.first_byte_ms,
-                        idle_ms=result.idle_ms,
-                        total_ms=result.total_ms,
-                        attempt_elapsed_ms=int((time.monotonic() - attempt_started_monotonic2) * 1000),
-                        ended_at=time.time(),
-                        outcome=result.outcome,
-                        error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
-                        proxy_name=result.proxy_name,
-                        bytes_up=result.proxy_bytes.up,
-                        bytes_down=result.proxy_bytes.down,
-                        response_body=result.response_text or None,
-                        usage=result.usage,
-                        usage_observed=result.usage_observed,
-                    ))
+                    if not result.request_finalized:
+                        await await_ws_owned(asyncio.to_thread(
+                            log_db.update_retry_attempt,
+                            attempt_id,
+                            final_round_id=result.round_id,
+                            connect_ms=result.connect_ms,
+                            first_byte_ms=result.first_byte_ms,
+                            idle_ms=result.idle_ms,
+                            total_ms=result.total_ms,
+                            attempt_elapsed_ms=int(
+                                (time.monotonic() - attempt_started_monotonic2) * 1000
+                            ),
+                            ended_at=time.time(),
+                            outcome=result.outcome,
+                            error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
+                            proxy_name=result.proxy_name,
+                            bytes_up=result.proxy_bytes.up,
+                            bytes_down=result.proxy_bytes.down,
+                            response_body=result.response_text or None,
+                            usage=result.usage,
+                            usage_observed=result.usage_observed,
+                        ))
                 except asyncio.CancelledError:
                     await _finish_cancelled_before_ws_candidate_transition(
                         result, ch, resolved_model, request_id, retry_count,
@@ -1228,6 +1328,20 @@ async def _try_ws_channel(
 
     try:
         upstream_req = await _build_ws_upstream_request(ch, body, resolved_model, websocket=websocket)
+    except asyncio.CancelledError:
+        await await_ws_owned(_finish_cancelled_before_ws_attempt_handoff(
+            ch=ch,
+            resolved_model=resolved_model,
+            request_id=request_id,
+            retry_count=retry_count_so_far,
+            affinity_hit=affinity_hit,
+            start_monotonic=start_monotonic,
+            attempt_started_monotonic=attempt_start_monotonic,
+            attempt_id=retry_attempt_id,
+            proxy_name=None,
+            upstream_transport="ws",
+        ))
+        raise
     except Exception as exc:
         if hasattr(exc, "status") and hasattr(exc, "message"):
             outcome = "candidate_guard" if getattr(exc, "scope", "request") == "candidate" else "guard_error"
@@ -1258,26 +1372,29 @@ async def _try_ws_channel(
         route_type = str(getattr(connector, "type", "direct") or "direct")
         round_id = str(uuid.uuid4())
         route_attempt_id = None
-        try:
-            route_attempt_id = await asyncio.to_thread(
-                log_db.record_proxy_attempt,
-                request_id,
-                retry_attempt_id,
-                route_order,
-                route_log_name,
-                time.time(),
-                round_id=round_id,
-                transport="ws",
-                request_mode="ws",
-            )
-        except Exception:
-            route_attempt_id = None
-
         timing = WsAttemptTiming(route_type=route_type, round_id=round_id)
         route_state = {"dispatched": False}
         relay_state: dict[str, Any] = {}
         upstream_ws = None
         try:
+            async def _record_route_attempt() -> None:
+                nonlocal route_attempt_id
+                route_attempt_id = await asyncio.to_thread(
+                    log_db.record_proxy_attempt,
+                    request_id,
+                    retry_attempt_id,
+                    route_order,
+                    route_log_name,
+                    time.time(),
+                    round_id=round_id,
+                    transport="ws",
+                    request_mode="ws",
+                )
+
+            try:
+                await await_ws_owned(_record_route_attempt())
+            except Exception:
+                route_attempt_id = None
             if connector is not None:
                 connector.stats.total_attempts += 1
                 connector.stats.last_attempt_ts = time.time()
@@ -1371,27 +1488,6 @@ async def _try_ws_channel(
                 _attach_ws_retry_after(
                     relay_result,
                     getattr(getattr(upstream_ws, "response", None), "headers", None),
-                )
-                await asyncio.to_thread(
-                    log_db.update_retry_attempt,
-                    retry_attempt_id,
-                    final_round_id=relay_result.round_id,
-                    connect_ms=relay_result.connect_ms,
-                    first_byte_ms=relay_result.first_byte_ms,
-                    idle_ms=relay_result.idle_ms,
-                    total_ms=relay_result.total_ms,
-                    attempt_elapsed_ms=int(
-                        (time.monotonic() - attempt_start_monotonic) * 1000
-                    ),
-                    ended_at=time.time(),
-                    outcome=relay_result.outcome,
-                    error_detail=(relay_result.error_detail or "")[:4000] or None,
-                    proxy_name=proxy_name_used,
-                    bytes_up=proxy_bytes.up,
-                    bytes_down=proxy_bytes.down,
-                    response_body=relay_result.response_text or None,
-                    usage=relay_result.usage,
-                    usage_observed=relay_result.usage_observed,
                 )
                 if session_result is None and relay_result.request_finalized:
                     session_result = relay_result
@@ -1530,7 +1626,17 @@ async def _try_ws_channel(
                 attempt_start_monotonic = time.monotonic()
                 retry_count_so_far = 0
                 affinity_hit = 0
-                await asyncio.to_thread(
+                retry_attempt_id = None
+                route_attempt_id = None
+                proxy_bytes = _WsProxyBytes()
+                round_id = str(uuid.uuid4())
+                timing = WsAttemptTiming(
+                    route_type=route_type, round_id=round_id,
+                )
+                route_state = {"dispatched": False}
+                relay_state = {}
+
+                await await_ws_owned(asyncio.to_thread(
                     log_db.insert_pending,
                     request_id,
                     client_ip,
@@ -1545,39 +1651,44 @@ async def _try_ws_channel(
                     ingress_protocol="responses_ws",
                     reasoning_effort=reasoning_effort,
                     fast_mode=fast_mode,
-                )
-                retry_attempt_id = await asyncio.to_thread(
-                    log_db.record_retry_attempt,
-                    request_id,
-                    1,
-                    ch.key,
-                    ch.type,
-                    resolved_model,
-                    time.time(),
-                    proxy_name=proxy_name_used,
-                    upstream_protocol=getattr(
-                        ch, "protocol", "openai-responses",
-                    ),
-                    client_visible_model=str(
-                        body.get("_client_visible_model") or requested_model
-                    ),
-                )
-                proxy_bytes = _WsProxyBytes()
-                round_id = str(uuid.uuid4())
-                route_attempt_id = await asyncio.to_thread(
-                    log_db.record_proxy_attempt,
-                    request_id,
-                    retry_attempt_id,
-                    1,
-                    route_log_name,
-                    time.time(),
-                    round_id=round_id,
-                    transport="ws",
-                    request_mode="ws",
-                )
-                timing = WsAttemptTiming(
-                    route_type=route_type, round_id=round_id,
-                )
+                ))
+
+                async def _record_turn_attempt() -> None:
+                    nonlocal retry_attempt_id
+                    retry_attempt_id = await asyncio.to_thread(
+                        log_db.record_retry_attempt,
+                        request_id,
+                        1,
+                        ch.key,
+                        ch.type,
+                        resolved_model,
+                        time.time(),
+                        proxy_name=proxy_name_used,
+                        upstream_protocol=getattr(
+                            ch, "protocol", "openai-responses",
+                        ),
+                        client_visible_model=str(
+                            body.get("_client_visible_model") or requested_model
+                        ),
+                    )
+
+                await await_ws_owned(_record_turn_attempt())
+
+                async def _record_turn_route() -> None:
+                    nonlocal route_attempt_id
+                    route_attempt_id = await asyncio.to_thread(
+                        log_db.record_proxy_attempt,
+                        request_id,
+                        retry_attempt_id,
+                        1,
+                        route_log_name,
+                        time.time(),
+                        round_id=round_id,
+                        transport="ws",
+                        request_mode="ws",
+                    )
+
+                await await_ws_owned(_record_turn_route())
                 timing.mark_handshake_complete()
                 open_snapshot = await _persist_ws_route_round(
                     route_attempt_id,
@@ -1587,8 +1698,6 @@ async def _try_ws_channel(
                     terminal=False,
                 )
                 connect_ms = open_snapshot.connection_ms
-                route_state = {"dispatched": False}
-                relay_state = {}
         except asyncio.CancelledError:
             async def finish_cancelled_round() -> None:
                 captured = None
@@ -1610,37 +1719,51 @@ async def _try_ws_channel(
                         await upstream_ws.close()
                     except BaseException:
                         pass
-                if timing.terminal:
+                if (
+                    timing.terminal
+                    and captured is not None
+                    and captured.request_finalized
+                ):
                     return
-                cancelled_snapshot = await _persist_ws_route_round(
-                    route_attempt_id,
-                    timing,
-                    proxy_bytes,
-                    outcome="cancelled",
-                    error_detail="cancelled",
-                    terminal=True,
-                )
-                try:
-                    await asyncio.to_thread(
-                        log_db.update_retry_attempt,
-                        retry_attempt_id,
-                        final_round_id=cancelled_snapshot.round_id,
-                        connect_ms=cancelled_snapshot.connection_ms,
-                        first_byte_ms=cancelled_snapshot.first_byte_ms,
-                        idle_ms=cancelled_snapshot.idle_ms,
-                        total_ms=cancelled_snapshot.total_ms,
-                        attempt_elapsed_ms=int((time.monotonic() - attempt_start_monotonic) * 1000),
-                        ended_at=time.time(),
+                if timing.terminal:
+                    cancelled_snapshot = timing.snapshot(terminal=True)
+                else:
+                    cancelled_snapshot = await _persist_ws_route_round(
+                        route_attempt_id,
+                        timing,
+                        proxy_bytes,
                         outcome="cancelled",
                         error_detail="cancelled",
-                        proxy_name=proxy_name_used,
-                        bytes_up=proxy_bytes.up,
-                        bytes_down=proxy_bytes.down,
-                        response_body=response_body,
-                        usage=usage,
-                        usage_observed=usage_observed,
-                        settle=False,
+                        terminal=True,
                     )
+                if (
+                    retry_attempt_id is not None
+                    and not relay_state.get("retry_finalized", False)
+                ):
+                    try:
+                        await asyncio.to_thread(
+                            log_db.update_retry_attempt,
+                            retry_attempt_id,
+                            final_round_id=cancelled_snapshot.round_id,
+                            connect_ms=cancelled_snapshot.connection_ms,
+                            first_byte_ms=cancelled_snapshot.first_byte_ms,
+                            idle_ms=cancelled_snapshot.idle_ms,
+                            total_ms=cancelled_snapshot.total_ms,
+                            attempt_elapsed_ms=int((time.monotonic() - attempt_start_monotonic) * 1000),
+                            ended_at=time.time(),
+                            outcome="cancelled",
+                            error_detail="cancelled",
+                            proxy_name=proxy_name_used,
+                            bytes_up=proxy_bytes.up,
+                            bytes_down=proxy_bytes.down,
+                            response_body=response_body,
+                            usage=usage,
+                            usage_observed=usage_observed,
+                            settle=False,
+                        )
+                    except Exception:
+                        pass
+                try:
                     await asyncio.to_thread(
                         log_db.finish_error,
                         request_id,
@@ -1802,11 +1925,25 @@ async def _try_sse_channel(
         http_body = dict(body)
         http_body["stream"] = True
         upstream_req = await ch.build_upstream_request(http_body, resolved_model, ingress_protocol="responses")
-        await asyncio.to_thread(
+        await await_ws_owned(asyncio.to_thread(
             log_db.update_pending_fast_mode_from_upstream,
             request_id, upstream_req.body, upstream_req.headers,
             dispatch_metadata=getattr(upstream_req, "dispatch_metadata", None),
-        )
+        ))
+    except asyncio.CancelledError:
+        await await_ws_owned(_finish_cancelled_before_ws_attempt_handoff(
+            ch=ch,
+            resolved_model=resolved_model,
+            request_id=request_id,
+            retry_count=retry_count_so_far,
+            affinity_hit=affinity_hit,
+            start_monotonic=start_monotonic,
+            attempt_started_monotonic=attempt_start_monotonic,
+            attempt_id=retry_attempt_id,
+            proxy_name=None,
+            upstream_transport="sse",
+        ))
+        raise
     except Exception as exc:
         if hasattr(exc, "status") and hasattr(exc, "message"):
             outcome = "candidate_guard" if getattr(exc, "scope", "request") == "candidate" else "guard_error"
@@ -2633,6 +2770,7 @@ async def _relay_ws_session(
     # closure so it can retain frames observed before this coroutine is
     # cancelled, without leaking tracker internals into the transport API.
     relay_state["sync_result"] = sync_tracker_result
+    relay_state["retry_finalized"] = False
 
     async def finalize_accepted_request() -> _WsAttemptResult:
         if result.request_finalized:
@@ -2648,25 +2786,29 @@ async def _relay_ws_session(
         )
         _apply_ws_snapshot(result, timing, terminal=True)
         if retry_attempt_id is not None:
-            await asyncio.to_thread(
-                log_db.update_retry_attempt,
-                retry_attempt_id,
-                final_round_id=result.round_id,
-                connect_ms=result.connect_ms,
-                first_byte_ms=result.first_byte_ms,
-                idle_ms=result.idle_ms,
-                total_ms=result.total_ms,
-                attempt_elapsed_ms=int(
-                    (time.monotonic() - attempt_start_monotonic) * 1000
-                ),
-                ended_at=time.time(),
-                outcome=result.outcome,
-                error_detail=(result.error_detail or "")[:4000] or None,
-                proxy_name=proxy_name,
-                bytes_up=proxy_bytes.up,
-                bytes_down=proxy_bytes.down,
-                settle=False,
-            )
+            async def settle_retry_attempt() -> None:
+                await asyncio.to_thread(
+                    log_db.update_retry_attempt,
+                    retry_attempt_id,
+                    final_round_id=result.round_id,
+                    connect_ms=result.connect_ms,
+                    first_byte_ms=result.first_byte_ms,
+                    idle_ms=result.idle_ms,
+                    total_ms=result.total_ms,
+                    attempt_elapsed_ms=int(
+                        (time.monotonic() - attempt_start_monotonic) * 1000
+                    ),
+                    ended_at=time.time(),
+                    outcome=result.outcome,
+                    error_detail=(result.error_detail or "")[:4000] or None,
+                    proxy_name=proxy_name,
+                    bytes_up=proxy_bytes.up,
+                    bytes_down=proxy_bytes.down,
+                    settle=False,
+                )
+                relay_state["retry_finalized"] = True
+
+            await await_ws_owned(settle_retry_attempt())
         result.request_finalized = True
         request_elapsed_ms = int((time.monotonic() - start_monotonic) * 1000)
 

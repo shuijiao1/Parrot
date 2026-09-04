@@ -1576,6 +1576,79 @@ def _transfer_pending_stream_result(result: AttemptResult) -> None:
         owner.transfer()
 
 
+async def _finish_cancelled_failover_attempt(
+    *,
+    request_id: str,
+    retry_count: int,
+    ch: Channel,
+    resolved_model: str,
+    attempt_id,
+    attempt_started_monotonic: float,
+    start_monotonic: float,
+    affinity_hit: int,
+    proxy_name: str | None,
+    upstream_transport: str,
+    result: AttemptResult | None = None,
+    terminalize_retry: bool = True,
+) -> None:
+    """Settle the orchestration-owned attempt before propagating cancellation."""
+
+    if result is None:
+        result = AttemptResult(
+            outcome="cancelled",
+            error_detail="cancelled before upstream attempt handoff",
+            proxy_name=proxy_name,
+        )
+    if terminalize_retry and attempt_id is not None:
+        await asyncio.to_thread(
+            log_db.update_retry_attempt,
+            attempt_id,
+            final_round_id=result.round_id,
+            connect_ms=result.connect_ms,
+            first_byte_ms=result.first_byte_ms,
+            idle_ms=result.idle_ms,
+            total_ms=result.total_ms,
+            attempt_elapsed_ms=_elapsed_ms(attempt_started_monotonic),
+            ended_at=time.time(),
+            outcome="cancelled",
+            error_detail="cancelled before upstream attempt handoff",
+            proxy_name=proxy_name or result.proxy_name,
+            bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
+            bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
+            response_body=getattr(result, "full_response_text", None),
+            usage=getattr(result, "usage", None),
+            usage_observed=getattr(result, "usage_observed", None),
+            settle=False,
+        )
+    await asyncio.to_thread(
+        log_db.finish_error,
+        request_id,
+        "client disconnected",
+        retry_count,
+        final_channel_key=ch.key,
+        final_channel_type=ch.type,
+        final_model=resolved_model,
+        connect_ms=result.connect_ms,
+        first_token_ms=result.first_byte_ms,
+        idle_ms=result.idle_ms,
+        total_ms=result.total_ms,
+        final_round_id=result.round_id,
+        request_elapsed_ms=_elapsed_ms(start_monotonic),
+        http_status=499,
+        affinity_hit=affinity_hit,
+        response_body=getattr(result, "full_response_text", None),
+        usage=getattr(result, "usage", None),
+        usage_observed=getattr(result, "usage_observed", None),
+        upstream_protocol=getattr(ch, "protocol", "anthropic"),
+        upstream_transport=upstream_transport,
+        proxy_name=proxy_name or result.proxy_name,
+        proxy_bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
+        proxy_bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
+        status="cancelled",
+        **_request_stage_kwargs(result),
+    )
+
+
 async def run_failover(
     schedule_result: ScheduleResult,
     body: dict,
@@ -1763,22 +1836,31 @@ async def run_failover(
             release_done = True
             concurrency.release(_key)
 
+        attempt_id = None
+        attempt_handed_off = False
+        attempt_started_monotonic = time.monotonic()
+        _attempt_proxy: str | None = _pick_non_direct_proxy_name(ch, resolved_model)
+        use_responses_ws = _should_use_responses_upstream_ws(
+            ch, ingress_protocol=ingress_protocol, cfg=cfg,
+        )
         try:
-            # Resolve proxy for this attempt (read from proxy manager)
-            _attempt_proxy: str | None = _pick_non_direct_proxy_name(ch, resolved_model)
-
-            attempt_started_monotonic = time.monotonic()
-            attempt_id = await asyncio.to_thread(
-                log_db.record_retry_attempt,
-                request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
-                proxy_name=_attempt_proxy,
-                upstream_protocol=getattr(ch, "protocol", "anthropic"),
-                client_visible_model=client_visible_model,
-            )
-            if _attempt_proxy:
-                await asyncio.to_thread(
-                    log_db.update_pending, request_id, proxy_name=_attempt_proxy,
+            async def _record_attempt() -> None:
+                nonlocal attempt_id
+                attempt_id = await asyncio.to_thread(
+                    log_db.record_retry_attempt,
+                    request_id, attempt_order, ch.key, ch.type, resolved_model,
+                    time.time(), proxy_name=_attempt_proxy,
+                    upstream_protocol=getattr(ch, "protocol", "anthropic"),
+                    client_visible_model=client_visible_model,
                 )
+
+            # The assignment runs in the owned task so cancellation cannot lose the
+            # handle of a worker that still inserts the retry row.
+            await await_ws_owned(_record_attempt())
+            if _attempt_proxy:
+                await await_ws_owned(asyncio.to_thread(
+                    log_db.update_pending, request_id, proxy_name=_attempt_proxy,
+                ))
 
             candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
             candidate_openai_local_web_loop = openai_local_web_loop_active
@@ -1789,7 +1871,8 @@ async def run_failover(
             if (candidate_local_web_loop or candidate_openai_local_web_loop) and attempt_body.get("stream"):
                 attempt_body = dict(attempt_body)
                 attempt_body["stream"] = False
-            if _should_use_responses_upstream_ws(ch, ingress_protocol=ingress_protocol, cfg=cfg):
+            attempt_handed_off = True
+            if use_responses_ws:
                 result = await _try_openai_oauth_responses_ws_channel(
                     ch, resolved_model, attempt_body, effective_is_stream, deadline_ts, start_time,
                     fp_query, attempt_body.get("messages") or [], api_key_name, client_ip,
@@ -1845,11 +1928,41 @@ async def run_failover(
                 usage=getattr(result, "usage", None),
                 usage_observed=getattr(result, "usage_observed", None),
             )
-            if getattr(result, "_pending_stream_owner", None) is not None:
+            try:
                 await await_ws_owned(retry_update)
-            else:
-                await retry_update
+            except asyncio.CancelledError:
+                if not result.success and not result.stream_started:
+                    await await_ws_owned(_finish_cancelled_failover_attempt(
+                        request_id=request_id,
+                        retry_count=retry_count,
+                        ch=ch,
+                        resolved_model=resolved_model,
+                        attempt_id=attempt_id,
+                        attempt_started_monotonic=attempt_started_monotonic,
+                        start_monotonic=start_monotonic,
+                        affinity_hit=affinity_hit,
+                        proxy_name=result.proxy_name,
+                        upstream_transport=("ws" if use_responses_ws else "http"),
+                        result=result,
+                        terminalize_retry=False,
+                    ))
+                raise
             slot_phase_complete = True
+        except asyncio.CancelledError:
+            if not attempt_handed_off:
+                await await_ws_owned(_finish_cancelled_failover_attempt(
+                    request_id=request_id,
+                    retry_count=retry_count,
+                    ch=ch,
+                    resolved_model=resolved_model,
+                    attempt_id=attempt_id,
+                    attempt_started_monotonic=attempt_started_monotonic,
+                    start_monotonic=start_monotonic,
+                    affinity_hit=affinity_hit,
+                    proxy_name=_attempt_proxy,
+                    upstream_transport=("ws" if use_responses_ws else "http"),
+                ))
+            raise
         finally:
             if not slot_phase_complete:
                 await _abort_pending_stream_result(pending_stream_result)
@@ -2300,20 +2413,28 @@ async def run_failover(
                     release_done2 = True
                     concurrency.release(_key)
 
+                attempt_order += 1
+                last_ch_key, last_ch_type, last_model = ch.key, ch.type, resolved_model
+                last_ch_protocol = getattr(ch, "protocol", "anthropic")
+                _attempt_proxy2: str | None = _pick_non_direct_proxy_name(ch, resolved_model)
+                attempt_started_monotonic2 = time.monotonic()
+                attempt_id = None
+                attempt_handed_off2 = False
+                use_responses_ws2 = _should_use_responses_upstream_ws(
+                    ch, ingress_protocol=ingress_protocol, cfg=cfg,
+                )
                 try:
-                    attempt_order += 1
-                    last_ch_key, last_ch_type, last_model = ch.key, ch.type, resolved_model
-                    last_ch_protocol = getattr(ch, "protocol", "anthropic")
+                    async def _record_queued_attempt() -> None:
+                        nonlocal attempt_id
+                        attempt_id = await asyncio.to_thread(
+                            log_db.record_retry_attempt,
+                            request_id, attempt_order, ch.key, ch.type,
+                            resolved_model, time.time(), proxy_name=_attempt_proxy2,
+                            upstream_protocol=getattr(ch, "protocol", "anthropic"),
+                            client_visible_model=client_visible_model,
+                        )
 
-                    _attempt_proxy2: str | None = _pick_non_direct_proxy_name(ch, resolved_model)
-                    attempt_started_monotonic2 = time.monotonic()
-                    attempt_id = await asyncio.to_thread(
-                        log_db.record_retry_attempt,
-                        request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
-                        proxy_name=_attempt_proxy2,
-                        upstream_protocol=getattr(ch, "protocol", "anthropic"),
-                        client_visible_model=client_visible_model,
-                    )
+                    await await_ws_owned(_record_queued_attempt())
                     candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
                     candidate_openai_local_web_loop = openai_local_web_loop_active
                     effective_is_stream = is_stream and not (candidate_local_web_loop or candidate_openai_local_web_loop)
@@ -2323,7 +2444,8 @@ async def run_failover(
                     if (candidate_local_web_loop or candidate_openai_local_web_loop) and attempt_body.get("stream"):
                         attempt_body = dict(attempt_body)
                         attempt_body["stream"] = False
-                    if _should_use_responses_upstream_ws(ch, ingress_protocol=ingress_protocol, cfg=cfg):
+                    attempt_handed_off2 = True
+                    if use_responses_ws2:
                         result = await _try_openai_oauth_responses_ws_channel(
                             ch, resolved_model, attempt_body, effective_is_stream, deadline_ts, start_time,
                             fp_query, attempt_body.get("messages") or [], api_key_name, client_ip,
@@ -2377,11 +2499,41 @@ async def run_failover(
                         usage=getattr(result, "usage", None),
                         usage_observed=getattr(result, "usage_observed", None),
                     )
-                    if getattr(result, "_pending_stream_owner", None) is not None:
+                    try:
                         await await_ws_owned(retry_update)
-                    else:
-                        await retry_update
+                    except asyncio.CancelledError:
+                        if not result.success and not result.stream_started:
+                            await await_ws_owned(_finish_cancelled_failover_attempt(
+                                request_id=request_id,
+                                retry_count=retry_count,
+                                ch=ch,
+                                resolved_model=resolved_model,
+                                attempt_id=attempt_id,
+                                attempt_started_monotonic=attempt_started_monotonic2,
+                                start_monotonic=start_monotonic,
+                                affinity_hit=affinity_hit,
+                                proxy_name=result.proxy_name,
+                                upstream_transport=("ws" if use_responses_ws2 else "http"),
+                                result=result,
+                                terminalize_retry=False,
+                            ))
+                        raise
                     slot_phase_complete2 = True
+                except asyncio.CancelledError:
+                    if not attempt_handed_off2:
+                        await await_ws_owned(_finish_cancelled_failover_attempt(
+                            request_id=request_id,
+                            retry_count=retry_count,
+                            ch=ch,
+                            resolved_model=resolved_model,
+                            attempt_id=attempt_id,
+                            attempt_started_monotonic=attempt_started_monotonic2,
+                            start_monotonic=start_monotonic,
+                            affinity_hit=affinity_hit,
+                            proxy_name=_attempt_proxy2,
+                            upstream_transport=("ws" if use_responses_ws2 else "http"),
+                        ))
+                    raise
                 finally:
                     if not slot_phase_complete2:
                         await _abort_pending_stream_result(pending_stream_result2)
@@ -2616,7 +2768,7 @@ async def _persist_ws_route_round(
     )
     if proxy_attempt_id is not None:
         try:
-            await asyncio.to_thread(
+            await await_ws_owned(asyncio.to_thread(
                 log_db.update_proxy_attempt,
                 proxy_attempt_id,
                 started_at=snapshot.started_at,
@@ -2630,7 +2782,7 @@ async def _persist_ws_route_round(
                 error_detail=(error_detail or "")[:4000] if error_detail else None,
                 bytes_up=proxy_bytes.up,
                 bytes_down=proxy_bytes.down,
-            )
+            ))
         except Exception:
             pass
     return snapshot
@@ -3030,6 +3182,20 @@ async def _try_openai_oauth_responses_ws_channel(
         ) = await _build_oauth_responses_ws_upstream_request(
             ch, body, resolved_model,
         )
+    except asyncio.CancelledError:
+        await await_ws_owned(_finish_cancelled_failover_attempt(
+            request_id=request_id,
+            retry_count=retry_count_so_far,
+            ch=ch,
+            resolved_model=resolved_model,
+            attempt_id=retry_attempt_id,
+            attempt_started_monotonic=attempt_start_monotonic,
+            start_monotonic=start_monotonic,
+            affinity_hit=affinity_hit,
+            proxy_name=None,
+            upstream_transport="ws",
+        ))
+        raise
     except Exception as exc:
         if hasattr(exc, "status") and hasattr(exc, "err_type") and hasattr(exc, "message"):
             outcome = "candidate_guard" if getattr(exc, "scope", "request") == "candidate" else "guard_error"
@@ -3053,26 +3219,29 @@ async def _try_openai_oauth_responses_ws_channel(
         round_id = str(uuid.uuid4())
         proxy_attempt_order += 1
         proxy_attempt_id = None
-        try:
-            proxy_attempt_id = await asyncio.to_thread(
-                log_db.record_proxy_attempt,
-                request_id,
-                retry_attempt_id,
-                proxy_attempt_order,
-                route_log_name,
-                time.time(),
-                round_id=round_id,
-                transport="ws",
-                request_mode="ws",
-            )
-        except Exception:
-            proxy_attempt_id = None
-
         upstream_ws = None
         timing = WsAttemptTiming(route_type=route_type, round_id=round_id)
         route_state = {"dispatched": False}
         tracker = _WsResponsesTracker(ch)
         try:
+            async def _record_route_attempt() -> None:
+                nonlocal proxy_attempt_id
+                proxy_attempt_id = await asyncio.to_thread(
+                    log_db.record_proxy_attempt,
+                    request_id,
+                    retry_attempt_id,
+                    proxy_attempt_order,
+                    route_log_name,
+                    time.time(),
+                    round_id=round_id,
+                    transport="ws",
+                    request_mode="ws",
+                )
+
+            try:
+                await await_ws_owned(_record_route_attempt())
+            except Exception:
+                proxy_attempt_id = None
             if connector is not None:
                 connector.stats.total_attempts += 1
                 connector.stats.last_attempt_ts = route_selected_at
@@ -4108,11 +4277,25 @@ async def _try_channel(
         upstream_req = await ch.build_upstream_request(
             body, resolved_model, ingress_protocol=ingress_protocol,
         )
-        await asyncio.to_thread(
+        await await_ws_owned(asyncio.to_thread(
             log_db.update_pending_fast_mode_from_upstream,
             request_id, upstream_req.body, upstream_req.headers,
             dispatch_metadata=getattr(upstream_req, "dispatch_metadata", None),
-        )
+        ))
+    except asyncio.CancelledError:
+        await await_ws_owned(_finish_cancelled_failover_attempt(
+            request_id=request_id,
+            retry_count=retry_count_so_far,
+            ch=ch,
+            resolved_model=resolved_model,
+            attempt_id=retry_attempt_id,
+            attempt_started_monotonic=attempt_start_monotonic,
+            start_monotonic=start_monotonic,
+            affinity_hit=affinity_hit,
+            proxy_name=None,
+            upstream_transport="http",
+        ))
+        raise
     except Exception as exc:
         # GuardError（OpenAI 跨变体死角）带 .status / .err_type / .message 属性；
         # scope=request 表示请求级 guard，可短路到客户端 4xx；scope=candidate

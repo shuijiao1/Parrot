@@ -190,12 +190,18 @@ async def test_cancel_outer_retry_update_aborts_unstarted_http_to_ws_stream(
 
     assert upstream_ws.close_calls == 1
     assert slot_releases == [channel.key]
-    assert sum(row["outcome"] == "open" for row in logs.retry_updates) == 1
-    assert sum(
-        row["outcome"] == "client_disconnected" for row in logs.retry_updates
-    ) == 1
-    assert len(logs.request_terminals) == 1
-    assert logs.request_terminals[0]["status"] == "cancelled"
-    assert sum(
-        row["outcome"] == "client_disconnected" for row in logs.proxy_updates
-    ) == 1
+    assert [row["outcome"] for row in logs.retry_updates] == [
+        "open", "client_disconnected",
+    ]
+    assert all(
+        row["attempt_id"] == logs.retry_records[0]["handle"]
+        for row in logs.retry_updates
+    )
+    assert [
+        (row["status"], row["http_status"]) for row in logs.request_terminals
+    ] == [("cancelled", 499)]
+    assert [row["outcome"] for row in logs.proxy_updates] == [
+        "client_disconnected",
+    ]
+    assert logs.proxy_updates[0]["proxy_attempt_id"] == "proxy-ws-1"
+    assert logs.proxy_updates[0]["ended_at"] is not None

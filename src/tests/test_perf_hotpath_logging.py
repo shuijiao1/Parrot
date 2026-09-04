@@ -207,7 +207,7 @@ async def test_http_stream_all_log_writes_run_outside_event_loop(monkeypatch, m)
 async def test_channel_slot_release_survives_real_executor_log_cancellation(
     monkeypatch, m, transport, saturated, blocked_write,
 ):
-    """Every post-acquire log await has an already-established release owner."""
+    """Post-acquire writes, cancellation terminals, and release are ordered once."""
 
     fake._setup(m)
     channel = fake._make_openai_channel(
@@ -223,33 +223,70 @@ async def test_channel_slot_release_survives_real_executor_log_cancellation(
     with concurrency._slots_guard:
         concurrency._slots.clear()
 
+    request_id = f"cancel-{transport}-{blocked_write}-{int(saturated)}-{uuid.uuid4().hex}"
+    body = {"model": "model", "input": "hello", "stream": False}
+    request_handle = m["log_db"].insert_pending(
+        request_id,
+        "1.2.3.4",
+        "key",
+        "model",
+        transport == "ws",
+        1,
+        0,
+        {},
+        body,
+        ingress_protocol=("responses_ws" if transport == "ws" else "responses"),
+    )
+
     entered = threading.Event()
     allow_worker = threading.Event()
     worker_done = threading.Event()
-    worker_threads = []
+    worker_threads: list[int] = []
     loop_thread = threading.get_ident()
+    retry_outcomes: list[str | None] = []
+    request_terminals: list[tuple[str, int | None]] = []
+    release_calls: list[str] = []
 
-    def blocked(*_args, **_kwargs):
-        worker_threads.append(threading.get_ident())
-        entered.set()
-        try:
-            assert allow_worker.wait(timeout=5)
-            return "attempt-id" if blocked_write == "record_retry_attempt" else None
-        finally:
-            worker_done.set()
+    original_record_retry = m["log_db"].record_retry_attempt
+    original_update_pending = m["log_db"].update_pending
+    original_update_retry = m["log_db"].update_retry_attempt
+    original_finish_error = m["log_db"].finish_error
+    original_release = concurrency.release
 
-    monkeypatch.setattr(m["log_db"], "record_retry_attempt", (
-        blocked if blocked_write == "record_retry_attempt" else
-        lambda *_args, **_kwargs: "attempt-id"
-    ))
-    monkeypatch.setattr(m["log_db"], "update_pending", (
-        blocked if blocked_write == "update_pending" else
-        lambda *_args, **_kwargs: None
-    ))
-    monkeypatch.setattr(m["log_db"], "update_retry_attempt", (
-        blocked if blocked_write == "update_retry_attempt" else
-        lambda *_args, **_kwargs: None
-    ))
+    def maybe_block(name, func, *args, **kwargs):
+        if name == blocked_write:
+            worker_threads.append(threading.get_ident())
+            entered.set()
+            try:
+                assert allow_worker.wait(timeout=5)
+                return func(*args, **kwargs)
+            finally:
+                worker_done.set()
+        return func(*args, **kwargs)
+
+    def record_retry(*args, **kwargs):
+        return maybe_block("record_retry_attempt", original_record_retry, *args, **kwargs)
+
+    def update_pending(*args, **kwargs):
+        return maybe_block("update_pending", original_update_pending, *args, **kwargs)
+
+    def update_retry(*args, **kwargs):
+        retry_outcomes.append(kwargs.get("outcome"))
+        return maybe_block("update_retry_attempt", original_update_retry, *args, **kwargs)
+
+    def finish_error(*args, **kwargs):
+        request_terminals.append((kwargs.get("status", "error"), kwargs.get("http_status")))
+        return original_finish_error(*args, **kwargs)
+
+    def release(channel_key: str) -> None:
+        release_calls.append(channel_key)
+        original_release(channel_key)
+
+    monkeypatch.setattr(m["log_db"], "record_retry_attempt", record_retry)
+    monkeypatch.setattr(m["log_db"], "update_pending", update_pending)
+    monkeypatch.setattr(m["log_db"], "update_retry_attempt", update_retry)
+    monkeypatch.setattr(m["log_db"], "finish_error", finish_error)
+    monkeypatch.setattr(concurrency, "release", release)
     monkeypatch.setattr(asyncio, "to_thread", test_conftest._ORIG_TO_THREAD)
 
     route = ScheduleResult(
@@ -259,7 +296,6 @@ async def test_channel_slot_release_survives_real_executor_log_cancellation(
         fp_query=None,
         client_key="client:cancel",
     )
-    body = {"model": "model", "input": "hello", "stream": False}
 
     if transport == "http":
         monkeypatch.setattr(
@@ -271,14 +307,18 @@ async def test_channel_slot_release_survives_real_executor_log_cancellation(
             lambda *_args, **_kwargs: False,
         )
 
-        async def successful_attempt(*_args, **_kwargs):
-            return AttemptResult(success=True, outcome="success")
+        async def failed_attempt(*_args, **_kwargs):
+            return AttemptResult(
+                success=False,
+                outcome="connect_error",
+                error_detail="injected pre-transition failure",
+            )
 
-        monkeypatch.setattr(m["failover"], "_try_channel", successful_attempt)
+        monkeypatch.setattr(m["failover"], "_try_channel", failed_attempt)
         request = m["failover"].run_failover(
             route,
             body,
-            "cancel-request",
+            request_id,
             "key",
             "1.2.3.4",
             is_stream=False,
@@ -300,7 +340,7 @@ async def test_channel_slot_release_survives_real_executor_log_cancellation(
             first_obj={"type": "response.create", **body},
             schedule_result=route,
             body=body,
-            request_id="cancel-request",
+            request_id=request_id,
             api_key_name="key",
             client_ip="1.2.3.4",
             start_time=time.time(),
@@ -323,29 +363,46 @@ async def test_channel_slot_release_survives_real_executor_log_cancellation(
         assert worker_done.is_set() is False
 
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=2)
-
-        # The cancelled await doesn't cancel its underlying thread.  Release must
-        # nevertheless be complete before that worker is allowed to finish.
+        await asyncio.sleep(0)
+        # The cancelled waiter still owns the thread result and its DB handle.
+        assert task.done() is False
+        assert release_calls == []
         slot = next(
             row for row in concurrency.snapshot()
             if row["channel_key"] == channel.key
         )
-        assert slot["in_flight"] == 0
-        assert worker_done.is_set() is False
+        assert slot["in_flight"] == 1
+
+        allow_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
     finally:
         allow_worker.set()
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-    for _ in range(200):
-        if worker_done.is_set():
-            break
-        await asyncio.sleep(0.005)
     assert worker_done.is_set()
     assert worker_threads and all(thread != loop_thread for thread in worker_threads)
+    assert release_calls == [channel.key]
+    assert request_terminals == [("cancelled", 499)]
+    assert retry_outcomes == [
+        "connect_error" if blocked_write == "update_retry_attempt" else "cancelled"
+    ]
+
+    conn = m["log_db"]._get_conn_for_ref(request_handle.db)
+    request_row = conn.execute(
+        "SELECT status, http_status FROM request_log WHERE request_id=?",
+        (request_id,),
+    ).fetchone()
+    retry_rows = conn.execute(
+        "SELECT outcome, ended_at FROM retry_chain WHERE request_id=? ORDER BY attempt_order",
+        (request_id,),
+    ).fetchall()
+    assert tuple(request_row) == ("cancelled", 499)
+    assert len(retry_rows) == 1
+    assert retry_rows[0]["outcome"] == retry_outcomes[0]
+    assert retry_rows[0]["ended_at"] is not None
     slot = next(
         row for row in concurrency.snapshot()
         if row["channel_key"] == channel.key

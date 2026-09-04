@@ -38,10 +38,9 @@ async def test_cancel_while_proxy_row_worker_waits_closes_owned_client_and_termi
 
     assert client.close_calls == 1
     assert len(logs.proxy_records) == 1
-    terminals = [row for row in logs.proxy_updates if row["outcome"] == "cancelled"]
-    assert len(terminals) == 1
-    assert terminals[0]["proxy_attempt_id"] == logs.proxy_records[0]["handle"]
-    assert terminals[0]["ended_at"] is not None
+    assert [row["outcome"] for row in logs.proxy_updates] == ["cancelled"]
+    assert logs.proxy_updates[0]["proxy_attempt_id"] == logs.proxy_records[0]["handle"]
+    assert logs.proxy_updates[0]["ended_at"] is not None
 
 
 @pytest.mark.asyncio
@@ -92,4 +91,8 @@ async def test_cancel_while_open_proxy_snapshot_waits_closes_ctx_and_client_once
     assert context.exit_calls == 1
     assert client.close_calls == 1
     assert [row["outcome"] for row in logs.proxy_updates] == ["open", "cancelled"]
-    assert sum(row["outcome"] == "cancelled" for row in logs.proxy_updates) == 1
+    assert all(
+        row["proxy_attempt_id"] == logs.proxy_records[0]["handle"]
+        for row in logs.proxy_updates
+    )
+    assert logs.proxy_updates[-1]["ended_at"] is not None
