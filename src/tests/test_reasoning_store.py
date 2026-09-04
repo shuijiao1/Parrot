@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 
 import src.openai.transform.codex_oauth_transform as t
+from src.protocols.runtime import should_cooldown
 
 
 def _valid_encrypted_content(seed: int = 1) -> str:
@@ -112,7 +113,7 @@ def test_unstructured_5xx_invalid_encrypted_content_is_not_request_fault():
     out = f._request_invalid_result_if_needed(result)
     assert out.outcome == "stream_upstream_error"
     assert out.http_status == 503
-    assert f._should_cooldown(out.outcome)
+    assert should_cooldown(out.outcome)
 
 
 def test_invalid_encrypted_content_clears_replay_scope():
@@ -164,7 +165,7 @@ def test_context_length_exceeded_is_request_invalid_not_channel_failure():
         assert out.outcome == "request_invalid", name
         assert out.http_status == expected_status, name
         assert not out.stream_started, name
-        assert not f._should_cooldown(out.outcome), name
+        assert not should_cooldown(out.outcome), name
 
 
 def test_context_length_detector_does_not_swallow_tpm_rate_limits():
@@ -204,7 +205,7 @@ def test_structured_invalid_image_http_400_is_request_invalid_with_safe_code_mes
     assert out.http_status == 400
     assert out.error_code == "invalid_value"
     assert out.error_detail == "Invalid image data: expected a base64-encoded image."
-    assert not f._should_cooldown(out.outcome)
+    assert not should_cooldown(out.outcome)
 
 
 def test_structured_request_invalid_http_classification_keeps_retryable_and_ambiguous_errors():
@@ -224,7 +225,7 @@ def test_structured_request_invalid_http_classification_keeps_retryable_and_ambi
         out = f._request_invalid_result_if_needed(result)
         assert out.outcome == "http_error", (status, body)
         assert out.http_status == status, (status, body)
-        assert f._should_cooldown(out.outcome), (status, body)
+        assert should_cooldown(out.outcome), (status, body)
 
 
 def test_request_invalid_413_keeps_request_too_large_for_anthropic_ingress():
@@ -264,7 +265,7 @@ def test_non_encrypted_upstream_error_still_channel_failure():
     out = f._request_invalid_result_if_needed(result)
     assert out.outcome == "stream_upstream_error"
     assert out.http_status == 503
-    assert f._should_cooldown(out.outcome)
+    assert should_cooldown(out.outcome)
 
 
 def test_retry_body_without_encrypted_content_strips_only_ec_keeps_include():

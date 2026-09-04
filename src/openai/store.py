@@ -153,23 +153,6 @@ def _validate_private_store_files() -> None:
             pass
 
 
-def _legacy_regular_file_exists(path: str) -> bool:
-    """Return False only for a definite ENOENT legacy database.
-
-    Permission, mount and wrong-file-type failures must remain observable so
-    they cannot be rewritten as previous_response_id 404 responses.
-    """
-    try:
-        info = os.stat(path)
-    except FileNotFoundError:
-        return False
-    if not stat.S_ISREG(info.st_mode):
-        raise sqlite3.OperationalError(
-            f"legacy response store path is not a regular file: {path}"
-        )
-    return True
-
-
 def _absolute_data_path(value: str) -> str:
     if os.path.isabs(value):
         return os.path.abspath(value)
@@ -422,10 +405,6 @@ def save(response_id: str, parent_id: Optional[str], *,
     conn = _get_conn()
     with _write_lock:
         try:
-            local_owner = conn.execute(
-                "SELECT api_key_name FROM openai_response_store WHERE response_id=?",
-                (response_id,),
-            ).fetchone()
             cur = conn.execute(
                 """INSERT INTO openai_response_store
                    (response_id, parent_id, api_key_name, model, channel_key,

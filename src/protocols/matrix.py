@@ -38,11 +38,6 @@ _RESPONSES_BUILTIN_INPUT_ITEM_TYPES = frozenset({
 })
 
 _OPENAI_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
-# Cross-family Anthropic→OpenAI compatibility only. Native OpenAI/Codex
-# service tiers are opaque catalog capabilities and are not enumerated here.
-_ANTHROPIC_TO_OPENAI_COMPAT_SERVICE_TIERS = frozenset({
-    "auto", "default", "flex", "priority", "ultrafast",
-})
 
 
 def _protocol_bridge_cfg() -> dict[str, Any]:
@@ -65,12 +60,6 @@ def _valid_effort(value: Any, default: str) -> str:
     return effort if effort in _OPENAI_REASONING_EFFORTS else default
 
 
-def _tier_mapping(section: str) -> dict[str, Any]:
-    root = _protocol_bridge_cfg().get("serviceTier") or {}
-    if not isinstance(root, dict):
-        return {}
-    mapping = root.get(section) or {}
-    return mapping if isinstance(mapping, dict) else {}
 _ANTHROPIC_LOCAL_WEB_TOOL_TYPES = frozenset({
     "web_search_20250305",
     "web_search_20260209",
@@ -159,56 +148,6 @@ def canonical_ingress_protocol(ingress_protocol: str) -> str:
 
 def protocol_family(protocol: str) -> str:
     return "anthropic" if protocol == "anthropic" else "openai"
-
-
-def _tool_list_has_hosted_or_non_function(ingress_protocol: str, body: dict[str, Any]) -> bool:
-    if body.get("container") is not None or body.get("mcp_servers") is not None:
-        return True
-    tools = body.get("tools") or []
-    if not isinstance(tools, list):
-        return False
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        typ = tool.get("type")
-        if ingress_protocol == "anthropic":
-            # Anthropic function tools normally omit type; Parrot can emulate
-            # web_search/web_fetch server tools locally through AnySearch when
-            # crossing to OpenAI-family upstreams.
-            if typ not in (None, "function") and typ not in _ANTHROPIC_LOCAL_WEB_TOOL_TYPES:
-                return True
-            continue
-        if ingress_protocol == "chat":
-            if typ not in (None, "function"):
-                return True
-            continue
-        # Responses: function/custom are user-defined. Hosted/built-in/unknown
-        # tools have state Chat/Anthropic cannot safely represent.
-        if typ not in (None, "function", "custom"):
-            return True
-    return False
-
-
-def _tool_choice_is_hosted_or_non_function(ingress_protocol: str, body: dict[str, Any]) -> bool:
-    choice = body.get("tool_choice")
-    if not isinstance(choice, dict):
-        return False
-    typ = choice.get("type")
-    if ingress_protocol == "anthropic":
-        return typ not in ("auto", "none", "any", "tool")
-    if ingress_protocol == "chat":
-        if typ == "allowed_tools":
-            nested = choice.get("allowed_tools")
-            tools = nested.get("tools") if isinstance(nested, dict) else None
-            if not isinstance(tools, list) or not tools:
-                return True
-            return any(not isinstance(tool, dict) or tool.get("type") != "function" for tool in tools)
-        return typ not in (None, "function")
-    if typ in _RESPONSES_NON_CHAT_TOOL_CHOICE_TYPES:
-        return True
-    # Responses function/custom/allowed_tools/auto-ish choices can be handled by the existing
-    # Responses↔Chat translator; unknown hosted shapes stay guarded.
-    return typ not in (None, "auto", "none", "function", "custom", "allowed_tools")
 
 
 def _append_unique(labels: list[str], label: str) -> None:
@@ -325,11 +264,6 @@ def _hosted_tool_labels(ingress_protocol: str, body: dict[str, Any]) -> tuple[st
                 return ()
             return (f"tool_choice:{typ}",)
     return ()
-
-def _hosted_tool_label(ingress_protocol: str, body: dict[str, Any]) -> str | None:
-    labels = _hosted_tool_labels(ingress_protocol, body)
-    return labels[0] if labels else None
-
 
 def _responses_input_like_items(body: dict[str, Any]) -> list[Any]:
     items: list[Any] = []
@@ -631,37 +565,6 @@ def _anthropic_context_management_is_ignorable(value: Any) -> bool:
         if not str(edit.get("type") or "").startswith("clear_thinking_"):
             return False
     return True
-
-
-def _anthropic_service_tier_is_mappable(value: Any) -> bool:
-    if value is None:
-        return True
-    if not isinstance(value, str):
-        return False
-    tier = value.strip().lower()
-    if not tier:
-        return True
-    mapping = _tier_mapping("anthropicToOpenAI")
-    if tier in mapping:
-        return True
-    return (
-        tier in {"auto", "standard_only"}
-        or tier in _ANTHROPIC_TO_OPENAI_COMPAT_SERVICE_TIERS
-    )
-
-
-def _openai_service_tier_is_mappable_to_anthropic(value: Any) -> bool:
-    if value is None:
-        return True
-    if not isinstance(value, str):
-        return False
-    tier = value.strip().lower()
-    if not tier:
-        return True
-    mapping = _tier_mapping("openaiToAnthropic")
-    if tier in mapping:
-        return True
-    return tier in {"auto", "default", "standard_only"}
 
 
 def _file_data_supported(file_data: Any) -> bool:

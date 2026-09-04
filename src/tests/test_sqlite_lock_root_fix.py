@@ -73,6 +73,26 @@ def _save(response_id: str, parent_id: str | None = None) -> None:
     )
 
 
+def test_store_save_executes_one_table_statement(isolated_store):
+    conn = store._get_conn()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        _save("single-statement-save")
+    finally:
+        conn.set_trace_callback(None)
+
+    store_statements = [
+        sql for sql in statements
+        if "openai_response_store" in sql.lower()
+    ]
+    assert len(store_statements) == 1, store_statements
+    assert store_statements[0].lstrip().upper().startswith("INSERT INTO")
+    assert store.lookup(
+        "single-statement-save", api_key_name="key-a",
+    ).response_id == "single-statement-save"
+
+
 def test_config_defaults_keep_history_out_of_state_db():
     defaults = config.DEFAULT_CONFIG
     store_defaults = defaults["openai"]["store"]

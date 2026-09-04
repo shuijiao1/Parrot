@@ -722,6 +722,37 @@ def test_stats_without_cost_never_reads_response_body(m):
     assert not any("request_detail" in sql.lower() for sql in statements)
 
 
+def test_log_detail_reads_large_response_body_once(m):
+    _setup(m)
+    response_body = "x" * 200_000
+    _insert_success(
+        m,
+        "detail-single-body-read",
+        "k1",
+        "gpt-5.6-sol",
+        "api:Priced",
+        response_body=response_body,
+        upstream_protocol="openai-responses",
+    )
+
+    conn = m["log_db"]._get_conn()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        detail = m["log_db"].log_detail("detail-single-body-read")
+    finally:
+        conn.set_trace_callback(None)
+
+    detail_reads = [
+        sql for sql in statements
+        if "request_detail" in sql.lower()
+    ]
+    assert len(detail_reads) == 1, detail_reads
+    assert detail_reads[0].lower().count("response_body") == 1
+    assert detail["detail"]["response_body"] == response_body
+    assert "response_body" not in detail["log"]
+
+
 def test_stats_group_by_channel(m):
     _setup(m)
     _insert_success(m, "c1", "k1", "m1", "api:A")
@@ -2119,16 +2150,16 @@ def test_proxy_group_menu_uses_pagination_and_detail_buttons(m):
 
 
 
-def test_failover_proxy_route_kwargs_uses_provider_family_function_route(m):
+def test_proxy_route_kwargs_uses_provider_family_function_route(m):
     _setup(m)
-    from src import failover
+    from src.transports import policy as transport_policy
 
     class Ch:
         key = "api:anthropic-main"
         protocol = "anthropic"
         account_key = ""
 
-    assert failover._proxy_route_kwargs(Ch(), "claude-x") == {
+    assert transport_policy.proxy_route_kwargs(Ch(), "claude-x") == {
         "channel_key": "api:anthropic-main",
         "model": "claude-x",
         "purpose": "oauth_anthropic",
@@ -2140,7 +2171,7 @@ def test_failover_proxy_route_kwargs_uses_provider_family_function_route(m):
         protocol = "openai-responses"
         account_key = "openai:a"
 
-    assert failover._proxy_route_kwargs(OpenAICh(), "gpt-x") == {
+    assert transport_policy.proxy_route_kwargs(OpenAICh(), "gpt-x") == {
         "channel_key": "oauth:openai:a",
         "model": "gpt-x",
         "purpose": "oauth_openai",

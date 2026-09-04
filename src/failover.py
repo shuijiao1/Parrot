@@ -36,13 +36,8 @@ from .transform import cc_mimicry
 from .openai import compaction_owner, deepseek_reasoning, reasoning_replay
 from .openai.codex_identity_confuse import ConfuseState
 from .openai.responses_ws_runtime import (
-    build_oauth_responses_ws_frame,
-    drop_headers_case_insensitive,
-    ensure_oauth_responses_ws_session_headers,
-    get_header_case_insensitive,
     identity_expose_frame,
     identity_log_text,
-    merge_oauth_responses_ws_headers,
     prepare_oauth_responses_ws_request_parts,
 )
 from .proxy.connector import SOCKS5Connector, SS2022Connector
@@ -63,7 +58,6 @@ from .protocols.runtime import (
     is_context_1m_credit_error,
     is_responses_ws_visible_event_type,
     json_error_for_ingress,
-    make_stream_translator,
     parse_retry_after_seconds,
     retry_after_cooldown_until,
     prepare_non_stream_response,
@@ -74,14 +68,11 @@ from .protocols.runtime import (
     retryable_transient_error_kind,
     responses_ws_error_detail,
     transient_retry_allowed,
-    transient_retry_config,
     transient_retry_limit,
     request_invalid_result_if_needed,
     retry_body_without_encrypted_content,
     retry_body_without_context_1m,
-    should_cooldown,
     sse_error_for_ingress,
-    toolkit_for_channel,
     upstream_ws_http_status_from_attempt,
 )
 from .scheduler import ScheduleResult
@@ -91,7 +82,6 @@ from .transports import (
     close_response_context,
     finalize_opened_http_response,
     http_url_to_ws,
-    metadata_from_response,
     open_response_with_proxy_chain,
     prepare_stream_response_start,
     read_next_responses_ws_step,
@@ -109,11 +99,9 @@ from .transports import (
     legacy_socks5_connector,
     open_socket_via_ss2022,
     resolve_ws_route_chain,
-    socks5h_url,
     wait_ws_round_io,
     ws_event_type,
     ws_frame_size,
-    ws_route_kwargs,
 )
 from .transports import policy as transport_policy
 
@@ -431,10 +419,6 @@ def forget_codex_snapshot(account_key_or_email: str) -> None:
         _codex_snapshot_inflight.discard(key)
 
 
-def _toolkit_for(ch: Channel) -> dict:
-    return toolkit_for_channel(ch)
-
-
 def _openai_prompt_cache_key_from_body(ingress_protocol: str, body: Optional[dict]) -> Optional[str]:
     """仅 OpenAI 协议使用的自动 prompt_cache_key 传递值。"""
     if ingress_protocol not in ("chat", "responses") or not isinstance(body, dict):
@@ -563,10 +547,6 @@ def _maybe_save_native_responses_store(
             traceback.print_exc()
 
 
-def _make_stream_translator(translator_ctx: Optional[dict]):
-    return make_stream_translator(translator_ctx)
-
-
 def _apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dict:
     return apply_non_stream_response_translator(obj, translator_ctx)
 
@@ -593,10 +573,6 @@ def _json_error_for_ingress(
     return json_error_for_ingress(
         ingress, status, anth_err_type, message, code=code, details=details,
     )
-
-
-def _should_cooldown(outcome: str) -> bool:
-    return should_cooldown(outcome)
 
 
 def _is_invalid_encrypted_content_error(error_detail: Optional[str]) -> bool:
@@ -724,10 +700,6 @@ def _channel_uses_max_context(ch: Channel | None, body: dict, resolved_model: st
         return False
 
 
-def _proxy_route_kwargs(ch: Channel, resolved_model: str) -> dict:
-    return transport_policy.proxy_route_kwargs(ch, resolved_model)
-
-
 def _pick_non_direct_proxy_name(ch: Channel, resolved_model: str) -> str | None:
     return transport_policy.pick_non_direct_proxy_name(ch, resolved_model)
 
@@ -767,10 +739,6 @@ def _timing_stage_kwargs(timing, *, terminal: bool) -> dict:
         "response_headers_wait_ms": snapshot.response_headers_wait_ms,
         "response_body_first_byte_wait_ms": snapshot.response_body_first_byte_wait_ms,
     }
-
-
-def _responses_upstream_ws_enabled(cfg: Optional[dict] = None) -> bool:
-    return transport_policy.responses_upstream_ws_enabled(cfg)
 
 
 def _should_use_responses_upstream_ws(
@@ -990,10 +958,6 @@ def _effective_retry_cfg(cfg: Optional[dict] = None) -> dict:
     return cfg if isinstance(cfg, dict) else config.get()
 
 
-def _transient_retry_config(cfg: Optional[dict] = None) -> dict:
-    return transient_retry_config(_effective_retry_cfg(cfg))
-
-
 def _transient_retry_limit(cfg: Optional[dict] = None) -> int:
     return transient_retry_limit(_effective_retry_cfg(cfg))
 
@@ -1073,11 +1037,6 @@ def _notify_zhipu_quota_cooldown(ch: Channel, model: str, reset_ms: int) -> None
 
 def _err_type_from_outcome(outcome: str, http_status: Optional[int]) -> str:
     return protocol_errors.classify_attempt_outcome(outcome, http_status).anthropic_error_type
-
-
-def _pick_upstream_headers(resp: httpx.Response) -> dict:
-    """转发部分上游 headers 到下游（限定范围）。"""
-    return metadata_from_response(resp).forward_headers()
 
 
 def _attach_retry_after_from_response(
@@ -2516,14 +2475,6 @@ def _http_url_to_ws(url: str) -> str:
     return http_url_to_ws(url)
 
 
-def _socks5h_url(url: str) -> str:
-    return socks5h_url(url)
-
-
-def _ws_proxy_snapshot(proxy_bytes: _WsProxyBytes) -> tuple[int, int]:
-    return int(proxy_bytes.up or 0), int(proxy_bytes.down or 0)
-
-
 def _persist_ws_route_round(
     proxy_attempt_id,
     timing: WsAttemptTiming,
@@ -2581,38 +2532,6 @@ def _finalize_ws_attempt_result(
     result.proxy_bytes_up = proxy_bytes.up
     result.proxy_bytes_down = proxy_bytes.down
     return result
-
-
-def _drop_headers_case_insensitive(headers: dict[str, str], names: set[str]) -> dict[str, str]:
-    return drop_headers_case_insensitive(headers, names)
-
-
-def _get_header_case_insensitive(headers: dict[str, str] | None, key: str) -> str:
-    return get_header_case_insensitive(headers, key)
-
-
-def _merge_oauth_responses_ws_headers(headers: dict[str, str]) -> dict[str, str]:
-    return merge_oauth_responses_ws_headers(headers)
-
-
-def _ensure_oauth_responses_ws_session_headers(
-    headers: dict[str, str],
-    body: dict,
-) -> None:
-    ensure_oauth_responses_ws_session_headers(headers, body)
-
-
-def _build_oauth_responses_ws_frame(
-    body: dict,
-    resolved_model: str,
-    *,
-    channel: OpenAIOAuthChannel | None = None,
-) -> dict:
-    return build_oauth_responses_ws_frame(body, resolved_model, channel=channel)
-
-
-def _ws_route_kwargs(ch: Channel, resolved_model: str) -> dict:
-    return ws_route_kwargs(ch, resolved_model)
 
 
 def _resolve_ws_route_chain_for_channel(ch: Channel, resolved_model: str) -> list[tuple[str, Any | None]]:

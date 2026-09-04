@@ -22,6 +22,10 @@ from typing import Any
 
 import pytest
 
+from src.protocols.runtime import parse_wrapped_responses_ws_error
+from src.transports import socks5h_url
+from src.transports import policy as transport_policy
+
 
 def _valid_encrypted_content(seed: int = 1) -> str:
     payload = bytearray(1 + 8 + 16 + 16 + 32)
@@ -1415,7 +1419,7 @@ async def test_responses_ws_exhausted_candidates_use_finite_terminal_rule_and_sa
     assert frame["message"] == ws.close_calls[-1][1]
     assert set(frame["error"]) >= {"type", "code", "message"}
     assert frame["error"]["message"] == frame["message"]
-    parsed = m["responses_ws"]._parse_wrapped_ws_error(json.dumps(frame))
+    parsed = parse_wrapped_responses_ws_error(json.dumps(frame))
     assert parsed == {
         "status": expected_status,
         "code": frame["error"]["code"],
@@ -1908,7 +1912,7 @@ async def test_responses_ws_stream_error_after_visible_logs_and_cools_down(monke
 
 def test_responses_upstream_ws_config_default_off(m):
     cfg = _setup(m)
-    assert m["failover"]._responses_upstream_ws_enabled(cfg) is False
+    assert transport_policy.responses_upstream_ws_enabled(cfg) is False
     ch = _make_oauth_channel_for_failover(m)
     assert m["failover"]._should_use_responses_upstream_ws(ch, ingress_protocol="responses", cfg=cfg) is False
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
@@ -2643,7 +2647,7 @@ async def test_responses_ws_pre_visible_context_error_preserves_explicit_zero_us
         "code": "context_length_exceeded",
         "message": error_frame["message"],
     }
-    assert m["responses_ws"]._parse_wrapped_ws_error(
+    assert parse_wrapped_responses_ws_error(
         json.dumps(error_frame)
     )["status"] == 400
     assert ws.close_calls[-1][0] == 4400
@@ -3481,7 +3485,7 @@ async def test_responses_ws_postvisible_1009_sends_typed_error_and_closes(monkey
         "code": "message_too_big",
         "message": error["message"],
     }
-    assert m["responses_ws"]._parse_wrapped_ws_error(json.dumps(error))["status"] == 413
+    assert parse_wrapped_responses_ws_error(json.dumps(error))["status"] == 413
     assert ws.close_calls[-1][0] == 4400
     assert upstream.recv_calls == 2
 
@@ -3802,8 +3806,8 @@ async def test_http_responses_oauth_ws_pre_visible_context_error_keeps_zero_usag
 
 def test_responses_ws_uses_remote_dns_for_socks5(m):
     _setup(m)
-    assert m["responses_ws"]._socks5h_url("socks5://127.0.0.1:1080") == "socks5h://127.0.0.1:1080"
-    assert m["responses_ws"]._socks5h_url("socks5h://127.0.0.1:1080") == "socks5h://127.0.0.1:1080"
+    assert socks5h_url("socks5://127.0.0.1:1080") == "socks5h://127.0.0.1:1080"
+    assert socks5h_url("socks5h://127.0.0.1:1080") == "socks5h://127.0.0.1:1080"
 
 @pytest.mark.asyncio
 async def test_responses_ws_html403_skips_refresh_health_and_exhausts_with_safe_403(monkeypatch, m):

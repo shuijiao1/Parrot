@@ -251,20 +251,6 @@ def discover_claude(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
     return DiscoveryResult(models, _catalog(normalized), "upstream:anthropic")
 
 
-def _xai_is_text(record: dict) -> bool:
-    # /language-models is already typed. For /models fallback require positive
-    # structural evidence; never infer modality from names such as "imagine".
-    kind = str(record.get("type") or record.get("model_type") or record.get("modality") or "").lower()
-    if kind in {"language", "language_model", "text", "chat", "completion"}:
-        return True
-    capabilities = record.get("capabilities")
-    if isinstance(capabilities, dict):
-        return any(capabilities.get(key) is True for key in ("text", "chat", "completion", "responses"))
-    if isinstance(capabilities, list):
-        return bool({str(x).lower() for x in capabilities} & {"text", "chat", "completion", "responses"})
-    return False
-
-
 def discover_xai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
     deadline = _Deadline(timeout)
     token = str(account.get("access_token") or "")

@@ -3435,15 +3435,6 @@ def _extract_xai_response_from_response_body(body: str | None) -> dict | None:
     return latest
 
 
-def _extract_xai_usage_from_response_body(body: str | None) -> dict | None:
-    """从 xAI/Grok response body 中提取最终 usage。"""
-    resp = _extract_xai_response_from_response_body(body)
-    if not isinstance(resp, dict):
-        return None
-    usage = resp.get("usage")
-    return usage if isinstance(usage, dict) else None
-
-
 def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
     """聚合某 xAI/Grok OAuth channel 的 Parrot 本地调用金额与 tokens。
 
@@ -4984,19 +4975,16 @@ def recent_log_values(kind: str, limit: int = 120) -> list[str]:
 
 
 def log_detail(request_id: str) -> dict:
-    log_row = _get_conn().execute(
-        """SELECT request_log.*,
-                  request_detail.response_body AS response_body
-             FROM request_log
-             LEFT JOIN request_detail USING(request_id)
-            WHERE request_log.request_id=?""",
+    conn = _get_conn()
+    log_row = conn.execute(
+        "SELECT * FROM request_log WHERE request_id=?",
         (request_id,),
     ).fetchone()
-    detail_row = _get_conn().execute(
+    detail_row = conn.execute(
         "SELECT request_headers, request_body, response_body FROM request_detail WHERE request_id=?",
         (request_id,),
     ).fetchone()
-    chain_rows = _get_conn().execute(
+    chain_rows = conn.execute(
         "SELECT * FROM retry_chain WHERE request_id=? ORDER BY attempt_order ASC",
         (request_id,),
     ).fetchall()
@@ -5005,19 +4993,19 @@ def log_detail(request_id: str) -> dict:
     # the UI shows the actual compression model/channel instead of an empty
     # execution chain.
     if not chain_rows and log_row and dict(log_row).get("final_channel_key") == "compact-rescue":
-        chain_rows = _get_conn().execute(
+        chain_rows = conn.execute(
             "SELECT * FROM retry_chain WHERE request_id LIKE ? ORDER BY request_id ASC, attempt_order ASC",
             (request_id + ":%",),
         ).fetchall()
-    proxy_rows = _get_conn().execute(
+    proxy_rows = conn.execute(
         "SELECT * FROM proxy_chain WHERE request_id=? ORDER BY attempt_order ASC, id ASC",
         (request_id,),
     ).fetchall()
-    local_web_rows = _get_conn().execute(
+    local_web_rows = conn.execute(
         "SELECT * FROM local_web_log WHERE request_id=? ORDER BY round_no ASC, id ASC",
         (request_id,),
     ).fetchall()
-    billing_rows = _get_conn().execute(
+    billing_rows = conn.execute(
         """SELECT * FROM upstream_attempt_usage
             WHERE root_request_id=?
             ORDER BY settled_at ASC, id ASC""",

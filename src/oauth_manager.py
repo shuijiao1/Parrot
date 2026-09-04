@@ -1249,27 +1249,6 @@ async def fetch_usage_snapshot(account_key: str, *,
         return preserve_openai_reset_credit_details(account_key, usage)
 
 
-def _synthesize_openai_usage_from_row(row: dict) -> dict:
-    """把 OpenAI codex snapshot 行映射到 Anthropic 风格 usage dict。
-
-    让 extract_utils_percent / latest_reset_iso / flatten_usage 可以统一消费。
-    OpenAI 无 sonnet/opus/extra 维度，对应字段为 None。util 从 0..100 反推 0..100
-    百分比（flatten_usage 会原样写回）。
-    """
-    def _block(util_pct, reset):
-        # util_pct 是 0..100 百分比；flatten_usage 的 _util_pct 会直接透传
-        return {"utilization": util_pct, "resets_at": reset} if util_pct is not None else None
-
-    return {
-        "five_hour": _block(row.get("five_hour_util"), row.get("five_hour_reset")) or {},
-        "seven_day": _block(row.get("seven_day_util"), row.get("seven_day_reset")) or {},
-        "seven_day_sonnet": {},
-        "seven_day_opus": {},
-        "seven_day_fable": {},
-        "extra_usage": {"is_enabled": False},
-    }
-
-
 # ─── 按访问节流刷新 usage ────────────────────────────────────────
 #
 # 场景：quotaMonitor.enabled=False 时，后台轮询不跑，UI 读到的都是旧缓存。

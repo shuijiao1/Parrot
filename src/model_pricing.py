@@ -961,12 +961,6 @@ def _normalize_provider_id(value: Any) -> str | None:
     return provider
 
 
-def _provider_from_explicit_target(target: str) -> str | None:
-    if "/" not in target:
-        return None
-    return _normalize_provider_id(target.partition("/")[0])
-
-
 def _pricing_entry_payload(entry: PricingEntry) -> dict[str, Any]:
     return {item.name: getattr(entry, item.name) for item in fields(PricingEntry)}
 

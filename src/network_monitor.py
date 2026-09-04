@@ -10,7 +10,6 @@ Persistent status is stored in StateStore snapshots so menus can show banners an
 from __future__ import annotations
 
 import asyncio
-import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -379,28 +378,6 @@ async def _socks5_check(timeout: float) -> CheckResult:
     latency = int((time.time() - t0) * 1000)
     detail = "; ".join(failures[:4])
     return CheckResult("socks5", "SOCKS5 代理", "socks5", not failures, detail, latency)
-
-
-def _tcp_connect(host: str, port: int, timeout: float) -> int:
-    t0 = time.time()
-    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    last_exc: Exception | None = None
-    for family, socktype, proto, _canon, sockaddr in infos:
-        sock = socket.socket(family, socktype, proto)
-        try:
-            sock.settimeout(timeout)
-            sock.connect(sockaddr)
-            return int((time.time() - t0) * 1000)
-        except Exception as exc:
-            last_exc = exc
-        finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
-    if last_exc:
-        raise last_exc
-    raise OSError("no address")
 
 
 def _parse_host_port(url: str) -> tuple[str, int]:

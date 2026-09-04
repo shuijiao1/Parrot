@@ -55,15 +55,12 @@ from ..protocols.runtime import (
     configured_transient_retry_delays,
     format_responses_ws_error,
     is_responses_ws_visible_event_type,
-    is_retryable_responses_ws_error_before_accept,
     is_html_error_document,
     parse_retry_after_seconds,
     retry_after_cooldown_until,
-    parse_wrapped_responses_ws_error,
     recovery_retry_allowed,
     responses_ws_http_status_from_attempt,
     retryable_transient_error_kind,
-    should_cooldown,
     transient_retry_allowed,
     transient_retry_limit,
     ws_close_code_for_http_status,
@@ -85,7 +82,6 @@ from ..transports import (
     read_next_responses_ws_step,
     read_until_first_responses_ws_visible_event,
     resolve_ws_route_chain,
-    socks5h_url,
     wait_ws_round_io,
     WsProxyBytes,
     ws_event_type,
@@ -3131,10 +3127,6 @@ async def _connect_upstream_ws(
     )
 
 
-def _socks5h_url(url: str) -> str:
-    return socks5h_url(url)
-
-
 async def _open_socket_via_ss2022(
     url: str,
     connector: SS2022Connector,
@@ -3485,14 +3477,6 @@ async def _recv_until_first_visible_ws_event(
     return step.visible_frame
 
 
-def _parse_wrapped_ws_error(text: str) -> Optional[dict]:
-    return parse_wrapped_responses_ws_error(text)
-
-
-def _is_retryable_ws_error_before_accept(err: dict) -> bool:
-    return is_retryable_responses_ws_error_before_accept(err)
-
-
 def _invalid_status_detail(exc: InvalidStatus) -> str:
     resp = getattr(exc, "response", None)
     status = getattr(resp, "status_code", None)
@@ -3570,7 +3554,3 @@ def _is_ws_capable_channel(ch: Channel) -> bool:
     # candidates before retry accounting/scoring so they are not treated as
     # failed channels.
     return getattr(ch, "protocol", "anthropic") == "openai-responses"
-
-
-def _should_cooldown(outcome: str) -> bool:
-    return should_cooldown(outcome)
