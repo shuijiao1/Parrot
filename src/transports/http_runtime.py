@@ -1247,14 +1247,18 @@ async def _finish_pre_header_round(
     detail: str,
     proxy_name: str | None,
     proxy_bytes: dict,
+    persist_dispatch=None,
 ) -> AttemptResult:
+    if persist_dispatch is not None:
+        await persist_dispatch()
     if ctx is not None:
         await close_response_context(ctx)
     await close_proxy_client(proxy_client)
     result = _attempt_result(
         outcome, detail, bucket=proxy_bytes, proxy_name=proxy_name,
     )
-    _persist_proxy_attempt_timing(
+    await asyncio.to_thread(
+        _persist_proxy_attempt_timing,
         proxy_attempt_id,
         timing,
         outcome=outcome,
@@ -1372,7 +1376,8 @@ async def open_response_with_proxy_chain(
 
         round_id = str(uuid.uuid4())
         try:
-            proxy_attempt_id = log_db.record_proxy_attempt(
+            proxy_attempt_id = await asyncio.to_thread(
+                log_db.record_proxy_attempt,
                 request_id, retry_attempt_id, proxy_attempt_order,
                 route_log_name, time.time(),
                 round_id=round_id,
@@ -1382,19 +1387,52 @@ async def open_response_with_proxy_chain(
         except Exception:
             proxy_attempt_id = None
 
+        # The trace callback itself must remain non-blocking. It captures the
+        # authoritative physical-send timestamp; the surrounding coroutine then
+        # awaits the SQLite offload before exposing the next lifecycle state.
+        dispatch_state: dict[str, Any] = {"at": None, "persisted": False}
+
+        def note_dispatch() -> None:
+            if dispatch_state["at"] is None:
+                dispatch_state["at"] = time.time()
+
+        async def persist_dispatch() -> None:
+            if (
+                retry_attempt_id is None
+                or dispatch_state["at"] is None
+                or dispatch_state["persisted"]
+            ):
+                return
+            dispatch_state["persisted"] = True
+            try:
+                await asyncio.to_thread(
+                    log_db.mark_retry_attempt_dispatch,
+                    retry_attempt_id,
+                    upstream_req.body,
+                    dispatch_metadata=getattr(upstream_req, "dispatch_metadata", None),
+                    dispatched_at=dispatch_state["at"],
+                )
+            except Exception:
+                # Billing diagnostics must never break the proxy path.
+                pass
+
         # Authoritative round starts only now: immediately before client.stream.
         timing = HttpAttemptTiming(
             route_type=route_type,
             response_mode=response_mode,
             round_id=round_id,
-            on_dispatch=(
-                (lambda: log_db.mark_retry_attempt_dispatch(
-                    retry_attempt_id, upstream_req.body,
-                ))
-                if retry_attempt_id is not None else None
-            ),
+            on_dispatch=note_dispatch,
         )
         late_timing.target = timing
+
+        async def trace_with_dispatch(name: str, info: dict[str, Any]) -> None:
+            was_dispatched = timing.dispatch_started
+            await timing.trace(name, info)
+            if not was_dispatched and timing.dispatch_started:
+                # The trace callback is async, so the lock/commit offload can be
+                # awaited at the exact physical-send boundary without a detached
+                # task or delaying visibility until response headers arrive.
+                await persist_dispatch()
 
         try:
             dispatch_headers = _headers_for_physical_dispatch(upstream_req.headers)
@@ -1409,7 +1447,7 @@ async def open_response_with_proxy_chain(
                     read_timeout=max(330.0, round_timeouts.total + 1.0),
                     write_timeout=30.0,
                     pool_timeout=round_timeouts.connection + 0.5,
-                    extensions={"trace": timing.trace},
+                    extensions={"trace": trace_with_dispatch},
                 ),
             )
         except Exception as exc:
@@ -1425,7 +1463,8 @@ async def open_response_with_proxy_chain(
                 bucket=proxy_bytes,
                 proxy_name=proxy_name_used,
             ))
-            _persist_proxy_attempt_timing(
+            await asyncio.to_thread(
+                _persist_proxy_attempt_timing,
                 proxy_attempt_id,
                 timing,
                 outcome=last_pre_header.outcome,
@@ -1437,6 +1476,7 @@ async def open_response_with_proxy_chain(
 
         try:
             upstream_resp = await timing.wait_for(ctx.__aenter__(), round_timeouts)
+            await persist_dispatch()
             if response_mode == "stream" and not timing.connection_complete:
                 # High-level API return is the authoritative final-header boundary.
                 timing.mark_connection_complete()
@@ -1450,6 +1490,7 @@ async def open_response_with_proxy_chain(
                 detail="upstream HTTP round cancelled before response commit",
                 proxy_name=proxy_name_used,
                 proxy_bytes=proxy_bytes,
+                persist_dispatch=persist_dispatch,
             ))
             raise
         except BusinessTimeoutError as exc:
@@ -1463,6 +1504,7 @@ async def open_response_with_proxy_chain(
                 detail=detail,
                 proxy_name=proxy_name_used,
                 proxy_bytes=proxy_bytes,
+                persist_dispatch=persist_dispatch,
             )
             if connector is not None:
                 connector.stats.total_failures += 1
@@ -1482,6 +1524,7 @@ async def open_response_with_proxy_chain(
                 detail=detail,
                 proxy_name=proxy_name_used,
                 proxy_bytes=proxy_bytes,
+                persist_dispatch=persist_dispatch,
             )
             if connector is not None:
                 connector.stats.total_failures += 1
@@ -1500,6 +1543,7 @@ async def open_response_with_proxy_chain(
                 detail=detail,
                 proxy_name=proxy_name_used,
                 proxy_bytes=proxy_bytes,
+                persist_dispatch=persist_dispatch,
             )
             if connector is not None:
                 connector.stats.total_failures += 1
@@ -1520,6 +1564,7 @@ async def open_response_with_proxy_chain(
                 detail=detail,
                 proxy_name=proxy_name_used,
                 proxy_bytes=proxy_bytes,
+                persist_dispatch=persist_dispatch,
             )
             if connector is not None:
                 connector.stats.total_failures += 1
@@ -1529,7 +1574,8 @@ async def open_response_with_proxy_chain(
             continue
 
         connect_ms = timing.snapshot().connect_ms
-        _persist_proxy_attempt_timing(
+        await asyncio.to_thread(
+            _persist_proxy_attempt_timing,
             proxy_attempt_id,
             timing,
             outcome="open",

@@ -24,7 +24,7 @@ from ..openai.transform import (
     chat_to_responses,
     guard,
 )
-from .base import Channel, ChannelDisplay, UpstreamRequest
+from .base import Channel, ChannelDisplay, UpstreamRequest, build_dispatch_metadata
 
 
 _UA = "parrot/xai-oauth-adapter"
@@ -268,6 +268,9 @@ class XAIOAuthChannel(Channel):
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
             translator_ctx=translator_ctx,
+            dispatch_metadata=build_dispatch_metadata(
+                payload, "openai-responses", headers,
+            ),
         )
 
     async def restore_response(self, chunk: bytes,

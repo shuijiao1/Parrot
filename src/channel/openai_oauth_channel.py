@@ -41,7 +41,7 @@ from ..openai.transform import (
     codex_oauth_transform,
     guard,
 )
-from .base import Channel, ChannelDisplay, UpstreamRequest
+from .base import Channel, ChannelDisplay, UpstreamRequest, build_dispatch_metadata
 from .compatibility import apply_reasoning_effort_capability
 
 
@@ -615,6 +615,9 @@ class OpenAIOAuthChannel(Channel):
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
             translator_ctx=translator_ctx,
+            dispatch_metadata=build_dispatch_metadata(
+                payload, "openai-responses", headers,
+            ),
         )
 
     # ─── 响应字节流 ───────────────────────────────────────────

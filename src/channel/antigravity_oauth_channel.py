@@ -16,7 +16,7 @@ from ..oauth import antigravity as ag_provider
 from ..oauth_ids import account_key as _account_key
 from ..openai.transform import anthropic_to_responses, chat_to_responses, guard
 from ..providers import antigravity_codec, remote_image, registry as provider_registry
-from .base import Channel, ChannelDisplay, UpstreamRequest
+from .base import Channel, ChannelDisplay, UpstreamRequest, build_dispatch_metadata
 
 
 def _provider_cfg() -> dict:
@@ -238,6 +238,9 @@ class AntigravityOAuthChannel(Channel):
             body=json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
             translator_ctx=translator_ctx,
+            dispatch_metadata=build_dispatch_metadata(
+                envelope, "openai-responses", headers,
+            ),
         )
 
     async def restore_response(self, chunk: bytes,

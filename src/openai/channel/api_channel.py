@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from ...channel.base import Channel, ChannelDisplay, UpstreamRequest
+from ...channel.base import Channel, ChannelDisplay, UpstreamRequest, build_dispatch_metadata
 from ...channel.compatibility import (
     apply_forced_openai_fast_mode,
     apply_reasoning_effort_capability,
@@ -313,6 +313,7 @@ class OpenAIApiChannel(Channel):
             headers=self._headers(),
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
+            dispatch_metadata=build_dispatch_metadata(payload, self.protocol),
             translator_ctx={
                 "ingress": "anthropic",
                 "upstream_protocol": "openai-chat",
@@ -342,6 +343,7 @@ class OpenAIApiChannel(Channel):
             headers=self._headers(),
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
+            dispatch_metadata=build_dispatch_metadata(payload, self.protocol),
             translator_ctx={
                 "ingress": "anthropic",
                 "upstream_protocol": "openai-responses",
@@ -373,6 +375,7 @@ class OpenAIApiChannel(Channel):
             headers=self._headers(),
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
+            dispatch_metadata=build_dispatch_metadata(payload, self.protocol),
             translator_ctx=None,
         )
 
@@ -389,6 +392,7 @@ class OpenAIApiChannel(Channel):
             headers=self._headers(),
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
+            dispatch_metadata=build_dispatch_metadata(payload, self.protocol),
             translator_ctx=None,
         )
 
@@ -411,6 +415,7 @@ class OpenAIApiChannel(Channel):
             headers=self._headers(),
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
+            dispatch_metadata=build_dispatch_metadata(payload, self.protocol),
             translator_ctx={
                 "ingress": "chat",
                 "upstream_protocol": "openai-responses",
@@ -445,6 +450,7 @@ class OpenAIApiChannel(Channel):
             headers=self._headers(),
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
+            dispatch_metadata=build_dispatch_metadata(payload, self.protocol),
             translator_ctx={
                 "ingress": "responses",
                 "upstream_protocol": "openai-chat",

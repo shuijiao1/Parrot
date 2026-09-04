@@ -8,7 +8,7 @@ from .. import oauth_manager
 from ..openai.transform import chat_to_anthropic, responses_to_anthropic
 from ..providers import registry as provider_registry
 from ..transform import cc_mimicry
-from .base import Channel, ChannelDisplay, UpstreamRequest
+from .base import Channel, ChannelDisplay, UpstreamRequest, build_dispatch_metadata
 
 
 class OAuthChannel(Channel):
@@ -125,6 +125,7 @@ class OAuthChannel(Channel):
             body=signed,
             dynamic_tool_map=dynamic_map,
             translator_ctx=translator_ctx,
+            dispatch_metadata=build_dispatch_metadata(payload, "anthropic", headers),
         )
 
     async def restore_response(self, chunk: bytes,

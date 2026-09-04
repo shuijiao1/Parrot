@@ -303,7 +303,7 @@ async def test_proxy_route_is_not_replayed_after_request_dispatch_started(monkey
     monkeypatch.setattr(
         http_runtime.log_db,
         "mark_retry_attempt_dispatch",
-        lambda retry_id, body: dispatched.append((retry_id, body)),
+        lambda retry_id, body, **_kwargs: dispatched.append((retry_id, body)),
     )
 
     def open_stream(client, request):

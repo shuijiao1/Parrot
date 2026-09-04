@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import config, model_metadata, model_pricing
+from .channel.base import UpstreamDispatchMetadata
 
 _BJT = timezone(timedelta(hours=8))
 _local = threading.local()
@@ -1751,45 +1752,73 @@ def _outbound_model_id(request_body: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _mark_retry_attempt_dispatch_locked(
+    conn: sqlite3.Connection,
+    handle: RowLogHandle,
+    request_body: Any,
+    dispatch_metadata: UpstreamDispatchMetadata | None,
+    dispatched_at: float | None,
+) -> bool:
+    attempt = conn.execute(
+        "SELECT * FROM retry_chain WHERE id=?", (handle.row_id,),
+    ).fetchone()
+    if attempt is None or attempt["dispatched_at"] is not None:
+        return False
+    protocol = str(attempt["upstream_protocol"] or "").strip().lower() or None
+    if dispatch_metadata is None:
+        tier = _outbound_service_tier(request_body, protocol)
+        outbound_model = _outbound_model_id(request_body)
+    else:
+        tier = dispatch_metadata.outbound_service_tier
+        outbound_model = dispatch_metadata.outbound_model_id
+    binding = model_pricing.build_pricing_binding(
+        channel_key=str(attempt["channel_key"] or ""),
+        channel_type=str(attempt["channel_type"] or ""),
+        upstream_protocol=protocol,
+        outbound_model_id=outbound_model,
+        client_visible_model=str(
+            attempt["client_visible_model"] or attempt["model"] or outbound_model
+        ),
+    )
+    conn.execute(
+        """UPDATE retry_chain SET
+               outbound_service_tier=?, dispatched_at=?,
+               binding_provider_id=?, binding_model_id=?,
+               binding_pricing_key=?, binding_source=?, binding_json=?,
+               binding_version=?, binding_revision=?
+           WHERE id=? AND dispatched_at IS NULL""",
+        (
+            tier, time.time() if dispatched_at is None else float(dispatched_at),
+            binding.provider_id, binding.model_id,
+            binding.pricing_key, binding.binding_source, binding.binding_json,
+            binding.binding_version, binding.source_revision, handle.row_id,
+        ),
+    )
+    return True
+
+
 def mark_retry_attempt_dispatch(
     attempt_id: int | RowLogHandle,
-    request_body: Any,
+    request_body: Any = None,
+    *,
+    dispatch_metadata: UpstreamDispatchMetadata | None = None,
+    dispatched_at: float | None = None,
 ) -> None:
-    """Atomically freeze dispatch time, exact route/model/tier, and tariff binding."""
+    """Atomically freeze dispatch time, exact route/model/tier, and tariff binding.
+
+    Legacy callers may still provide only ``request_body``.  New request paths
+    pass the structured metadata carried by ``UpstreamRequest`` and never parse
+    the serialized body here.
+    """
+
     handle = _row_handle(attempt_id, table="retry_chain")
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
-        attempt = conn.execute(
-            "SELECT * FROM retry_chain WHERE id=?", (handle.row_id,),
-        ).fetchone()
-        if attempt is None or attempt["dispatched_at"] is not None:
-            return
-        protocol = str(attempt["upstream_protocol"] or "").strip().lower() or None
-        tier = _outbound_service_tier(request_body, protocol)
-        outbound_model = _outbound_model_id(request_body)
-        binding = model_pricing.build_pricing_binding(
-            channel_key=str(attempt["channel_key"] or ""),
-            channel_type=str(attempt["channel_type"] or ""),
-            upstream_protocol=protocol,
-            outbound_model_id=outbound_model,
-            client_visible_model=str(
-                attempt["client_visible_model"] or attempt["model"] or outbound_model
-            ),
+        changed = _mark_retry_attempt_dispatch_locked(
+            conn, handle, request_body, dispatch_metadata, dispatched_at,
         )
-        conn.execute(
-            """UPDATE retry_chain SET
-                   outbound_service_tier=?, dispatched_at=?,
-                   binding_provider_id=?, binding_model_id=?,
-                   binding_pricing_key=?, binding_source=?, binding_json=?,
-                   binding_version=?, binding_revision=?
-               WHERE id=? AND dispatched_at IS NULL""",
-            (
-                tier, time.time(), binding.provider_id, binding.model_id,
-                binding.pricing_key, binding.binding_source, binding.binding_json,
-                binding.binding_version, binding.source_revision, handle.row_id,
-            ),
-        )
-        conn.commit()
+        if changed:
+            conn.commit()
 
 
 def _billing_root_request_id(call_request_id: str) -> str:
@@ -5976,6 +6005,8 @@ def update_pending_fast_mode_from_upstream(
     request_id: str | RequestLogHandle,
     upstream_body: dict | str | bytes | bytearray | None,
     upstream_headers: dict | None = None,
+    *,
+    dispatch_metadata: UpstreamDispatchMetadata | None = None,
 ) -> bool | None:
     """Sync the summary Fast badge from the actual upstream wire payload.
 
@@ -5987,6 +6018,11 @@ def update_pending_fast_mode_from_upstream(
     Returns the detected state, or ``None`` when the payload is not a JSON object
     and therefore cannot authoritatively replace the current summary value.
     """
+    if dispatch_metadata is not None:
+        enabled = dispatch_metadata.fast_mode
+        update_pending(request_id, fast_mode=1 if enabled else 0)
+        return enabled
+
     payload = upstream_body
     if isinstance(payload, (bytes, bytearray)):
         try:
@@ -6005,6 +6041,95 @@ def update_pending_fast_mode_from_upstream(
     update_pending(request_id, fast_mode=1 if enabled else 0)
     return enabled
 
+
+def record_upstream_dispatch(
+    request_id: str | RequestLogHandle,
+    attempt_id: int | RowLogHandle | None,
+    request_body: Any = None,
+    upstream_headers: dict | None = None,
+    *,
+    dispatch_metadata: UpstreamDispatchMetadata | None = None,
+    dispatched_at: float | None = None,
+) -> bool | None:
+    """Persist adjacent Fast-badge and retry-dispatch facts in one transaction.
+
+    This narrow API is used only where both facts become authoritative at the
+    same pre-send boundary (Responses WS create frames). HTTP retains separate
+    build, route, and physical-dispatch visibility points.
+    """
+
+    request = _request_handle(request_id)
+    retry = (
+        _row_handle(attempt_id, table="retry_chain")
+        if attempt_id is not None else None
+    )
+    different_db = bool(
+        retry is not None
+        and isinstance(attempt_id, RowLogHandle)
+        and retry.db != request.db
+    )
+
+    payload: dict[str, Any] | None = None
+    if dispatch_metadata is not None:
+        enabled: bool | None = bool(dispatch_metadata.fast_mode)
+    else:
+        payload = _outbound_payload(request_body)
+        enabled = (
+            extract_fast_mode(payload, headers=upstream_headers)
+            if payload is not None else None
+        )
+
+    if different_db:
+        # Compatibility fallback for synthetic/pre-handle callers. Production
+        # RowLogHandles share the request DB and take the one-transaction path.
+        if enabled is not None:
+            update_pending(request, fast_mode=1 if enabled else 0)
+        try:
+            mark_retry_attempt_dispatch(
+                retry,
+                payload if payload is not None else request_body,
+                dispatch_metadata=dispatch_metadata,
+                dispatched_at=dispatched_at,
+            )
+        except Exception:
+            pass
+        return enabled
+
+    with _write_lock:
+        conn = _get_conn_for_ref(request.db)
+        changed = False
+        if enabled is not None:
+            conn.execute(
+                "UPDATE request_log SET fast_mode=? WHERE request_id=?",
+                (1 if enabled else 0, request.request_id),
+            )
+            changed = True
+        if retry is not None:
+            if not conn.in_transaction:
+                conn.execute("BEGIN")
+            # The former two-call sequence treated the Fast update as required
+            # but dispatch diagnostics as best effort. A savepoint preserves that
+            # recovery behavior while the successful path uses one commit.
+            conn.execute("SAVEPOINT upstream_dispatch")
+            try:
+                dispatch_changed = _mark_retry_attempt_dispatch_locked(
+                    conn,
+                    retry,
+                    payload if payload is not None else request_body,
+                    dispatch_metadata,
+                    dispatched_at,
+                )
+            except Exception:
+                conn.execute("ROLLBACK TO upstream_dispatch")
+                conn.execute("RELEASE upstream_dispatch")
+            else:
+                conn.execute("RELEASE upstream_dispatch")
+                changed = dispatch_changed or changed
+        if changed:
+            conn.commit()
+        elif conn.in_transaction:
+            conn.rollback()
+    return enabled
 
 
 def extract_reasoning_effort(body: dict, ingress_protocol: str = "anthropic") -> str | None:

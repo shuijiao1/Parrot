@@ -13,7 +13,7 @@ from ..openai.channel.api_channel import OpenAIApiChannel
 from ..openai.transform import anthropic_to_chat, guard
 from ..providers import registry as provider_registry
 from ..transform import cc_mimicry
-from .base import ChannelDisplay, UpstreamRequest
+from .base import ChannelDisplay, UpstreamRequest, build_dispatch_metadata
 from .compatibility import apply_reasoning_effort_capability
 
 
@@ -179,9 +179,10 @@ class CursorOAuthChannel(OpenAIApiChannel):
             api_key_name=body.get("_parrot_api_key_name"),
             client_ip=body.get("_parrot_client_ip"),
         )
+        headers = self._headers()
         return UpstreamRequest(
             url=f"{self.base_url}/v1/chat/completions",
-            headers=self._headers(),
+            headers=headers,
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
             translator_ctx={
@@ -190,6 +191,7 @@ class CursorOAuthChannel(OpenAIApiChannel):
                 "response_translator": "anthropic_to_chat",
                 "model_for_response": resolved_model,
             },
+            dispatch_metadata=build_dispatch_metadata(payload, "openai-chat", headers),
         )
 
     async def build_upstream_request(
@@ -323,6 +325,9 @@ class CursorOAuthChannel(OpenAIApiChannel):
         request.headers[cursor_runtime._ACCOUNT_HEADER] = self.account_key
         request.headers["Authorization"] = f"Bearer {cursor_runtime.bearer_secret()}"
         request.body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        request.dispatch_metadata = build_dispatch_metadata(
+            payload, "openai-chat", request.headers,
+        )
         ctx = dict(request.translator_ctx or {})
         ctx.update({
             "cursor_client_model": resolved_model,

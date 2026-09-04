@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 from ..openai.transform import chat_to_anthropic, responses_to_anthropic
 from ..providers import registry as provider_registry
 from ..transform import cc_mimicry, standard
-from .base import Channel, ChannelDisplay, UpstreamRequest
+from .base import Channel, ChannelDisplay, UpstreamRequest, build_dispatch_metadata
 from .compatibility import forced_for_model, normalize_mode, normalize_models
 from .url_utils import resolve_upstream_url
 
@@ -281,6 +281,7 @@ class ApiChannel(Channel):
             body=signed,
             dynamic_tool_map=dynamic_map,
             translator_ctx=translator_ctx,
+            dispatch_metadata=build_dispatch_metadata(payload, "anthropic", headers),
         )
 
     async def restore_response(self, chunk: bytes,

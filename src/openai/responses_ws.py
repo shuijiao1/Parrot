@@ -36,7 +36,7 @@ from .. import (
     affinity, apikey_limiter, auth, blacklist, channel_state, concurrency, config, cooldown, fingerprint, local_web_tools,
     log_db, model_mapping, model_pricing, network, notifier, oauth_manager, scheduler, scorer, translation, upstream,
 )
-from ..channel.base import Channel, UpstreamRequest
+from ..channel.base import Channel, UpstreamRequest, build_dispatch_metadata
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel, _isolate_session_id
 from . import compaction_owner
 from .codex_device_fingerprint import apply_device_fingerprint
@@ -272,7 +272,7 @@ async def _wait_for_transient_retry(
     return delay
 
 
-def _persist_ws_route_round(
+async def _persist_ws_route_round(
     route_attempt_id,
     timing: WsAttemptTiming,
     proxy_bytes: _WsProxyBytes,
@@ -288,7 +288,8 @@ def _persist_ws_route_round(
     )
     if route_attempt_id is not None:
         try:
-            log_db.update_proxy_attempt(
+            await asyncio.to_thread(
+                log_db.update_proxy_attempt,
                 route_attempt_id,
                 started_at=snapshot.started_at,
                 connect_ms=snapshot.connection_ms,
@@ -755,14 +756,17 @@ async def _run_ws_failover(
 
         attempt_proxy = _pick_non_direct_proxy_name(ch, resolved_model)
         attempt_started_monotonic = time.monotonic()
-        attempt_id = log_db.record_retry_attempt(
+        attempt_id = await asyncio.to_thread(
+            log_db.record_retry_attempt,
             request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
             proxy_name=attempt_proxy,
             upstream_protocol=getattr(ch, "protocol", "openai-responses"),
             client_visible_model=client_visible_model,
         )
         if attempt_proxy:
-            log_db.update_pending(request_id, proxy_name=attempt_proxy)
+            await asyncio.to_thread(
+                log_db.update_pending, request_id, proxy_name=attempt_proxy,
+            )
 
         turn_capacity = _WsTurnCapacity(
             api_key_lease=api_key_lease,
@@ -791,7 +795,8 @@ async def _run_ws_failover(
         last_result = result
         accepted = accepted or result.closed_after_accept or result.ok or result.connected
 
-        log_db.update_retry_attempt(
+        await asyncio.to_thread(
+            log_db.update_retry_attempt,
             attempt_id,
             final_round_id=result.round_id,
             connect_ms=result.connect_ms,
@@ -951,7 +956,8 @@ async def _run_ws_failover(
                 last_ch, last_model = ch, resolved_model
                 attempt_proxy = _pick_non_direct_proxy_name(ch, resolved_model)
                 attempt_started_monotonic2 = time.monotonic()
-                attempt_id = log_db.record_retry_attempt(
+                attempt_id = await asyncio.to_thread(
+                    log_db.record_retry_attempt,
                     request_id, attempt_order, ch.key, ch.type, resolved_model,
                     time.time(), proxy_name=attempt_proxy,
                     upstream_protocol=getattr(ch, "protocol", "openai-responses"),
@@ -982,7 +988,8 @@ async def _run_ws_failover(
                     result.proxy_name = attempt_proxy
                 last_result = result
                 accepted = accepted or result.closed_after_accept or result.ok or result.connected
-                log_db.update_retry_attempt(
+                await asyncio.to_thread(
+                    log_db.update_retry_attempt,
                     attempt_id,
                     final_round_id=result.round_id,
                     connect_ms=result.connect_ms,
@@ -1187,7 +1194,8 @@ async def _try_ws_channel(
         round_id = str(uuid.uuid4())
         route_attempt_id = None
         try:
-            route_attempt_id = log_db.record_proxy_attempt(
+            route_attempt_id = await asyncio.to_thread(
+                log_db.record_proxy_attempt,
                 request_id,
                 retry_attempt_id,
                 route_order,
@@ -1219,7 +1227,7 @@ async def _try_ws_channel(
             )
             if not timing.connection_complete:
                 timing.mark_handshake_complete()
-            open_snapshot = _persist_ws_route_round(
+            open_snapshot = await _persist_ws_route_round(
                 route_attempt_id,
                 timing,
                 proxy_bytes,
@@ -1286,7 +1294,7 @@ async def _try_ws_channel(
                     identity_session=identity_session,
                 )
                 if not timing.terminal:
-                    _persist_ws_route_round(
+                    await _persist_ws_route_round(
                         route_attempt_id,
                         timing,
                         proxy_bytes,
@@ -1473,7 +1481,8 @@ async def _try_ws_channel(
                     reasoning_effort=reasoning_effort,
                     fast_mode=fast_mode,
                 )
-                retry_attempt_id = log_db.record_retry_attempt(
+                retry_attempt_id = await asyncio.to_thread(
+                    log_db.record_retry_attempt,
                     request_id,
                     1,
                     ch.key,
@@ -1490,7 +1499,8 @@ async def _try_ws_channel(
                 )
                 proxy_bytes = _WsProxyBytes()
                 round_id = str(uuid.uuid4())
-                route_attempt_id = log_db.record_proxy_attempt(
+                route_attempt_id = await asyncio.to_thread(
+                    log_db.record_proxy_attempt,
                     request_id,
                     retry_attempt_id,
                     1,
@@ -1504,7 +1514,7 @@ async def _try_ws_channel(
                     route_type=route_type, round_id=round_id,
                 )
                 timing.mark_handshake_complete()
-                open_snapshot = _persist_ws_route_round(
+                open_snapshot = await _persist_ws_route_round(
                     route_attempt_id,
                     timing,
                     proxy_bytes,
@@ -1537,7 +1547,7 @@ async def _try_ws_channel(
                         pass
                 if timing.terminal:
                     return
-                cancelled_snapshot = _persist_ws_route_round(
+                cancelled_snapshot = await _persist_ws_route_round(
                     route_attempt_id,
                     timing,
                     proxy_bytes,
@@ -1646,7 +1656,7 @@ async def _try_ws_channel(
             )
         finally:
             if last_error is not None and not timing.terminal:
-                _persist_ws_route_round(
+                await _persist_ws_route_round(
                     route_attempt_id,
                     timing,
                     proxy_bytes,
@@ -1727,8 +1737,10 @@ async def _try_sse_channel(
         http_body = dict(body)
         http_body["stream"] = True
         upstream_req = await ch.build_upstream_request(http_body, resolved_model, ingress_protocol="responses")
-        log_db.update_pending_fast_mode_from_upstream(
+        await asyncio.to_thread(
+            log_db.update_pending_fast_mode_from_upstream,
             request_id, upstream_req.body, upstream_req.headers,
+            dispatch_metadata=getattr(upstream_req, "dispatch_metadata", None),
         )
     except Exception as exc:
         if hasattr(exc, "status") and hasattr(exc, "message"):
@@ -1842,9 +1854,12 @@ async def _try_sse_channel(
             detail = body_bytes.decode("utf-8", errors="replace")[:2000] or detail
         except asyncio.CancelledError:
             response_text = b"".join(parts).decode("utf-8", errors="replace")
-            timing_snapshot = finalize_opened_http_response(
-                opened, "cancelled", "HTTP error response read cancelled",
-            )
+            timing_snapshot = await await_ws_owned(asyncio.to_thread(
+                finalize_opened_http_response,
+                opened,
+                "cancelled",
+                "HTTP error response read cancelled",
+            ))
             _sync_http_proxy_bytes(proxy_bytes, opened)
             normalized = model_pricing.normalize_response_billing(response_text)
             usage = {
@@ -1954,7 +1969,12 @@ async def _try_sse_channel(
             retry_after_seconds=_retry_after_from_headers(response.headers),
         )
         _sync_http_proxy_bytes(proxy_bytes, opened)
-        finalize_opened_http_response(opened, result.outcome, result.error_detail)
+        await asyncio.to_thread(
+            finalize_opened_http_response,
+            opened,
+            result.outcome,
+            result.error_detail,
+        )
         _apply_http_snapshot(result, opened, terminal=True)
         await close_response_context(opened.ctx)
         await close_proxy_client(opened.proxy_client)
@@ -1980,11 +2000,13 @@ async def _try_sse_channel(
     aiter = response.aiter_bytes()
     round_terminalized = False
 
-    def terminalize_round(outcome: str, error_detail: str | None) -> None:
+    async def terminalize_round(outcome: str, error_detail: str | None) -> None:
         nonlocal round_terminalized
         if round_terminalized:
             return
-        finalize_opened_http_response(opened, outcome, error_detail)
+        await asyncio.to_thread(
+            finalize_opened_http_response, opened, outcome, error_detail,
+        )
         _apply_http_snapshot(result, opened, terminal=True)
         _sync_http_proxy_bytes(proxy_bytes, opened)
         round_terminalized = True
@@ -2001,7 +2023,7 @@ async def _try_sse_channel(
 
     async def finalize_and_return() -> _WsAttemptResult:
         sync_tracker_result()
-        terminalize_round(result.outcome, result.error_detail)
+        await terminalize_round(result.outcome, result.error_detail)
         if retry_attempt_id is not None:
             await asyncio.to_thread(
                 log_db.update_retry_attempt,
@@ -2272,7 +2294,7 @@ async def _try_sse_channel(
             result.outcome = "cancelled"
             result.error_detail = "upstream SSE bridge cancelled"
             sync_tracker_result()
-            terminalize_round(result.outcome, result.error_detail)
+            await terminalize_round(result.outcome, result.error_detail)
             result.request_finalized = True
             try:
                 await asyncio.to_thread(
@@ -2328,7 +2350,7 @@ async def _try_sse_channel(
         raise
     finally:
         if not round_terminalized:
-            terminalize_round(result.outcome, result.error_detail)
+            await terminalize_round(result.outcome, result.error_detail)
         try:
             await await_ws_owned(close_response_context(opened.ctx))
             await await_ws_owned(close_proxy_client(opened.proxy_client))
@@ -2549,7 +2571,7 @@ async def _relay_ws_session(
         if result.request_finalized:
             return result
         sync_tracker_result()
-        _persist_ws_route_round(
+        await _persist_ws_route_round(
             route_attempt_id,
             timing,
             proxy_bytes,
@@ -2687,13 +2709,18 @@ async def _relay_ws_session(
                 {}, first_upstream_obj, installation_id,
                 create_client_metadata=True,
             )
-        log_db.update_pending_fast_mode_from_upstream(request_id, first_upstream_obj)
+        dispatch_metadata = build_dispatch_metadata(
+            first_upstream_obj,
+            getattr(ch, "protocol", "openai-responses"),
+        )
+        await asyncio.to_thread(
+            log_db.record_upstream_dispatch,
+            request_id,
+            retry_attempt_id,
+            first_upstream_obj,
+            dispatch_metadata=dispatch_metadata,
+        )
         payload_to_send: str | bytes = _dump_frame(first_upstream_obj)
-        if retry_attempt_id is not None:
-            try:
-                log_db.mark_retry_attempt_dispatch(retry_attempt_id, first_upstream_obj)
-            except Exception:
-                pass
         on_dispatch()
         proxy_bytes.count(up=_frame_size(payload_to_send))
         await wait_ws_round_io(
@@ -3072,7 +3099,13 @@ async def _build_ws_upstream_request(
             headers, _ = apply_device_fingerprint(
                 headers, None, installation_id, create_client_metadata=False,
             )
-        return UpstreamRequest(url=ws_url, headers=headers, body=b"", translator_ctx=translator_ctx)
+        return UpstreamRequest(
+            url=ws_url,
+            headers=headers,
+            body=b"",
+            translator_ctx=translator_ctx,
+            dispatch_metadata=req.dispatch_metadata,
+        )
 
     # Third-party OpenAI Responses API channel. Only same-protocol channels are
     # valid here; chat upstream cannot speak Responses WS.
@@ -3083,6 +3116,7 @@ async def _build_ws_upstream_request(
         body=b"",
         dynamic_tool_map=req.dynamic_tool_map,
         translator_ctx=req.translator_ctx,
+        dispatch_metadata=req.dispatch_metadata,
     )
 
 
