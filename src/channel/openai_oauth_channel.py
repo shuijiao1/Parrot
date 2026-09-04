@@ -43,6 +43,7 @@ from ..openai.transform import (
 )
 from .base import Channel, ChannelDisplay, UpstreamRequest, build_dispatch_metadata
 from .compatibility import apply_reasoning_effort_capability
+from .oauth_helpers import request_api_key_name as _request_api_key_name
 
 
 def _provider_cfg() -> dict:
@@ -87,16 +88,6 @@ def _isolate_session_id(api_key_name: str, raw: str) -> str:
         return ""
     material = f"k{api_key_name or '-'}:{raw}".encode("utf-8")
     return hashlib.sha256(material).hexdigest()[:16]
-
-
-def _request_api_key_name(body: dict) -> str:
-    """Return the downstream API key name for OpenAI and Anthropic ingress.
-
-    OpenAI handlers inject ``_api_key_name`` while the Anthropic /v1/messages
-    route injects ``_parrot_api_key_name``.  OAuth Codex session isolation and
-    cross-protocol prompt-cache keys must treat them equivalently.
-    """
-    return str(body.get("_api_key_name") or body.get("_parrot_api_key_name") or "")
 
 
 # ─── 常量 ────────────────────────────────────────────────────────

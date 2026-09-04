@@ -15,10 +15,7 @@ from ..providers import registry as provider_registry
 from ..transform import cc_mimicry
 from .base import ChannelDisplay, UpstreamRequest, build_dispatch_metadata
 from .compatibility import apply_reasoning_effort_capability
-
-
-def _request_api_key_name(body: dict) -> str:
-    return str(body.get("_api_key_name") or body.get("_parrot_api_key_name") or "")
+from .oauth_helpers import request_api_key_name as _request_api_key_name
 
 
 def _contains_image(payload: dict) -> bool:

@@ -17,6 +17,7 @@ from ..oauth_ids import account_key as _account_key
 from ..openai.transform import anthropic_to_responses, chat_to_responses, guard
 from ..providers import antigravity_codec, remote_image, registry as provider_registry
 from .base import Channel, ChannelDisplay, UpstreamRequest, build_dispatch_metadata
+from .oauth_helpers import request_api_key_name as _request_api_key_name
 
 
 def _provider_cfg() -> dict:
@@ -33,10 +34,6 @@ def _provider_cfg() -> dict:
         else:
             merged[key] = value
     return merged
-
-
-def _request_api_key_name(body: dict) -> str:
-    return str(body.get("_api_key_name") or body.get("_parrot_api_key_name") or "")
 
 
 def _wants_stream(body: dict) -> bool:
