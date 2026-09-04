@@ -564,8 +564,7 @@ class UpdateControl:
         with self._lock:
             active_digest = self._active_plan_digest
             result = self._updates.cancel()
-            if result[0]:
-                self._retire_plan(active_digest)
+            self._retire_plan_after_cancel(active_digest, ok=result[0])
             return result
 
     def _idempotent_existing(
@@ -661,6 +660,12 @@ class UpdateControl:
             plan.consumed = True
         if self._active_plan_digest == digest:
             self._active_plan_digest = None
+
+    def _retire_plan_after_cancel(self, digest: str | None, *, ok: bool) -> None:
+        """Retire a plan whenever cancel has actually left the staged state."""
+        post_state = self._state_without_auth()
+        if ok or post_state.stage != STAGE_STAGED:
+            self._retire_plan(digest)
 
     def _start_stage(self, operation_id: str, context: ManagementContext, payload: Any) -> None:
         store = self._operation_store
@@ -871,7 +876,7 @@ class UpdateControl:
                 raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
             active_digest = self._active_plan_digest
             ok, _detail = self._updates.cancel()
+            self._retire_plan_after_cancel(active_digest, ok=ok)
             if not ok:
                 raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True)
-            self._retire_plan(active_digest)
         audit(self._audit_sink, context, action="updates.staged.cancel", target="staged-update")

@@ -217,6 +217,117 @@ def test_reaudit3_update_token_cancelled_plan_never_revives_on_same_version_rest
         assert fixture.update_gateway.activate_calls == 1
 
 
+def test_reaudit4_failed_cancel_that_clears_stage_retires_plan_before_direct_restage(tmp_path):
+    app, runtime, fixture = build_auxiliary_app(tmp_path)
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        staged = client.post(
+            BASE + "/updates/0.32.0/actions/stage",
+            headers={**headers, "Idempotency-Key": "stage-before-failed-direct-cancel"},
+        )
+        assert staged.status_code == 202, staged.text
+        old_token = staged.json()["data"]["activationPlanToken"]
+        terminal = _poll(client, headers, staged.json()["data"]["id"])
+        assert terminal["status"] == "succeeded"
+        old_revision = terminal["result"]["expectedRevision"]
+
+        cancel_detail = "source rollback failed after state reset"
+
+        def fail_cancel_after_reset():
+            fixture.update_gateway.cancel_calls += 1
+            fixture.update_gateway.update_state = {"stage": "idle", "mode": "docker"}
+            return False, cancel_detail
+
+        fixture.update_gateway.cancel = fail_cancel_after_reset
+        direct_session = runtime.sessions.issue_for_principal(
+            subject_id="telegram:update-admin",
+            auth_method=AuthMethod.TELEGRAM_APPROVAL,
+            roles=(),
+            capabilities=(Capability.READ, Capability.UPDATE),
+        )
+        direct_context = ManagementContext(
+            request_id="failed-direct-cancel",
+            actor=direct_session.principal,
+        )
+
+        cancelled = fixture.controls.updates.cancel_direct(direct_context)
+        assert cancelled == (False, cancel_detail)
+        assert fixture.update_gateway.cancel_calls == 1
+
+        restaged = fixture.controls.updates.stage_direct(
+            direct_context,
+            "0.32.0",
+            progress=lambda _stage, _message: None,
+            chat_id=123,
+            notify_msg_id=456,
+        )
+        assert restaged == (True, "ready")
+        new_revision = fixture.controls.updates.state(direct_context).revision
+        assert new_revision == old_revision
+
+        stale = client.post(
+            BASE + "/updates/staged/actions/restart",
+            json={"planToken": old_token},
+            headers={
+                **headers,
+                "Idempotency-Key": "activate-after-failed-direct-cancel",
+                "If-Match": new_revision,
+            },
+        )
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["error"]["code"] == "STATE_CONFLICT"
+        assert fixture.update_gateway.activate_calls == 0
+
+
+def test_reaudit4_failed_cancel_while_still_staged_keeps_plan_retryable(tmp_path):
+    app, _, fixture = build_auxiliary_app(tmp_path)
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        staged = client.post(
+            BASE + "/updates/0.32.0/actions/stage",
+            headers={**headers, "Idempotency-Key": "stage-before-retryable-cancel"},
+        )
+        assert staged.status_code == 202, staged.text
+        plan_token = staged.json()["data"]["activationPlanToken"]
+        terminal = _poll(client, headers, staged.json()["data"]["id"])
+        assert terminal["status"] == "succeeded"
+        revision = terminal["result"]["expectedRevision"]
+
+        private_detail = "PRIVATE_STILL_STAGED_CANCEL_FAILURE"
+
+        def fail_cancel_while_staged():
+            fixture.update_gateway.cancel_calls += 1
+            return False, private_detail
+
+        fixture.update_gateway.cancel = fail_cancel_while_staged
+        cancelled = client.delete(
+            BASE + "/updates/staged",
+            headers={**headers, "If-Match": revision},
+        )
+        assert cancelled.status_code == 503, cancelled.text
+        assert cancelled.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+        assert cancelled.json()["error"]["message"] == "A required dependency is unavailable"
+        assert cancelled.json()["error"]["retryable"] is True
+        assert private_detail not in cancelled.text
+        assert fixture.update_gateway.cancel_calls == 1
+        assert fixture.update_gateway.update_state["stage"] == "staged"
+
+        activated = client.post(
+            BASE + "/updates/staged/actions/restart",
+            json={"planToken": plan_token},
+            headers={
+                **headers,
+                "Idempotency-Key": "activate-after-retryable-cancel",
+                "If-Match": revision,
+            },
+        )
+        assert activated.status_code == 202, activated.text
+        terminal = _poll(client, headers, activated.json()["data"]["id"])
+        assert terminal["status"] == "succeeded"
+        assert terminal["result"] == {"activated": True}
+        assert fixture.update_gateway.activate_calls == 1
+
+
 def test_image_and_xai_all_operations_no_oauth_secret_and_revision_conflict(tmp_path):
     app, _, fixture = build_auxiliary_app(tmp_path)
     with TestClient(app) as client:
