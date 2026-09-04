@@ -5403,23 +5403,25 @@ def _management_candidate_tie_order(
     """Return the frozen recent_logs() order within one created_at value.
 
     Without a pushed equality filter SQLite scans idx_log_created backwards, so
-    equal timestamps arrive by rowid descending.  The frozen selector pushed a
-    single status and API-key/channel selections into recent_logs(); on the
-    current schema those scans use the corresponding equality index and feed
-    the stable timestamp sort by index value then rowid ascending.  Channel is
-    the planner's last applicable index, followed by API key and then status.
+    equal timestamps arrive by rowid descending.  With multiple usable indexes,
+    the current schema's planner chooses the smallest IN-list cardinality; ties
+    prefer channel over API key over status.  The selected equality-index scan
+    feeds the stable timestamp sort by index value then rowid ascending.
     """
 
-    channels = [str(value) for value in (channel_keys or []) if str(value)]
-    if channels:
-        return "final_channel_key ASC, id ASC"
-    keys = [str(value) for value in (api_keys or []) if str(value)]
-    if keys:
-        return "api_key_name ASC, id ASC"
     clean_statuses = [str(value) for value in (statuses or []) if str(value)]
+    keys = [str(value) for value in (api_keys or []) if str(value)]
+    channels = [str(value) for value in (channel_keys or []) if str(value)]
+    candidates: list[tuple[int, int, str]] = []
     if len(clean_statuses) == 1:
-        return "status ASC, id ASC"
-    return "id DESC"
+        candidates.append((1, 0, "status ASC, id ASC"))
+    if keys:
+        candidates.append((len(keys), 1, "api_key_name ASC, id ASC"))
+    if channels:
+        candidates.append((len(channels), 2, "final_channel_key ASC, id ASC"))
+    if not candidates:
+        return "id DESC"
+    return min(candidates, key=lambda item: (item[0], -item[1]))[2]
 
 
 def _management_logs_order(
