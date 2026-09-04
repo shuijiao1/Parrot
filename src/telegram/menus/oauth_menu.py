@@ -196,11 +196,17 @@ def _foreground_account_model_sync(
             )
     selection_before = post_save.get("model_selection_before") or {}
     future = post_save.get("model_sync_future")
+    if future is None:
+        # The frozen helper invoked selection/submit inline, so a failure before
+        # a Future existed escaped to the provider's save/overwrite error flow.
+        # Only failures from Future.result() belong to the asynchronous warning.
+        launch_error = post_save.get("model_sync_error")
+        if isinstance(launch_error, BaseException):
+            raise launch_error
+        raise RuntimeError(str(launch_error or "model sync did not start"))
 
     def finish() -> None:
         try:
-            if future is None:
-                raise RuntimeError(str(post_save.get("model_sync_error") or "model sync did not start"))
             result = future.result(timeout=oauth_control.model_sync_foreground_timeout_seconds())
         except concurrent.futures.TimeoutError:
             result = {"action": "foreground_timeout", "account_key": account_key}
