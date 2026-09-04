@@ -21,6 +21,70 @@ def _ch(key, protocol, alias="m", real="real", type="api", provider=""):
     )
 
 
+def test_schedule_precomputes_raw_and_portable_features_once(monkeypatch):
+    candidate_count = 12
+    channels = [
+        _ch(f"c{index}", "openai-responses")
+        for index in range(candidate_count)
+    ]
+    body = {
+        "model": "m",
+        "input": [{"type": "reasoning", "encrypted_content": "opaque-owner-state"}],
+    }
+    extracted_bodies = []
+    planned_features = []
+    raw_features = object()
+    portable_features = object()
+
+    def counted_extract(protocol, candidate_body):
+        assert protocol == "responses"
+        extracted_bodies.append(candidate_body)
+        return raw_features if candidate_body is body else portable_features
+
+    class RecordingMatrix:
+        def plan(self, ingress, upstream, *, features, capabilities):
+            assert ingress == "responses"
+            assert upstream == "openai-responses"
+            assert capabilities is None
+            planned_features.append(features)
+            return scheduler.RoutePlan(ingress_protocol=ingress, upstream_protocol=upstream)
+
+    binding = {"channel_key": "c0", "model": "real"}
+    monkeypatch.setattr(scheduler.registry, "all_channels", lambda: channels)
+    monkeypatch.setattr(
+        scheduler.registry,
+        "get_channel",
+        lambda key: channels[0] if key == "c0" else None,
+    )
+    monkeypatch.setattr(scheduler.affinity, "get", lambda _key: binding)
+    monkeypatch.setattr(scheduler.affinity, "make_client_key", lambda *_: "client")
+    monkeypatch.setattr(scheduler.cooldown, "is_blocked", lambda *_: False)
+    monkeypatch.setattr(scheduler.concurrency, "is_saturated", lambda *_: False)
+    monkeypatch.setattr(scheduler.config, "get", lambda: {"channelSelection": "order"})
+    monkeypatch.setattr(scheduler, "capabilities_for_channel", lambda _channel: None)
+    monkeypatch.setattr(scheduler, "extract_request_features", counted_extract)
+    monkeypatch.setattr(scheduler, "DEFAULT_MATRIX", RecordingMatrix())
+
+    result = scheduler.schedule(
+        body,
+        api_key_name="tenant",
+        client_ip="192.0.2.1",
+        ingress_protocol="responses",
+        fp_query="exact-session",
+    )
+
+    assert [channel.key for channel, _ in result.candidates] == [
+        f"c{index}" for index in range(candidate_count)
+    ]
+    assert result.bound_channel_key == "c0"
+    assert result.encrypted_content_count == 1
+    assert len(extracted_bodies) == 2
+    assert extracted_bodies[0] is body
+    assert extracted_bodies[1] is not body
+    assert "encrypted_content" not in extracted_bodies[1]["input"][0]
+    assert planned_features == [raw_features] + [portable_features] * (candidate_count - 1)
+
+
 def test_schedule_explains_disabled_and_cooldown_exclusions(monkeypatch):
     disabled = _ch("api:disabled", "anthropic")
     disabled.enabled = False

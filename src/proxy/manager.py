@@ -6,10 +6,11 @@ runtime state (stats, cached connectors) is rebuilt on reload.
 
 from __future__ import annotations
 
-import asyncio
 import threading
-import time
-from typing import Callable, Optional
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -22,61 +23,118 @@ from .connector import (
 # ── State ────────────────────────────────────────────────────────
 
 _lock = threading.RLock()
-_connectors: dict[str, Connector] = {}  # name → Connector
-_groups: dict[str, list[str]] = {}       # group_name → [proxy_name, ...]
-_routing: dict = {}                      # routing config subtree
 _initialized = False
+_callback_registered = False
+_config_generation: object | None = None
 
 # A special "direct" connector always available
 _DIRECT = DirectConnector()
 
 
+@dataclass(frozen=True)
+class _ProxySnapshot:
+    """One atomically published, read-only proxy configuration generation."""
+
+    connectors: Mapping[str, Connector]
+    groups: Mapping[str, tuple[Any, ...]]
+    routing: Mapping[str, Any]
+
+
+def _freeze(value: Any) -> Any:
+    """Recursively detach JSON-like config values and make them read-only."""
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _mutable_copy(value: Any) -> Any:
+    """Return public routing/group values with their historical dict/list shape."""
+    if isinstance(value, Mapping):
+        return {key: _mutable_copy(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_mutable_copy(item) for item in value]
+    return value
+
+
+_EMPTY_SNAPSHOT = _ProxySnapshot(
+    connectors=MappingProxyType({}),
+    groups=MappingProxyType({}),
+    routing=MappingProxyType({}),
+)
+_snapshot = _EMPTY_SNAPSHOT
+
+
 # ── Init / Reload ────────────────────────────────────────────────
 
 def init() -> None:
-    """Build connectors + groups + routing from config. Idempotent."""
-    global _initialized
-    _reload_from_config()
-    if not _initialized:
-        config.on_reload(_on_config_reload)
+    """Initialize once; config reload callbacks own every later generation."""
+    global _callback_registered, _initialized
+    if _initialized:
+        return
+    with _lock:
+        if _initialized:
+            return
+        if not _callback_registered:
+            config.on_reload(_on_config_reload)
+            _callback_registered = True
+        # Keep _initialized false until the complete first snapshot is visible,
+        # so concurrent callers cannot return while initialization is partial.
+        _install_config_locked(config.get())
         _initialized = True
 
 
 def _on_config_reload(_cfg=None) -> None:
-    _reload_from_config()
+    # Always re-read the current object.  A callback from an older concurrent
+    # reload must not publish its stale argument after a newer generation won.
+    with _lock:
+        _install_config_locked(config.get())
 
 
-def _reload_from_config() -> None:
-    cfg = config.get()
+def _install_config_locked(cfg: dict) -> None:
+    global _config_generation, _snapshot
+    # config retains one object for the lifetime of a loaded generation and
+    # publishes a replacement object on reload/update.
+    if cfg is _config_generation:
+        return
+    new_snapshot = _build_snapshot(cfg, _snapshot)
+    # Readers use this one pointer.  No partially cleared/repopulated mappings
+    # are observable, even while a reload is building the next generation.
+    _snapshot = new_snapshot
+    _config_generation = cfg
+
+
+def _build_snapshot(cfg: dict, previous: _ProxySnapshot) -> _ProxySnapshot:
     net = cfg.get("network") or {}
 
-    with _lock:
-        # ── proxies ──
-        old_stats = {n: c.stats for n, c in _connectors.items()}
-        _connectors.clear()
-        raw_proxies = net.get("proxies") or {}
-        for name, pcfg in raw_proxies.items():
-            if name == "direct":
-                continue  # reserved
-            try:
-                c = connector_from_config(name, pcfg)
-                # Restore stats if connector was known
-                if name in old_stats:
-                    c.stats = old_stats[name]
-                _connectors[name] = c
-            except Exception as e:
-                print(f"[proxy] failed to build connector '{name}': {e}")
+    old_stats = {name: connector.stats for name, connector in previous.connectors.items()}
+    connectors: dict[str, Connector] = {}
+    raw_proxies = net.get("proxies") or {}
+    for name, pcfg in raw_proxies.items():
+        if name == "direct":
+            continue  # reserved
+        try:
+            connector = connector_from_config(name, pcfg)
+            if name in old_stats:
+                connector.stats = old_stats[name]
+            connectors[name] = connector
+        except Exception as exc:
+            print(f"[proxy] failed to build connector '{name}': {exc}")
 
-        # ── groups ──
-        _groups.clear()
-        raw_groups = net.get("groups") or {}
-        for gname, members in raw_groups.items():
-            if isinstance(members, list):
-                _groups[gname] = list(members)
+    groups: dict[str, tuple[Any, ...]] = {}
+    raw_groups = net.get("groups") or {}
+    for group_name, members in raw_groups.items():
+        if isinstance(members, list):
+            groups[group_name] = tuple(_freeze(item) for item in members)
 
-        # ── routing ──
-        _routing.clear()
-        _routing.update(net.get("routing") or {})
+    raw_routing = net.get("routing") or {}
+    routing = _freeze(raw_routing if isinstance(raw_routing, dict) else {})
+    return _ProxySnapshot(
+        connectors=MappingProxyType(connectors),
+        groups=MappingProxyType(groups),
+        routing=routing,
+    )
 
 
 # ── Lookups ──────────────────────────────────────────────────────
@@ -86,29 +144,29 @@ def get_connector(name: str) -> Optional[Connector]:
     if name == "direct":
         return _DIRECT
     with _lock:
-        return _connectors.get(name)
+        return _snapshot.connectors.get(name)
 
 
 def get_group(name: str) -> Optional[list[str]]:
     with _lock:
-        return list(_groups.get(name, []))
+        return _mutable_copy(_snapshot.groups.get(name, ()))
 
 
 def all_connectors() -> dict[str, Connector]:
     with _lock:
-        d = dict(_connectors)
-    d["direct"] = _DIRECT
-    return d
+        values = dict(_snapshot.connectors)
+    values["direct"] = _DIRECT
+    return values
 
 
 def all_groups() -> dict[str, list[str]]:
     with _lock:
-        return dict(_groups)
+        return _mutable_copy(_snapshot.groups)
 
 
 def get_routing() -> dict:
     with _lock:
-        return dict(_routing)
+        return _mutable_copy(_snapshot.routing)
 
 
 def _network_config_snapshot() -> dict:
@@ -208,40 +266,43 @@ def resolve_proxy_target(*, channel_key: str = "", model: str = "",
       - "direct"
     """
     with _lock:
-        r = dict(_routing)
+        routing = _snapshot.routing
+
+    def selected(value):
+        return _mutable_copy(value)
 
     # 1. Account/channel-level override (same priority; account wins ties)
-    acct_routes = r.get("accounts") or {}
+    acct_routes = routing.get("accounts") or {}
     if account_key and account_key in acct_routes:
-        return acct_routes[account_key]
+        return selected(acct_routes[account_key])
     # The Telegram account-routing UI stores OAuth channel keys (``oauth:...``),
     # while transports also pass the provider account key (without that prefix).
     # Account keys still win when both routes exist, but a missing account-key
     # route must fall back to the saved channel key instead of silently going
     # direct.
     if channel_key and channel_key in acct_routes:
-        return acct_routes[channel_key]
+        return selected(acct_routes[channel_key])
 
     # 1b. Channel-level override
-    ch_routes = r.get("channels") or {}
+    ch_routes = routing.get("channels") or {}
     if channel_key and channel_key in ch_routes:
-        return ch_routes[channel_key]
+        return selected(ch_routes[channel_key])
 
     # 2. Model-level override
-    m_routes = r.get("models") or {}
-    if model and model in m_routes:
-        return m_routes[model]
+    model_routes = routing.get("models") or {}
+    if model and model in model_routes:
+        return selected(model_routes[model])
 
     # 3. Purpose/family-level override (telegram, oauth_anthropic, oauth_openai, etc.)
-    if purpose and purpose in r:
-        return r[purpose]
+    if purpose and purpose in routing:
+        return selected(routing[purpose])
 
     # Backward-compatible alias used by the first draft of the UI.
-    if purpose.startswith("oauth_") and "oauth" in r:
-        return r["oauth"]
+    if purpose.startswith("oauth_") and "oauth" in routing:
+        return selected(routing["oauth"])
 
     # 4. Default
-    return r.get("default", "direct")
+    return selected(routing.get("default", "direct"))
 
 
 def _expand_target(target: str | list[str]) -> list[str]:

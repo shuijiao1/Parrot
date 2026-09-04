@@ -87,6 +87,14 @@ def _filter_candidates(requested_model: str,
        saturated = 其它条件 OK 但当前并发满的候选（作为排队备选）。
     """
     request_body = body or {}
+    # Feature extraction walks the complete request structure.  Compute each
+    # request shape once; the candidate loop only selects the matching result.
+    request_features = extract_request_features(ingress_protocol, request_body)
+    if portable_body is None or portable_body is request_body:
+        portable_features = request_features
+    else:
+        portable_features = extract_request_features(ingress_protocol, portable_body)
+
     available: list[tuple[Channel, str]] = []
     saturated: list[tuple[Channel, str]] = []
     route_plans: dict[tuple[str, str], RoutePlan] = {}
@@ -110,10 +118,9 @@ def _filter_candidates(requested_model: str,
         # EC belongs to the exact bound channel.  For every other candidate,
         # Matrix must plan the portable request shape that failover will actually
         # send, not reject the candidate based on another account's opaque state.
-        planning_body = request_body
+        features = request_features
         if portable_body is not None and ch.key != bound_channel_key:
-            planning_body = portable_body
-        features = extract_request_features(ingress_protocol, planning_body)
+            features = portable_features
         try:
             route_plan = DEFAULT_MATRIX.plan(
                 ingress_protocol,
