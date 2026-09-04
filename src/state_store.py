@@ -1,6 +1,7 @@
 """Unified in-memory state with verified, atomic JSON snapshots.
 
-Runtime state is memory-first/debounced. Durable mutations use
+Runtime mutations publish domain/record copy-on-write state and defer complete
+payload encoding to the debounced flush. Durable mutations use
 prepare-write-publish: memory is published only after the candidate snapshot is
 closed, read-verified, installed and directory-synced.
 """
@@ -17,6 +18,8 @@ import threading
 import uuid
 from contextlib import contextmanager
 from typing import Any, Callable, Iterable
+
+from .state_cow import CowDomain
 
 SCHEMA = "parrot-state"
 VERSION = 1
@@ -349,8 +352,14 @@ class StateStore:
         if not self.flush("runtime", strict=False): self._schedule_runtime_flush()
 
     def _candidate_for(self, kind: str) -> dict[str, dict[str, Any]]:
+        """Capture one immutable published generation without copying records.
+
+        Every mutation replaces domains and touched records instead of modifying
+        a publication in place.  Holding references here is therefore a stable
+        flush snapshot even after ``_lock`` is released.
+        """
         domains = RUNTIME_DOMAINS if kind == "runtime" else DURABLE_DOMAINS
-        return {domain: copy.deepcopy(self._data[domain]) for domain in domains}
+        return {domain: self._data[domain] for domain in domains}
 
     def _mutate(self, domain: str, operation: Callable[[dict[str, dict[str, Any]]], Any],
                 *, strict: bool | None = None) -> Any:
@@ -358,11 +367,15 @@ class StateStore:
         with self._install_locks[kind]:
             with self._lock:
                 self._assert_mutable()
-                candidate = self._candidate_for(kind)
-                result = operation(candidate[domain])
-                # Validate the complete candidate before memory can be poisoned.
-                self._payload_bytes(candidate)
+                transaction = CowDomain(self._data[domain])
+                result = operation(transaction)
+                # Commit validates only touched records and detaches callback-owned
+                # values. Runtime-wide encoding is deliberately deferred to flush.
+                candidate_domain = transaction.commit()
                 generation = self._generation[kind] + 1
+                candidate = self._candidate_for(kind) if kind == "durable" else None
+                if candidate is not None:
+                    candidate[domain] = candidate_domain
             if kind == "durable":
                 try:
                     self.write_snapshot(self._paths[kind], kind, generation, candidate)
@@ -370,11 +383,13 @@ class StateStore:
                     with self._lock: self._last_error[kind] = str(exc)
                     raise
                 with self._lock:
-                    self._data.update(candidate); self._generation[kind] = generation
+                    self._data[domain] = candidate_domain
+                    self._generation[kind] = generation
                     self._dirty[kind] = False; self._last_error[kind] = None
             else:
                 with self._lock:
-                    self._data.update(candidate); self._generation[kind] = generation
+                    self._data[domain] = candidate_domain
+                    self._generation[kind] = generation
                     self._dirty[kind] = True
         if kind == "runtime": self._schedule_runtime_flush()
         return copy.deepcopy(result)
@@ -385,16 +400,28 @@ class StateStore:
         if len(kinds) != 1:
             raise ValueError("cross-kind mutation is not supported")
         kind = next(iter(kinds))
+        kind_domains = RUNTIME_DOMAINS if kind == "runtime" else DURABLE_DOMAINS
+        declared = set(domains)
         with self._install_locks[kind]:
             with self._lock:
-                self._assert_mutable(); candidate = self._candidate_for(kind)
-                proxy = dict(self._data); proxy.update(candidate)
-                result = operation(proxy); self._payload_bytes(candidate)
+                self._assert_mutable()
+                # Keep the historical same-kind mapping available to private
+                # callbacks, but lazily detach only domains/records they touch.
+                transactions = {name: CowDomain(self._data[name]) for name in kind_domains}
+                result = operation(transactions)
+                candidate_domains = {
+                    name: transaction.commit()
+                    for name, transaction in transactions.items()
+                    if name in declared or transaction.touched
+                }
                 generation = self._generation[kind] + 1
+                candidate = self._candidate_for(kind) if kind == "durable" else None
+                if candidate is not None:
+                    candidate.update(candidate_domains)
             if kind == "durable":
                 self.write_snapshot(self._paths[kind], kind, generation, candidate)
             with self._lock:
-                self._data.update(candidate); self._generation[kind] = generation
+                self._data.update(candidate_domains); self._generation[kind] = generation
                 self._dirty[kind] = kind == "runtime"; self._last_error[kind] = None
         if kind == "runtime": self._schedule_runtime_flush()
         return copy.deepcopy(result)
