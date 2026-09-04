@@ -5395,33 +5395,81 @@ def _casefold_collation(left: object, right: object) -> int:
 
 
 def _management_candidate_tie_order(
+    conn: sqlite3.Connection,
     *,
+    projection: str,
     statuses: list[str] | None,
     api_keys: list[str] | None,
+    models: list[str] | None,
     channel_keys: list[str] | None,
 ) -> str:
-    """Return the frozen recent_logs() order within one created_at value.
+    """Return the actual frozen recent_logs() order for equal timestamps.
 
-    Without a pushed equality filter SQLite scans idx_log_created backwards, so
-    equal timestamps arrive by rowid descending.  With multiple usable indexes,
-    the current schema's planner chooses the smallest IN-list cardinality; ties
-    prefer channel over API key over status.  The selected equality-index scan
-    feeds the stable timestamp sort by index value then rowid ascending.
+    The frozen selector pushed only one status (but every API-key, model and
+    channel filter) into ``recent_logs()``.  Ask this connection's planner about
+    that exact projected, descending and bounded candidate statement so
+    persistent ``sqlite_stat1`` data participates without reading any log row.
     """
 
     clean_statuses = [str(value) for value in (statuses or []) if str(value)]
-    keys = [str(value) for value in (api_keys or []) if str(value)]
-    channels = [str(value) for value in (channel_keys or []) if str(value)]
-    candidates: list[tuple[int, int, str]] = []
-    if len(clean_statuses) == 1:
-        candidates.append((1, 0, "status ASC, id ASC"))
-    if keys:
-        candidates.append((len(keys), 1, "api_key_name ASC, id ASC"))
-    if channels:
-        candidates.append((len(channels), 2, "final_channel_key ASC, id ASC"))
-    if not candidates:
-        return "id DESC"
-    return min(candidates, key=lambda item: (item[0], -item[1]))[2]
+    where, values = _recent_logs_where(
+        status=clean_statuses[0] if len(clean_statuses) == 1 else None,
+        api_keys=api_keys,
+        models=models,
+        channel_keys=channel_keys,
+    )
+    plan = conn.execute(
+        f"EXPLAIN QUERY PLAN SELECT {projection} FROM request_log {where} "
+        "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        values + [1, 0],
+    ).fetchall()
+    details = [str(row[3]) for row in plan]
+    request_steps = [
+        detail for detail in details
+        if re.match(r"^(?:SEARCH|SCAN) request_log(?: |$)", detail)
+    ]
+    if len(request_steps) != 1:
+        raise RuntimeError(
+            "unsupported frozen recent_logs query plan: " + " | ".join(details)
+        )
+
+    request_step = request_steps[0]
+    uses_temp_sort = any(
+        "USE TEMP B-TREE FOR ORDER BY" in detail for detail in details
+    )
+    index_orders = {
+        "idx_log_created": "id DESC",
+        "idx_log_status": "status ASC, id ASC",
+        "idx_log_apikey": "api_key_name ASC, id ASC",
+        "idx_log_channel": "final_channel_key ASC, id ASC",
+    }
+    selected = [
+        (index, order)
+        for index, order in index_orders.items()
+        if re.search(
+            rf"\bUSING (?:COVERING )?INDEX {re.escape(index)}\b",
+            request_step,
+        )
+    ]
+    if len(selected) == 1:
+        index, order = selected[0]
+        expected_temp_sort = index != "idx_log_created"
+        if uses_temp_sort == expected_temp_sort:
+            return order
+    elif (
+        not selected
+        and re.fullmatch(r"SCAN request_log", request_step)
+        and uses_temp_sort
+    ):
+        # A forward rowid table scan feeds SQLite's stable created_at sorter.
+        return "id ASC"
+
+    # An automatic/custom/multi-index plan has no tie order represented by the
+    # supported schema mapping.  Fail closed instead of inventing another
+    # planner model and silently returning different page members.
+    raise RuntimeError(
+        "unsupported frozen recent_logs query plan: " + " | ".join(details)
+    )
 
 
 def _management_logs_order(
@@ -5496,9 +5544,13 @@ def management_logs_page(
         started_at=started_at,
         ended_at=ended_at,
     )
+    projection = _compatible_recent_cols(conn)
     candidate_tie_order = _management_candidate_tie_order(
+        conn,
+        projection=projection,
         statuses=statuses,
         api_keys=api_keys,
+        models=models,
         channel_keys=channel_keys,
     )
     order = _management_logs_order(
@@ -5508,7 +5560,6 @@ def management_logs_page(
     )
     size = max(1, int(page_size or 50))
     offset = max(0, (max(1, int(page or 1)) - 1) * size)
-    projection = _compatible_recent_cols(conn)
 
     if not query:
         count_row = conn.execute(

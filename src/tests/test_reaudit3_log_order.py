@@ -188,12 +188,14 @@ def test_candidate_tie_order_matches_frozen_sqlite_plan_for_filter_combinations(
             "channel_keys": channel_keys,
         }
         where, values = _frozen_where(**filters)
+        projection = log_db._compatible_recent_cols(conn)
         plan = " | ".join(
             str(row["detail"])
             for row in conn.execute(
-                f"EXPLAIN QUERY PLAN SELECT id FROM request_log {where} "
-                "ORDER BY created_at DESC",
-                values,
+                f"EXPLAIN QUERY PLAN SELECT {projection} "
+                f"FROM request_log {where} "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                values + [1, 0],
             )
         )
         selected = [
@@ -201,8 +203,172 @@ def test_candidate_tie_order_matches_frozen_sqlite_plan_for_filter_combinations(
         ]
         assert len(selected) == 1, (filters, plan)
         assert log_db._management_candidate_tie_order(
+            conn,
+            projection=projection,
             statuses=statuses,
             api_keys=api_keys,
+            models=models,
             channel_keys=channel_keys,
         ) == selected[0], (filters, plan)
+    conn.close()
+
+
+def _analyzed_skew_log_db() -> sqlite3.Connection:
+    """Build the report's selective API-key / non-selective channel case."""
+
+    conn = _memory_log_db()
+    conn.executemany(
+        """INSERT INTO request_log(
+               request_id, created_at, status, api_key_name, requested_model,
+               final_model, final_channel_key, ingress_protocol, total_time_ms)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (
+            (
+                f"r{index + 1}",
+                100.0,
+                "error" if index % 3 == 0 else "success",
+                f"k{(index // 2) % 100}",
+                "m",
+                "m",
+                f"c{index % 2}",
+                "chat",
+                7,
+            )
+            for index in range(10_000)
+        ),
+    )
+    conn.commit()
+    conn.execute("ANALYZE")
+    return conn
+
+
+@pytest.mark.parametrize("descending", [True, False], ids=["desc", "asc"])
+def test_analyzed_api_key_plan_matches_frozen_page_boundaries(
+    monkeypatch,
+    descending: bool,
+) -> None:
+    conn = _analyzed_skew_log_db()
+    stats = {
+        str(row["idx"]): str(row["stat"])
+        for row in conn.execute(
+            "SELECT idx, stat FROM sqlite_stat1 WHERE tbl='request_log'"
+        )
+    }
+    assert stats["idx_log_apikey"] == "10000 100"
+    assert stats["idx_log_channel"] == "10000 5000"
+
+    candidate_filters = {
+        "statuses": ["success", "error"],
+        "api_keys": ["k1", "k2"],
+        "models": ["m"],
+        "channel_keys": ["c1"],
+    }
+    where, values = _frozen_where(**candidate_filters)
+    projection = log_db._compatible_recent_cols(conn)
+    plan = " | ".join(
+        str(row["detail"])
+        for row in conn.execute(
+            f"EXPLAIN QUERY PLAN SELECT {projection} "
+            f"FROM request_log {where} "
+            "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            values + [1, 0],
+        )
+    )
+    assert "USING INDEX idx_log_apikey" in plan
+    assert "USE TEMP B-TREE FOR ORDER BY" in plan
+    assert log_db._management_candidate_tie_order(
+        conn,
+        projection=projection,
+        **candidate_filters,
+    ) == "api_key_name ASC, id ASC"
+
+    frozen_ids = _frozen_default_ids(conn, **candidate_filters)
+    expected_first_twelve = [f"r{4 + 200 * index}" for index in range(12)]
+    assert frozen_ids[:12] == expected_first_twelve
+
+    monkeypatch.setattr(log_db, "_get_conn", lambda: conn)
+    actual_ids: list[str] = []
+    for page_number in (1, 2):
+        rows, total = log_db.management_logs_page(
+            **candidate_filters,
+            protocols=["chat"],
+            started_at=100.0,
+            ended_at=100.0,
+            descending=descending,
+            page=page_number,
+            page_size=6,
+        )
+        assert total == 100
+        actual_ids.extend(str(row["request_id"]) for row in rows)
+    assert actual_ids == frozen_ids[:12] == expected_first_twelve
+    conn.close()
+
+
+def test_table_scan_tie_order_comes_from_real_sqlite_sort() -> None:
+    conn = _memory_log_db()
+    conn.execute("DROP INDEX idx_log_created")
+    for index in range(1, 7):
+        _insert_request(conn, f"r{index}")
+    conn.commit()
+    projection = log_db._compatible_recent_cols(conn)
+    plan = " | ".join(
+        str(row["detail"])
+        for row in conn.execute(
+            f"EXPLAIN QUERY PLAN SELECT {projection} FROM request_log "
+            "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            [6, 0],
+        )
+    )
+    frozen_ids = [
+        str(row["request_id"])
+        for row in conn.execute(
+            f"SELECT {projection} FROM request_log "
+            "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            [6, 0],
+        )
+    ]
+
+    assert "SCAN request_log" in plan
+    assert "USE TEMP B-TREE FOR ORDER BY" in plan
+    assert frozen_ids == ["r1", "r2", "r3", "r4", "r5", "r6"]
+    assert log_db._management_candidate_tie_order(
+        conn,
+        projection=projection,
+        statuses=None,
+        api_keys=None,
+        models=None,
+        channel_keys=None,
+    ) == "id ASC"
+    conn.close()
+
+
+def test_unknown_selected_index_fails_closed_instead_of_guessing() -> None:
+    conn = _memory_log_db()
+    conn.execute("CREATE INDEX custom_log_apikey ON request_log(api_key_name)")
+    for index in range(1, 7):
+        _insert_request(conn, f"r{index}", api_key="k")
+    conn.commit()
+    projection = log_db._compatible_recent_cols(conn)
+    where, values = _frozen_where(api_keys=["k"])
+    plan = " | ".join(
+        str(row["detail"])
+        for row in conn.execute(
+            f"EXPLAIN QUERY PLAN SELECT {projection} "
+            f"FROM request_log {where} "
+            "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            values + [1, 0],
+        )
+    )
+    assert "USING INDEX custom_log_apikey" in plan
+    assert "USE TEMP B-TREE FOR ORDER BY" in plan
+
+    with pytest.raises(RuntimeError, match="unsupported frozen recent_logs query plan"):
+        log_db._management_candidate_tie_order(
+            conn,
+            projection=projection,
+            statuses=None,
+            api_keys=["k"],
+            models=None,
+            channel_keys=None,
+        )
     conn.close()
