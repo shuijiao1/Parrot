@@ -2,29 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from threading import RLock
+from dataclasses import asdict
 from typing import Iterable
 
 from fastapi import Request
 
 from src.management_control import ErrorField, ManagementError, ManagementErrorCode
-from src.management_control.network import NetworkControl
-from src.management_control.system import ContentBlacklistControl, SettingsControl
+from src.management_control.composition import SystemNetworkControls
 
-from ..dependencies import ManagementRuntime
+from ..dependencies import ManagementRuntime, get_management_control_owner
 from ..response_helpers import response_meta
 from ._operations import operation_data
-
-
-@dataclass(slots=True)
-class SystemNetworkControls:
-    settings: SettingsControl
-    blacklist: ContentBlacklistControl
-    network: NetworkControl
-
-
-_BIND_LOCK = RLock()
 
 
 def get_bound_system_network_controls(request: Request) -> SystemNetworkControls:
@@ -35,19 +23,10 @@ def get_bound_system_network_controls(request: Request) -> SystemNetworkControls
         return current
     if not isinstance(runtime, ManagementRuntime):
         raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY, retryable=True)
-    with _BIND_LOCK:
-        current = getattr(request.app.state, "management_system_network_controls", None)
-        owner = getattr(request.app.state, "management_system_network_controls_runtime", None)
-        if isinstance(current, SystemNetworkControls) and (owner is None or owner is runtime):
-            return current
-        current = SystemNetworkControls(
-            settings=SettingsControl(audit_sink=runtime.audit_sink),
-            blacklist=ContentBlacklistControl(audit_sink=runtime.audit_sink),
-            network=NetworkControl(operations=runtime.operations, audit_sink=runtime.audit_sink),
-        )
-        request.app.state.management_system_network_controls = current
-        request.app.state.management_system_network_controls_runtime = runtime
-        return current
+    current = get_management_control_owner(runtime).system
+    request.app.state.management_system_network_controls = current
+    request.app.state.management_system_network_controls_runtime = runtime
+    return current
 
 
 def reject_unknown_query(*allowed: str):

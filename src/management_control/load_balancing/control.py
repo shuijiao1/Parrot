@@ -39,8 +39,12 @@ class AffinityClearResult:
 class LoadBalancingControl(DomainControl):
     FAMILIES = load_balancing.FAMILIES
 
-    def __init__(self, *, audit_sink: AuditSink | None = None) -> None:
+    def __init__(
+        self, *, audit_sink: AuditSink | None = None, backend=load_balancing,
+    ) -> None:
         super().__init__(audit_sink=audit_sink)
+        self.backend = backend
+        self.channel_registry = registry
 
     @staticmethod
     def _snapshot() -> dict:
@@ -289,7 +293,15 @@ class LoadBalancingControl(DomainControl):
 
     def mode_description(self, mode: str) -> str:
         self._read(None)
-        return load_balancing.mode_description(mode)
+        return self.backend.mode_description(mode)
+
+    def display_mode(self, mode: str) -> str:
+        self._read(None)
+        return self.backend.display_mode(mode)
+
+    def family_for_channel(self, channel) -> str:
+        self._read(None)
+        return self.backend.family_for_channel(channel)
 
     def client_models(self) -> list[str]:
         self._read(None)
@@ -313,7 +325,7 @@ class LoadBalancingControl(DomainControl):
 
     def set_mode(self, mode: str) -> None:
         actual = self._write(None)
-        load_balancing.set_mode(mode)
+        self.backend.set_mode(mode)
         self._audit(actual, "load_balancing.mode.update", "load-balancing", "succeeded")
 
     def save_channel_order(self, order: list[str]) -> None:

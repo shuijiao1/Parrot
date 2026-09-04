@@ -98,12 +98,21 @@ def test_management_initialization_and_shutdown_are_isolated(tmp_path, monkeypat
     monkeypatch.setattr(server.config, "management_settings", lambda: values)
     runtime = server._initialize_management_runtime(app)
     assert isinstance(runtime, ManagementRuntime)
+    owner = runtime.control_owner()
     assert app.state.management_runtime is runtime
+    assert app.state.management_controls is owner
+    assert app.state.management_controls_runtime is runtime
+    assert server.tgbot.mapping_menu.mapping_control is owner.mapping
+    assert server.tgbot.system_menu._settings_control is owner.system.settings
+    assert server.tgbot.system_menu._runtime_control is owner.system_runtime
     assert (tmp_path / "management-composition.db").exists()
     output = capsys.readouterr().out
     assert values["managementKey"] not in output
     asyncio.run(server._close_management_runtime(app))
     assert app.state.management_runtime is None
+    assert app.state.management_controls is None
+    assert server.tgbot.mapping_menu.mapping_control is not owner.mapping
+    assert server.tgbot.system_menu._settings_control is not owner.system.settings
     assert server.tgbot._management_approval_handler is None
 
 

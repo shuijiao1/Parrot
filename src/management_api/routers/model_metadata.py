@@ -17,6 +17,7 @@ from src.management_control.mapping import (
 
 from ..dependencies import (
     ManagementRuntime,
+    get_management_control_owner,
     get_management_runtime,
     management_request_id,
     require_capability,
@@ -67,7 +68,7 @@ _MUTATION_ERRORS = (*_RESOURCE_ERRORS, ManagementErrorCode.REVISION_CONFLICT)
 def get_metadata_control(
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
 ) -> MappingControl:
-    return MappingControl(audit_sink=runtime.audit_sink, operation_store=runtime.operations)
+    return get_management_control_owner(runtime).mapping
 
 
 def _page_meta(request: Request, result) -> MappingListMeta:

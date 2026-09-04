@@ -30,6 +30,7 @@ from src.management_control import (
     OperationStore,
     StoreAuditSink,
 )
+from src.management_control.composition import ManagementControls, build_management_controls
 
 
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -47,16 +48,34 @@ class ManagementRuntime:
     allowed_origins: frozenset[str]
     application_version: str
     documentation_url: str
+    controls: ManagementControls | None = field(default=None, init=False, repr=False)
     _close_lock: RLock = field(default_factory=RLock, init=False, repr=False)
     _close_complete: Event = field(default_factory=Event, init=False, repr=False)
     _closing: bool = field(default=False, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
+
+    def control_owner(self) -> ManagementControls:
+        """Return this runtime's one lazily-safe, lifecycle-bound Control graph."""
+        with self._close_lock:
+            if self._closed or self._closing:
+                raise ManagementError(
+                    ManagementErrorCode.SERVICE_NOT_READY,
+                    retryable=True,
+                )
+            if self.controls is None:
+                self.controls = build_management_controls(
+                    audit_sink=self.audit_sink,
+                    operations=self.operations,
+                    operation_registry=self.operation_registry,
+                )
+            return self.controls
 
     def _claim_close(self) -> bool:
         with self._close_lock:
             if self._closed or self._closing:
                 return False
             self._closing = True
+            self.controls = None
             return True
 
     def _finish_close(self) -> None:
@@ -104,6 +123,10 @@ def management_request_id(request: Request) -> str:
     value = supplied if _REQUEST_ID_RE.fullmatch(supplied) else str(uuid.uuid4())
     request.state.management_request_id = value
     return value
+
+
+def get_management_control_owner(runtime: ManagementRuntime) -> ManagementControls:
+    return runtime.control_owner()
 
 
 def get_management_runtime(request: Request) -> ManagementRuntime:

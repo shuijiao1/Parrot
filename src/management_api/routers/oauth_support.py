@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import json
-from threading import RLock
 from typing import Annotated
-from weakref import WeakKeyDictionary
 
 from fastapi import Depends, Request
 from fastapi.responses import JSONResponse
@@ -22,7 +20,12 @@ from src.management_control.oauth import (
 from src.management_control.oauth.contracts import public_value, sanitize_text
 from src.management_control.operations import ManagementOperation
 
-from ..dependencies import ManagementRuntime, get_management_runtime, management_request_id
+from ..dependencies import (
+    ManagementRuntime,
+    get_management_control_owner,
+    get_management_runtime,
+    management_request_id,
+)
 from ..error_mapping import error_response, management_error_responses
 from ..schemas.base import ResponseMeta
 from ..schemas.oauth import (
@@ -160,10 +163,6 @@ def identity_conflict_response(
     return response
 
 
-_RUNTIME_CONTROLS: WeakKeyDictionary[object, OAuthControl] = WeakKeyDictionary()
-_RUNTIME_CONTROLS_LOCK = RLock()
-
-
 class StrictOAuthQueryRoute(APIRoute):
     """Reject undeclared query keys before auth/control dependencies run."""
 
@@ -189,14 +188,8 @@ class StrictOAuthQueryRoute(APIRoute):
 def get_oauth_control_dependency(
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
 ) -> OAuthControl:
-    """Return one flow/plan-preserving control bound to this runtime audit sink."""
-    key = runtime.audit_sink
-    with _RUNTIME_CONTROLS_LOCK:
-        control = _RUNTIME_CONTROLS.get(key)
-        if control is None:
-            control = OAuthControl(audit_sink=key)
-            _RUNTIME_CONTROLS[key] = control
-        return control
+    """Return the flow/plan-preserving control owned by this runtime."""
+    return get_management_control_owner(runtime).oauth
 
 
 def meta(request: Request) -> ResponseMeta:

@@ -17,6 +17,7 @@ from src.management_control.load_balancing import (
 
 from ..dependencies import (
     ManagementRuntime,
+    get_management_control_owner,
     get_management_runtime,
     require_capability,
 )
@@ -64,7 +65,7 @@ _REORDER_ERRORS = (
 def get_load_balancing_control(
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
 ) -> LoadBalancingControl:
-    return LoadBalancingControl(audit_sink=runtime.audit_sink)
+    return get_management_control_owner(runtime).load_balancing
 
 
 def _load_balancing(item: LoadBalancingRecord) -> LoadBalancingData:

@@ -57,6 +57,7 @@ from src.management_auth import (
     SessionService,
 )
 from src.management_control import OperationRegistry, OperationStore, StoreAuditSink
+from src.management_control.composition import ManagementControls
 from src.protocols import errors as protocol_errors
 from src.openai.codex_constants import codex_cli_version
 from src.transform.cc_mimicry import (
@@ -99,6 +100,67 @@ async def _throttled_notify(alert_key: str, text: str) -> None:
 # ─── 后台循环 ─────────────────────────────────────────────────────
 
 _background_tasks: list[asyncio.Task] = []
+_telegram_control_defaults: tuple[tuple[object, str, object], ...] | None = None
+
+
+def _telegram_control_bindings(controls: ManagementControls):
+    observability = controls.observability
+    auxiliary = controls.auxiliary
+    system = controls.system
+    return (
+        (tgbot.main_menu, "_CONTROL", observability.status),
+        (tgbot.status_menu, "_CONTROL", observability.status),
+        (tgbot.stats_menu, "_CONTROL", observability.stats),
+        (tgbot.menu_cache, "_STATS_CONTROL", observability.stats),
+        (tgbot.logs_menu, "_CONTROL", observability.logs),
+        (tgbot.media_logs_menu, "_CONTROL", observability.media),
+        (tgbot.mapping_menu, "mapping_control", controls.mapping),
+        (tgbot.mapping_menu, "compact_rescue", controls.mapping),
+        (tgbot.load_balancing_menu, "load_balancing_control", controls.load_balancing),
+        (tgbot.proxy_menu, "proxy_control", controls.proxy),
+        (tgbot.channel_menu, "_CONTROL", controls.channels),
+        (tgbot.apikey_menu, "_CONTROL", controls.api_keys),
+        (tgbot.oauth_menu, "oauth_control", controls.oauth),
+        (tgbot.oauth_account_models_menu, "oauth_control", controls.oauth),
+        (tgbot.oauth_defaults_menu, "oauth_control", controls.oauth),
+        (tgbot.translation_menu, "_CONTROL", auxiliary.translation),
+        (tgbot.status_alert_menu, "_CONTROL", auxiliary.status_alerts),
+        (tgbot.update_menu, "_CONTROL", auxiliary.updates),
+        (tgbot.image_menu, "_CONTROL", auxiliary.images),
+        (tgbot.xai_imagine_menu, "_CONTROL", auxiliary.xai_media),
+        (tgbot.system_menu, "_settings_control", system.settings),
+        (tgbot.system_menu, "_blacklist_control", system.blacklist),
+        (tgbot.system_menu, "_network_control", system.network),
+        (tgbot.system_menu, "_runtime_control", controls.system_runtime),
+        (tgbot.system_menu, "_load_balancing_control", controls.load_balancing),
+        (tgbot.system_menu, "_retention_control", controls.telegram_retention),
+    )
+
+
+def _bind_telegram_management_controls(controls: ManagementControls) -> None:
+    """Publish the runtime-owned controls to the already-imported TG adapters."""
+    global _telegram_control_defaults
+    bindings = _telegram_control_bindings(controls)
+    if _telegram_control_defaults is None:
+        _telegram_control_defaults = tuple(
+            (module, attribute, getattr(module, attribute))
+            for module, attribute, _value in bindings
+        )
+    for module, attribute, value in bindings:
+        setattr(module, attribute, value)
+
+
+def _unbind_telegram_management_controls(controls: ManagementControls | None) -> None:
+    """Remove only the closing lifecycle's bindings; never retain its owner."""
+    if controls is None or _telegram_control_defaults is None:
+        return
+    expected = {
+        (id(module), attribute): value
+        for module, attribute, value in _telegram_control_bindings(controls)
+    }
+    for module, attribute, fallback in _telegram_control_defaults:
+        if getattr(module, attribute, None) is expected[(id(module), attribute)]:
+            setattr(module, attribute, fallback)
 
 
 class _TelegramApprovalNotifier:
@@ -126,6 +188,7 @@ def _management_telegram_configured() -> bool:
 def _initialize_management_runtime(app: FastAPI) -> ManagementRuntime | None:
     """Build the isolated management plane; any local failure stays fail closed."""
     store = None
+    controls = None
     try:
         settings = config.management_settings()
         store = ManagementStateStore(
@@ -173,6 +236,10 @@ def _initialize_management_runtime(app: FastAPI) -> ManagementRuntime | None:
             application_version=__version__,
             documentation_url="/docs",
         )
+        controls = runtime.control_owner()
+        _bind_telegram_management_controls(controls)
+        app.state.management_controls = controls
+        app.state.management_controls_runtime = runtime
         app.state.management_runtime = runtime
 
         def decide(approval_id: str, telegram_user_id: int, approved: bool) -> str:
@@ -191,12 +258,16 @@ def _initialize_management_runtime(app: FastAPI) -> ManagementRuntime | None:
         print("[management] control plane ready")
         return runtime
     except Exception as exc:
+        if isinstance(controls, ManagementControls):
+            _unbind_telegram_management_controls(controls)
         if store is not None:
             try:
                 store.close()
             except Exception:
                 pass
         app.state.management_runtime = None
+        app.state.management_controls = None
+        app.state.management_controls_runtime = None
         tgbot.configure_management_approval_handler(None)
         # Exception text can contain a configured path or credential; type is enough.
         print(f"[management] initialization failed closed ({type(exc).__name__})")
@@ -205,10 +276,24 @@ def _initialize_management_runtime(app: FastAPI) -> ManagementRuntime | None:
 
 async def _close_management_runtime(app: FastAPI) -> None:
     runtime = getattr(app.state, "management_runtime", None)
+    controls = getattr(app.state, "management_controls", None)
     app.state.management_runtime = None
+    app.state.management_controls = None
+    app.state.management_controls_runtime = None
+    if isinstance(controls, ManagementControls):
+        _unbind_telegram_management_controls(controls)
     tgbot.configure_management_approval_handler(None)
     if not isinstance(runtime, ManagementRuntime):
         return
+    for name in (
+        "management_channel_control", "management_apikey_control",
+        "management_auxiliary_controls", "management_observability_controls",
+        "management_system_network_controls",
+    ):
+        owner_name = name + "_runtime"
+        if getattr(app.state, owner_name, None) is runtime:
+            setattr(app.state, name, None)
+            setattr(app.state, owner_name, None)
     try:
         await runtime.aclose()
     except Exception as exc:
@@ -495,6 +580,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.state.management_runtime = None
+app.state.management_controls = None
+app.state.management_controls_runtime = None
 install_management_routers(app)
 install_management_error_handlers(app)
 

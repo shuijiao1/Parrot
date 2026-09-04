@@ -808,10 +808,10 @@ OpenAPI 中 `/api/management/v1` 的 operationId 集合必须与第 4～12 节�
 建议固定：
 
 ```text
-src/tests/fixtures/management_api/v1-operation-ids.txt
+src/tests/fixtures/management_api/production-operation-ids.txt
 ```
 
-测试从 `/openapi.json` 提取实际集合与其逐行比较。
+测试从 `/openapi.json` 提取实际集合与其逐行比较。`v1-operation-ids.txt` 仅是 P0/foundation 的 9-operation 基础清单，不是完整生产 operation 清单。
 
 ### 15.2 operation 功能测试与横切门禁
 

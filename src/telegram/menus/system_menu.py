@@ -14,13 +14,15 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
-from ... import apikey_limiter, concurrency, config, load_balancing, log_db, network, network_monitor, state_db
-from ...channel import registry
+from ...management_control.load_balancing import (
+    load_balancing_control as DEFAULT_LOAD_BALANCING_CONTROL,
+)
 from ...management_control.network import DEFAULT_NETWORK_CONTROL
 from ...management_control.observability.common import telegram_context
 from ...management_control.system import (
     DEFAULT_CONTENT_BLACKLIST_CONTROL,
     DEFAULT_SETTINGS_CONTROL,
+    DEFAULT_SYSTEM_RUNTIME_CONTROL,
     DEFAULT_TELEGRAM_RETENTION_ADAPTER,
 )
 from .. import states, ui
@@ -35,6 +37,19 @@ _retention_pending: dict[str, dict] = {}
 _settings_control = DEFAULT_SETTINGS_CONTROL
 _blacklist_control = DEFAULT_CONTENT_BLACKLIST_CONTROL
 _network_control = DEFAULT_NETWORK_CONTROL
+_runtime_control = DEFAULT_SYSTEM_RUNTIME_CONTROL
+_load_balancing_control = DEFAULT_LOAD_BALANCING_CONTROL
+# Frozen TG tests patch these module objects. Production menu calls still cross
+# only the Controls above; the aliases retain the established deterministic seam.
+config = _runtime_control.config
+log_db = _runtime_control.log_db
+network = _runtime_control.network
+network_monitor = _runtime_control.network_monitor
+state_db = _runtime_control.state_db
+concurrency = _runtime_control.concurrency
+apikey_limiter = _runtime_control.apikey_limiter
+load_balancing = _load_balancing_control.backend
+registry = _load_balancing_control.channel_registry
 _retention_control = DEFAULT_TELEGRAM_RETENTION_ADAPTER
 
 
@@ -94,11 +109,11 @@ def _merge_proxy_stats_for_system(names, stats_map: dict[str, dict]) -> dict:
 # ─── 主菜单 ───────────────────────────────────────────────────────
 
 def _main_text_and_kb() -> tuple[str, dict]:
-    cfg = config.get()
+    cfg = _runtime_control.config_snapshot()
     t = cfg.get("timeouts") or {}
     sc = cfg.get("scoring") or {}
     aff = cfg.get("affinity") or {}
-    retention = log_db.retention_policy(cfg)
+    retention = _runtime_control.retention_policy(cfg)
     retention_label = (
         "全部保留"
         if retention["mode"] == "forever"
@@ -130,7 +145,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
         f"评分: α={sc.get('emaAlpha', 0.25)} · 窗口={sc.get('recentWindow', 50)} · "
         f"惩罚={sc.get('errorPenaltyFactor', 8)} · 探索={sc.get('explorationRate', 0.2)}\n"
         f"亲和: TTL={aff.get('ttlMinutes', 30)}min\n"
-        f"调度: <code>{load_balancing.display_mode(cfg.get('channelSelection', 'smart'))}</code>\n"
+        f"调度: <code>{_load_balancing_control.display_mode(cfg.get('channelSelection', 'smart'))}</code>\n"
         f"WS模式: HTTP→WS 上游转换 <code>{ws_mode_label}</code>\n"
         f"请求日志留存: <code>{retention_label}</code>\n"
     )
@@ -212,7 +227,7 @@ _RETRY_RECOVERY_EVENTS = [
 
 
 def _retry_sections() -> tuple[dict, dict]:
-    retry = config.get().get("retry") or {}
+    retry = _runtime_control.config_snapshot().get("retry") or {}
     if not isinstance(retry, dict):
         retry = {}
     transient = retry.get("transient") or {}
@@ -502,8 +517,8 @@ def _pop_retention_pending(code: str, chat_id: int, kind: str | None = None) -> 
 
 
 def _retention_menu_text_kb() -> tuple[str, dict]:
-    cfg = config.get()
-    policy = log_db.retention_policy(cfg)
+    cfg = _runtime_control.config_snapshot()
+    policy = _runtime_control.retention_policy(cfg)
     store_bodies = cfg.get("logStoreBodies", True) is not False
     if policy["mode"] == "days":
         policy_lines = [
@@ -534,7 +549,7 @@ def _retention_menu_text_kb() -> tuple[str, dict]:
         "",
         "<i>按天留存最少 1 天、无业务上限。整月过期库会删除文件；边界月会精确删除旧记录并压缩数据库以释放磁盘。</i>",
     ]
-    if log_db.retention_cleanup_busy():
+    if _runtime_control.retention_cleanup_busy():
         lines.extend(["", "⏳ <i>日志留存清理正在执行，完成前不能切换策略。</i>"])
     rows: list[list[dict]] = []
     if policy["mode"] == "days":
@@ -559,7 +574,7 @@ def _show_retention(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _toggle_log_store_bodies(chat_id: int, message_id: int, cb_id: str) -> None:
-    current = config.get().get("logStoreBodies", True) is not False
+    current = _runtime_control.config_snapshot().get("logStoreBodies", True) is not False
     new_value = not current
     _retention_control.set_log_store_bodies(_control_context(chat_id), new_value)
     ui.answer_cb(
@@ -572,11 +587,11 @@ def _toggle_log_store_bodies(chat_id: int, message_id: int, cb_id: str) -> None:
 
 def _edit_retention_days(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    if log_db.retention_cleanup_busy():
+    if _runtime_control.retention_cleanup_busy():
         ui.edit(chat_id, message_id, "⏳ 日志留存清理正在执行，完成后再修改策略。",
                 reply_markup=ui.inline_kb([[ui.btn("◀ 返回数据留存", "sys:show:retention")]]))
         return
-    policy = log_db.retention_policy()
+    policy = _runtime_control.retention_policy()
     current = (
         f"当前为按天留存，保留 <code>{int(policy['days'])}</code> 天。请输入新的保留天数："
         if policy["mode"] == "days"
@@ -605,7 +620,7 @@ def _on_retention_days_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, "❌ 最少保留 1 天，请重新输入：")
         return
     states.pop_state(chat_id)
-    current = log_db.retention_policy()
+    current = _runtime_control.retention_policy()
     if current["mode"] == "days":
         old_days = int(current["days"])
         if days == old_days:
@@ -858,7 +873,7 @@ def _cancel_retention(chat_id: int, message_id: int, cb_id: str, code: str | Non
 
 def _show_timeouts(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    t = config.get().get("timeouts") or {}
+    t = _runtime_control.config_snapshot().get("timeouts") or {}
     text = (
         "⏱ <b>超时设置</b>\n\n"
         f"连接最大时长: <code>{t.get('connect', 10)}s</code>\n"
@@ -914,7 +929,7 @@ def _on_timeouts_input(chat_id: int, text: str) -> None:
 
 def _show_errwin(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    cfg = config.get()
+    cfg = _runtime_control.config_snapshot()
     win = cfg.get("errorWindows") or []
     grace = int(cfg.get("oauthGraceCount", 3))
     ladder_interval = int(cfg.get("cooldownLadderMinIntervalSeconds", 30))
@@ -1082,7 +1097,7 @@ _SCORING_FIELDS = {
 
 def _show_scoring(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    sc = config.get().get("scoring") or {}
+    sc = _runtime_control.config_snapshot().get("scoring") or {}
     lines = ["🎯 <b>评分参数</b>", ""]
     rows: list[list[dict]] = []
     for k, (label, _kind, _rng) in _SCORING_FIELDS.items():
@@ -1140,7 +1155,7 @@ _AFFINITY_FIELDS = {
 
 def _show_affinity(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    a = config.get().get("affinity") or {}
+    a = _runtime_control.config_snapshot().get("affinity") or {}
     lines = ["🔗 <b>亲和绑定参数</b>", ""]
     rows: list[list[dict]] = []
     for k, (label, _kind, _rng) in _AFFINITY_FIELDS.items():
@@ -1192,7 +1207,7 @@ _CCH_MODES = ("disabled", "dynamic")
 
 def _show_cch(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    cfg = config.get()
+    cfg = _runtime_control.config_snapshot()
     mode = cfg.get("cchMode", "disabled")
     text = (
         "🎭 <b>CCH 模式（Claude Code 伪装）</b>\n\n"
@@ -1223,7 +1238,7 @@ def _on_cch_set(chat_id: int, message_id: int, cb_id: str, mode: str) -> None:
 
 def _show_chsel(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    mode = config.get().get("channelSelection", "smart")
+    mode = _runtime_control.config_snapshot().get("channelSelection", "smart")
     text = (
         "🚦 <b>渠道选择模式</b>\n\n"
         f"当前: <code>{mode}</code>\n\n"
@@ -1245,12 +1260,13 @@ def _on_chsel_set(chat_id: int, message_id: int, cb_id: str, mode: str) -> None:
         ui.answer_cb(cb_id, "无效模式")
         return
     try:
-        load_balancing.set_mode(mode)
+        _load_balancing_control.bind_telegram_actor(chat_id)
+        _load_balancing_control.set_mode(mode)
     except Exception as exc:
         ui.answer_cb(cb_id, "切换失败")
         ui.send(chat_id, f"❌ 切换失败: <code>{ui.escape_html(str(exc))}</code>")
         return
-    ui.answer_cb(cb_id, f"已切换到 {load_balancing.display_mode(mode)}")
+    ui.answer_cb(cb_id, f"已切换到 {_load_balancing_control.display_mode(mode)}")
     load_balancing_menu.show(chat_id, message_id)
 
 
@@ -1258,7 +1274,7 @@ def _on_chsel_set(chat_id: int, message_id: int, cb_id: str, mode: str) -> None:
 
 def _show_quota(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    qm = config.get().get("quotaMonitor") or {}
+    qm = _runtime_control.config_snapshot().get("quotaMonitor") or {}
     enabled = bool(qm.get("enabled", False))
     interval = int(qm.get("intervalSeconds", 60))
     threshold = float(qm.get("disableThresholdPercent", 95))
@@ -1285,7 +1301,7 @@ def _show_quota(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _on_quota_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
-    cur = bool((config.get().get("quotaMonitor") or {}).get("enabled", False))
+    cur = bool((_runtime_control.config_snapshot().get("quotaMonitor") or {}).get("enabled", False))
     new_val = not cur
     _settings_control.update_quota_monitor(
         _control_context(chat_id), {"enabled": new_val},
@@ -1377,7 +1393,7 @@ _NOTIF_EVENTS = [
 
 def _show_notif(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    notif = config.get().get("notifications") or {}
+    notif = _runtime_control.config_snapshot().get("notifications") or {}
     enabled = bool(notif.get("enabled", True))
     events = notif.get("events") or {}
 
@@ -1406,7 +1422,7 @@ def _show_notif(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _on_notif_toggle_main(chat_id: int, message_id: int, cb_id: str) -> None:
-    cur = bool((config.get().get("notifications") or {}).get("enabled", True))
+    cur = bool((_runtime_control.config_snapshot().get("notifications") or {}).get("enabled", True))
     new_val = not cur
     _settings_control.update_notifications(
         _control_context(chat_id), {"enabled": new_val},
@@ -1420,7 +1436,7 @@ def _on_notif_toggle_event(chat_id: int, message_id: int, cb_id: str, event_key:
     if event_key not in valid_keys:
         ui.answer_cb(cb_id, "未知事件")
         return
-    notif = config.get().get("notifications") or {}
+    notif = _runtime_control.config_snapshot().get("notifications") or {}
     events = notif.get("events") or {}
     cur = bool(events.get(event_key, True))
     new_val = not cur
@@ -1443,7 +1459,7 @@ def _on_notif_toggle_event(chat_id: int, message_id: int, cb_id: str, event_key:
 
 def _show_blacklist(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    bl = config.get().get("contentBlacklist") or {}
+    bl = _runtime_control.config_snapshot().get("contentBlacklist") or {}
     defaults = list(bl.get("default") or [])
     by_ch = bl.get("byChannel") or {}
 
@@ -1503,7 +1519,7 @@ def _on_bl_add_default_input(chat_id: int, text: str) -> None:
 
 def _bl_del_default(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    defaults = list((config.get().get("contentBlacklist") or {}).get("default") or [])
+    defaults = list((_runtime_control.config_snapshot().get("contentBlacklist") or {}).get("default") or [])
     if not defaults:
         ui.edit(chat_id, message_id, "(无默认黑名单可删除)",
                 reply_markup=ui.inline_kb([[ui.btn("◀ 返回", "sys:show:blacklist")]]))
@@ -1564,7 +1580,7 @@ def _on_bl_add_ch_input(chat_id: int, text: str) -> None:
 # ─── 网络设置 ───────────────────────────────────────────────────
 
 def _network_summary() -> tuple[list[str], dict, dict, list[str]]:
-    cfg = config.get()
+    cfg = _runtime_control.config_snapshot()
     net = cfg.get("network") or {}
     dns_cfg = net.get("dns") or {}
     s5_cfg = net.get("socks5") or {}
@@ -1590,8 +1606,7 @@ def _network_summary() -> tuple[list[str], dict, dict, list[str]]:
         f"🔀 代理: <code>{proxy_count}</code> 个",
     ]
     # Top proxy stats. Show all proxy rows so group totals are not truncated.
-    from ... import log_db
-    pstats = log_db.proxy_stats(limit=1000)
+    pstats = _runtime_control.proxy_stats(limit=1000)
     pstats_by_name = {p["proxy_name"]: p for p in pstats}
 
     def _fmt_ms(ms):
@@ -1672,7 +1687,7 @@ def _show_network(chat_id: int, message_id: int, cb_id: str) -> None:
 def _show_dns_cache(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     try:
-        entries = network.dns_cache_entries()
+        entries = _runtime_control.dns_cache_entries()
     except Exception as exc:
         ui.edit(
             chat_id, message_id,
@@ -1685,7 +1700,7 @@ def _show_dns_cache(chat_id: int, message_id: int, cb_id: str) -> None:
         return
     ttl = 0
     try:
-        ttl = int((config.get().get("network", {}).get("dns", {}) or {}).get("cacheTtlSeconds", 300) or 0)
+        ttl = int((_runtime_control.config_snapshot().get("network", {}).get("dns", {}) or {}).get("cacheTtlSeconds", 300) or 0)
     except Exception:
         ttl = 0
     lines = [
@@ -1729,7 +1744,7 @@ def _clear_dns_cache(chat_id: int, message_id: int, cb_id: str) -> None:
 
 def _edit_dns(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    servers = network.dns_servers()
+    servers = _runtime_control.dns_servers()
     states.set_state(chat_id, "sys_net_dns")
     ui.edit(
         chat_id, message_id,
@@ -1762,10 +1777,10 @@ def _on_dns_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, f"❌ DNS 检测异常：<code>{ui.escape_html(exc)}</code>")
         return
 
-    state_data = network.dumps_state({"servers": servers, "test": test})
+    state_data = _runtime_control.dumps_network_state({"servers": servers, "test": test})
     states.set_state(chat_id, "sys_net_dns_confirm", state_data)
     ok = bool(test.get("ok"))
-    text_out = network.dns_test_text(test) + "\n\n" + (
+    text_out = _runtime_control.dns_test_text(test) + "\n\n" + (
         "是否立即保存？" if ok else "是否仍然保存？"
     )
     rows = [
@@ -1807,7 +1822,7 @@ def _save_dns_confirm(chat_id: int, message_id: int, cb_id: str, *, force: bool)
         reply_markup=ui.inline_kb([[ui.btn("◀ 返回网络设置", "sys:show:network")]]),
     )
     if force:
-        warn = network.failure_warning("dns", test)
+        warn = _runtime_control.failure_warning("dns", test)
         if warn:
             ui.send(chat_id, ui.escape_html(warn))
 
@@ -1829,13 +1844,13 @@ def _sync_dns(chat_id: int, message_id: int, cb_id: str) -> None:
 
 def _edit_socks5(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    s5 = network.socks5_cfg()
+    s5 = _runtime_control.socks5_config()
     cur = str(s5.get("url") or "").strip()
     states.set_state(chat_id, "sys_net_socks5")
     ui.edit(
         chat_id, message_id,
         "设置 SOCKS5 代理\n\n"
-        f"当前代理：<code>{ui.escape_html(network.mask_url(cur)) if cur else '未设置'}</code>\n"
+        f"当前代理：<code>{ui.escape_html(_runtime_control.mask_network_url(cur)) if cur else '未设置'}</code>\n"
         "请输入 SOCKS5 地址\n\n"
         "支持：\n"
         "<code>socks5://127.0.0.1:1080</code>\n"
@@ -1863,10 +1878,10 @@ def _on_socks5_input(chat_id: int, text: str) -> None:
     except Exception as exc:
         ui.send(chat_id, f"❌ SOCKS5 检测异常：<code>{ui.escape_html(exc)}</code>")
         return
-    state_data = network.dumps_state({"url": norm.url, "test": test})
+    state_data = _runtime_control.dumps_network_state({"url": norm.url, "test": test})
     states.set_state(chat_id, "sys_net_socks5_confirm", state_data)
     ok = bool(test.get("ok"))
-    text_out = network.socks5_test_text(test) + "\n\n" + (
+    text_out = _runtime_control.socks5_test_text(test) + "\n\n" + (
         "是否立即保存并启用？" if ok else "是否仍然保存并启用？"
     )
     rows = [[ui.btn("✅ 保存并启用", "sys:net:socks5_save")]]
@@ -1902,17 +1917,17 @@ def _save_socks5_confirm(chat_id: int, message_id: int, cb_id: str, *, force: bo
     ui.answer_cb(cb_id, "已保存并启用")
     ui.edit(
         chat_id, message_id,
-        f"✅ SOCKS5 已保存并启用：<code>{ui.escape_html(network.mask_url(saved))}</code>",
+        f"✅ SOCKS5 已保存并启用：<code>{ui.escape_html(_runtime_control.mask_network_url(saved))}</code>",
         reply_markup=ui.inline_kb([[ui.btn("◀ 返回网络设置", "sys:show:network")]]),
     )
     if force:
-        warn = network.failure_warning("socks5", test)
+        warn = _runtime_control.failure_warning("socks5", test)
         if warn:
             ui.send(chat_id, ui.escape_html(warn))
 
 
 def _toggle_socks5(chat_id: int, message_id: int, cb_id: str) -> None:
-    s5 = network.socks5_cfg()
+    s5 = _runtime_control.socks5_config()
     url = str(s5.get("url") or "").strip()
     enabled = bool(s5.get("enabled")) and bool(url)
     if not enabled and not url:
@@ -1929,7 +1944,7 @@ def _toggle_socks5(chat_id: int, message_id: int, cb_id: str) -> None:
 # ─── 网络检测 ───────────────────────────────────────────────────
 
 def _mon_cfg() -> dict:
-    return network_monitor.cfg()
+    return _runtime_control.monitor_config()
 
 
 def _mon_on(v: bool) -> str:
@@ -1947,7 +1962,7 @@ def _mon_core_label(key: str, *, rich: bool = False) -> str:
 
 
 def _mon_last_lines(limit: int = 12) -> list[str]:
-    rows = state_db.network_check_load_all()
+    rows = _runtime_control.network_checks()
     if not rows:
         return ["<i>暂无检测记录。</i>"]
     out: list[str] = []
@@ -1974,7 +1989,7 @@ def _show_monitor(chat_id: int, message_id: int, cb_id: str) -> None:
     c = _mon_cfg()
     ch_cfg = c.get("channels") or {}
     core = c.get("core") or {}
-    failures = network_monitor.active_failures()
+    failures = _runtime_control.active_monitor_failures()
     lines = [
         "🩺 <b>网络检测</b>",
         "",
@@ -1984,7 +1999,7 @@ def _show_monitor(chat_id: int, message_id: int, cb_id: str) -> None:
         "",
         f"DNS 检测: <code>{_mon_on(bool(c.get('dns')))}</code>",
         f"SOCKS5 检测: <code>{_mon_on(bool(c.get('socks5')))}</code>",
-        f"渠道连接性: <code>{_mon_on(bool(ch_cfg.get('enabled')))}</code> · 已选 {len(network_monitor.enabled_channel_keys())} 个",
+        f"渠道连接性: <code>{_mon_on(bool(ch_cfg.get('enabled')))}</code> · 已选 {len(_runtime_control.enabled_monitor_channels())} 个",
         "核心上游: " + " · ".join(
             f"{_mon_core_label(k, rich=True)} {'✅' if core.get(k) else '🚫'}"
             for k in ("openai", "claude", "cloudflare")
@@ -2094,7 +2109,7 @@ def _show_monitor_channels(chat_id: int, message_id: int, cb_id: str) -> None:
     total_on = bool(ch_cfg.get("enabled", False))
     by_key = ch_cfg.get("byKey") or {}
     # 只显示 API 类型渠道；OAuth 走专门的 OAuth 状态监控，不在网络检测里
-    channels = [ch for ch in registry.all_channels() if getattr(ch, "type", "") == "api"]
+    channels = [ch for ch in _load_balancing_control.all_channels() if getattr(ch, "type", "") == "api"]
     lines = [
         "🔌 <b>渠道连接性检测</b>",
         "",
@@ -2109,13 +2124,13 @@ def _show_monitor_channels(chat_id: int, message_id: int, cb_id: str) -> None:
             label = ui.escape_html(getattr(ch, "display_name", ch.key))
             # API 渠道无法锁定具体 Provider；展示它兼容的协议家族 rich tag。
             try:
-                fam = load_balancing.family_for_channel(ch)
+                fam = _load_balancing_control.family_for_channel(ch)
             except Exception:
                 fam = ""
             fam_tag = ui.family_tag(fam) if fam else ""
             # 第二行展示该渠道的探测 URL，便于一眼判断打的是哪个上游
             try:
-                probe_url = network_monitor._channel_probe_url(ch)
+                probe_url = _runtime_control.channel_probe_url(ch)
             except Exception:
                 probe_url = ""
             head = f"{'✅' if on else '🚫'} {label}"
@@ -2149,7 +2164,7 @@ def _mon_channel_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -
         ui.answer_cb(cb_id, "短码已失效")
         return
     key = full[len("monch:"):]
-    cur = network_monitor.channel_enabled(key)
+    cur = _runtime_control.monitor_channel_enabled(key)
     _network_control.telegram_set_monitor_channel(
         _control_context(chat_id), key, not cur,
     )
@@ -2167,7 +2182,7 @@ def _run_monitor_now(chat_id: int, message_id: int, cb_id: str) -> None:
     except Exception as exc:
         ui.edit(chat_id, message_id, f"❌ 网络检测异常：<code>{ui.escape_html(exc)}</code>", reply_markup=ui.inline_kb([[ui.btn("◀ 返回网络检测", "sys:mon:show")]]))
         return
-    ui.edit(chat_id, message_id, ui.truncate(network_monitor.format_results(results)), reply_markup=ui.inline_kb([[ui.btn("◀ 返回网络检测", "sys:mon:show")]]))
+    ui.edit(chat_id, message_id, ui.truncate(_runtime_control.format_monitor_results(results)), reply_markup=ui.inline_kb([[ui.btn("◀ 返回网络检测", "sys:mon:show")]]))
 
 
 # ─── 路由 ─────────────────────────────────────────────────────────
@@ -2362,14 +2377,13 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
 
 def _show_concurrency(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    cfg = config.get()
+    cfg = _runtime_control.config_snapshot()
     cc_cfg = cfg.get("concurrency") or {}
     enabled = bool(cc_cfg.get("enabled", True))
     queue_wait = int(cc_cfg.get("queueWaitSeconds", 30))
     default_max = int(cc_cfg.get("defaultMaxConcurrent", 0))
 
-    totals = concurrency.totals()
-    snap = concurrency.snapshot()
+    totals, snap = _runtime_control.concurrency_runtime()
 
     lines = [
         "⚡ <b>渠道并发限制</b>",
@@ -2426,7 +2440,7 @@ def _show_concurrency(chat_id: int, message_id: int, cb_id: str) -> None:
 
 def _on_cc_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id, "已切换")
-    cfg = config.get()
+    cfg = _runtime_control.config_snapshot()
     cur = bool((cfg.get("concurrency") or {}).get("enabled", True))
     new_val = not cur
     _settings_control.update_concurrency(
@@ -2522,14 +2536,13 @@ def _parse_aklim_duration(text: str) -> int:
 
 def _show_aklim(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    cfg = config.get()
+    cfg = _runtime_control.config_snapshot()
     ak_cfg = cfg.get("apiKeyConcurrency") or {}
     enabled = bool(ak_cfg.get("enabled", True))
     default_max = int(ak_cfg.get("defaultMaxConcurrent", 5))
     default_queue = int(ak_cfg.get("defaultMaxQueue", 50))
     default_wait = int(ak_cfg.get("defaultQueueWaitSeconds", 1800))
-    totals = apikey_limiter.totals()
-    snap = apikey_limiter.snapshot()
+    totals, snap = _runtime_control.api_key_runtime()
     lines = [
         "🔑 <b>API Key 默认限流</b>",
         "",
@@ -2568,7 +2581,7 @@ def _show_aklim(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _on_aklim_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
-    cfg = config.get()
+    cfg = _runtime_control.config_snapshot()
     cur = bool((cfg.get("apiKeyConcurrency") or {}).get("enabled", True))
     _settings_control.update_api_key_concurrency(
         _control_context(chat_id), {"enabled": not cur},
@@ -2614,7 +2627,7 @@ def _on_aklim_input(chat_id: int, action: str, text: str) -> None:
 
 
 def _ws_mode_enabled() -> bool:
-    return bool((config.get().get("openai") or {}).get("responsesUpstreamWsForOAuth", False))
+    return bool((_runtime_control.config_snapshot().get("openai") or {}).get("responsesUpstreamWsForOAuth", False))
 
 
 def _show_ws_mode(chat_id: int, message_id: int, cb_id: str) -> None:

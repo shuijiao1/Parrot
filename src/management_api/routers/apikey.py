@@ -24,6 +24,7 @@ from src.management_control.apikey import (
 from ._strict_query import reject_unknown_query_parameters
 from ..dependencies import (
     ManagementRuntime,
+    get_management_control_owner,
     get_management_runtime,
     management_request_id,
     require_capability,
@@ -151,7 +152,7 @@ def get_api_key_control(
         owner = getattr(request.app.state, "management_apikey_control_runtime", None)
         if isinstance(current, ApiKeyControl) and (owner is None or owner is runtime):
             return current
-        current = ApiKeyControl(audit_sink=runtime.audit_sink)
+        current = get_management_control_owner(runtime).api_keys
         request.app.state.management_apikey_control = current
         request.app.state.management_apikey_control_runtime = runtime
         return current

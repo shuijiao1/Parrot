@@ -17,6 +17,7 @@ from src.management_control.proxy import (
 
 from ..dependencies import (
     ManagementRuntime,
+    get_management_control_owner,
     get_management_runtime,
     management_request_id,
     require_capability,
@@ -82,7 +83,7 @@ _PROBE_ERRORS = (
 def get_proxy_control(
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
 ) -> ProxyControl:
-    return ProxyControl(audit_sink=runtime.audit_sink, operation_store=runtime.operations)
+    return get_management_control_owner(runtime).proxy
 
 
 def _page_meta(request: Request, result) -> MappingListMeta:

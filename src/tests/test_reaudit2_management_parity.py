@@ -326,90 +326,50 @@ def _concurrent_calls(call):
         return [future.result(timeout=10) for future in futures]
 
 
-def test_p03_channel_first_binding_publishes_one_control_and_registers_once(monkeypatch):
+def test_p03_channel_binding_publishes_the_runtime_owned_control(monkeypatch):
     app = SimpleNamespace(state=SimpleNamespace())
-    registry = _Registry()
-    runtime = SimpleNamespace(operation_registry=registry, operations=object(), audit_sink=object())
-    constructions = []
+    control = SimpleNamespace(plan_owner="runtime")
+    owner = SimpleNamespace(channels=control)
+    runtime = SimpleNamespace(control_owner=lambda: owner)
 
-    class Control:
-        def __init__(self, *, operation_registry, operation_store, audit_sink):
-            del operation_store, audit_sink
-            constructions.append(len(constructions) + 1)
-            self.plan_owner = constructions[-1]
-            operation_registry.register("channel.probe", lambda: None)
-
-    monkeypatch.setattr(channels, "ChannelControl", Control)
     monkeypatch.setattr(channels, "_BIND_LOCK", _BarrierLock())
     request = SimpleNamespace(app=app)
     results = _concurrent_calls(lambda: channels.get_channel_control(request, runtime))
 
-    assert constructions == [1]
-    assert results[0] is results[1] is app.state.management_channel_control
-    assert results[0].plan_owner == 1
-    assert registry.kinds == ["channel.probe"]
+    assert results[0] is results[1] is control
+    assert app.state.management_channel_control is control
+    assert app.state.management_channel_control_runtime is runtime
 
 
-def test_p03_apikey_first_binding_preserves_the_single_plan_owner(monkeypatch):
+def test_p03_apikey_binding_preserves_the_runtime_plan_owner(monkeypatch):
     app = SimpleNamespace(state=SimpleNamespace())
-    runtime = SimpleNamespace(audit_sink=object())
-    constructions = []
+    control = SimpleNamespace(plans={"owner": "runtime"})
+    owner = SimpleNamespace(api_keys=control)
+    runtime = SimpleNamespace(control_owner=lambda: owner)
 
-    class Control:
-        def __init__(self, *, audit_sink):
-            del audit_sink
-            constructions.append(len(constructions) + 1)
-            self.plans = {"owner": constructions[-1]}
-
-    monkeypatch.setattr(apikey, "ApiKeyControl", Control)
     monkeypatch.setattr(apikey, "_BIND_LOCK", _BarrierLock())
     request = SimpleNamespace(app=app)
     results = _concurrent_calls(lambda: apikey.get_api_key_control(request, runtime))
 
-    assert constructions == [1]
-    assert results[0] is results[1] is app.state.management_apikey_control
-    assert results[0].plans == {"owner": 1}
+    assert results[0] is results[1] is control
+    assert app.state.management_apikey_control is control
+    assert app.state.management_apikey_control_runtime is runtime
 
 
-def test_p03_auxiliary_first_binding_publishes_one_control_and_registers_once(monkeypatch):
+def test_p03_auxiliary_binding_publishes_the_runtime_owned_bundle():
     app = SimpleNamespace(state=SimpleNamespace())
-    registry = _Registry()
-    runtime = SimpleNamespace(operation_registry=registry, operations=object(), audit_sink=object())
-    constructions = []
-
-    class Component:
-        def __init__(self, **_kwargs):
-            pass
-
-    class Controls:
-        def __init__(self, **_kwargs):
-            constructions.append(len(constructions) + 1)
-            self.plan_owner = constructions[-1]
-            self._bound = set()
-
-        def bind_operations(self, _store, operation_registry):
-            identity = id(operation_registry)
-            if identity not in self._bound:
-                operation_registry.register("auxiliary.probe", lambda: None)
-                self._bound.add(identity)
-
-    monkeypatch.setattr(auxiliary_support, "AuxiliaryControls", Controls)
-    for name in (
-        "TranslationControl",
-        "StatusAlertControl",
-        "UpdateControl",
-        "ImageControl",
-        "XaiMediaControl",
-    ):
-        monkeypatch.setattr(auxiliary_support, name, Component)
-    monkeypatch.setattr(auxiliary_support, "_BIND_LOCK", _BarrierLock())
+    controls = SimpleNamespace(plan_owner="runtime")
+    owner = SimpleNamespace(auxiliary=controls)
+    runtime = SimpleNamespace(control_owner=lambda: owner)
     request = SimpleNamespace(app=app)
-    results = _concurrent_calls(lambda: auxiliary_support.get_bound_auxiliary_controls(request, runtime))
 
-    assert constructions == [1]
-    assert results[0] is results[1] is app.state.management_auxiliary_controls
-    assert results[0].plan_owner == 1
-    assert registry.kinds == ["auxiliary.probe"]
+    results = _concurrent_calls(
+        lambda: auxiliary_support.get_bound_auxiliary_controls(request, runtime)
+    )
+
+    assert results[0] is results[1] is controls
+    assert app.state.management_auxiliary_controls is controls
+    assert app.state.management_auxiliary_controls_runtime is runtime
 
 
 def test_p04_prefix_collisions_keep_plain_fastapi_origin_and_validation_behavior():

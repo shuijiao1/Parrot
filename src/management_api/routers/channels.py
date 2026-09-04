@@ -34,6 +34,7 @@ from ..channels_security import redact_credential_text, strip_url_userinfo
 from ..dependencies import (
     ManagementRuntime,
     get_management_context,
+    get_management_control_owner,
     get_management_runtime,
     management_request_id,
 )
@@ -237,11 +238,7 @@ def get_channel_control(
         owner = getattr(request.app.state, "management_channel_control_runtime", None)
         if isinstance(current, ChannelControl) and (owner is None or owner is runtime):
             return current
-        current = ChannelControl(
-            operation_registry=runtime.operation_registry,
-            operation_store=runtime.operations,
-            audit_sink=runtime.audit_sink,
-        )
+        current = get_management_control_owner(runtime).channels
         request.app.state.management_channel_control = current
         request.app.state.management_channel_control_runtime = runtime
         return current

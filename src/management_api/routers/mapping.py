@@ -12,6 +12,7 @@ from src.management_control.mapping import MappingControl, MappingRecord
 
 from ..dependencies import (
     ManagementRuntime,
+    get_management_control_owner,
     get_management_runtime,
     management_request_id,
     require_capability,
@@ -61,7 +62,7 @@ _MUTATION_ERRORS = (
 def get_mapping_control(
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
 ) -> MappingControl:
-    return MappingControl(audit_sink=runtime.audit_sink, operation_store=runtime.operations)
+    return get_management_control_owner(runtime).mapping
 
 
 def _mapping(item: MappingRecord) -> MappingData:
