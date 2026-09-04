@@ -1,11 +1,13 @@
-# 13. Management Control / Management API 重构约束
+# 13. Management Control / Management API 重构实施与验收
 
-> 状态：**实施与验收的规范性合同（normative）**  
+> 状态：**以功能主线为优先的实施与验收文档**
 > 基线：`feature/management-api`，`b8ba47cc7568aee31fc2587354b5bc14d9773c9a`（v0.31.13）  
 > 范围：Shared Management Control、统一管理身份/授权、Management API Adapter，以及 Telegram Adapter 向共享控制层的等价迁移  
-> 不在范围：Web UI、推理 API 协议改造、配置格式迁移、Telegram UI 重设计
+> 不在范围：Web UI、推理 API 协议改造、配置格式迁移、Telegram UI 重设计、安全专项
 
-本文中的“必须”“禁止”“不得”是合并门禁，不是建议。若实现与本文冲突，应修改实现；不得以“Web UI 尚未开发”或“Telegram 看起来差不多”为理由降低标准。
+本文仍是本轮功能实施与验收依据，但条款有明确优先级：**v0.31.13 Telegram 原版行为完全一致**和**完整、真实可达的 Management API**优先，其次是两个 Adapter 共享同一控制层及权威业务副作用，最后才是本轮必要的基础认证与秘密字段边界。安全增强不得自行扩张范围、删减功能或把本轮改造成安全专项；第 4.6 节列出的后续加固候选不是本轮合并门禁。
+
+本文中的“必须”“禁止”“不得”仅在上述本轮范围及完成定义内构成门禁。不得以“Web UI 尚未开发”或“Telegram 看起来差不多”为理由降低功能标准，也不得以自设纵深安全要求阻断已经满足本轮功能与基础安全边界的实现。
 
 ---
 
@@ -32,20 +34,22 @@ Management API Adapter┘                 │
 
 两个 Adapter 只负责各自的传输、输入解析、输出渲染和交互状态；业务校验、配置变更、跨模块级联、运行时动作和查询编排只允许存在于 Shared Management Control 或现有业务模块中。
 
+本轮是 **API only**：不交付 Web UI，但 Management API 必须用 typed schema、稳定 operation 和可发现元数据表达完整管理能力，便于后续 Web 直接作为普通客户端使用，不需要再开私有捷径。
+
 ### 1.2 本轮 Done
 
 只有同时满足下列条件才算完成：
 
-1. `/api/management/v1` 下的版本化 Management API 已按第 5～12 节完整实现，并可由 OpenAPI 发现；
-2. 固定管理长密钥和 Telegram 带外批准均只能换取 Management Session；所有管理资源只接受有效 Session；
-3. Telegram 和 Management API 对同一管理动作调用同一个控制层用例，而不是各自复制业务逻辑；
-4. 第 14 节 Telegram 功能清单中的每项均有基线轨迹和重构后轨迹，所有 Telegram 方法、正文、按钮、`callback_data`、分页、状态流、确认、错误显示和业务副作用逐字节相同；
-5. 第 15 节 API 清单的每个 operationId 均有成功、校验失败、鉴权失败及关键副作用测试；
-6. 完整测试套件不低于已知基线 `2524 passed`，且新增门禁全部通过；
-7. 每个新增源码文件不超过 1000 行；依赖门禁未发现 Adapter 直连业务模块或反向依赖；
-8. 未读取、打印、写回或纳入 fixture 的真实密钥、真实 OAuth 账号、Telegram token 或真实日志正文。
+1. `/api/management/v1` 下第 4～12 节列出的 Management API 已完整实现，可由 OpenAPI 发现，并由实际应用组合根挂载全部领域 router；仅生成 schema、只在测试 app 挂载或存在不可达 endpoint 均不算完成；
+2. 除创建/交换 Session 所需的认证引导路由外，所有管理领域资源只接受有效 Management Session；固定管理密钥和 Telegram 带外批准是两种换取 Session 的入口，不能直接访问领域资源；
+3. Telegram 和 Management API 对同一管理动作调用同一个控制层用例和同一组运行时依赖，而不是各自复制业务逻辑或在生产组合中实例化互不相干的 control；
+4. 第 14 节 53 项 Telegram 功能均有基线轨迹和重构后轨迹；所有既有 Telegram 方法、正文、按钮、`callback_data`、分页、状态流、确认、错误显示和业务副作用与 v0.31.13 完全一致；
+5. 第 15 节 API 清单的每个 operationId 均有可达性、schema/control 接线及与其语义相关的成功、校验和关键副作用测试；
+6. 完整测试套件不低于已知基线 `2524 passed`，且本轮新增功能门禁全部通过；不得把尚未执行的最终验收写成已完成事实；
+7. 每个新增源码文件不超过 1000 行，按领域维护性拆分；依赖门禁未发现 Adapter 直连业务模块或反向依赖；
+8. 实施、开发服务和测试均使用隔离副本、临时配置/数据库及 fake/专用凭据，不触碰生产 `/opt/src-space/parrot`、生产进程或生产数据。
 
-任一 Telegram 差异、缺失 API operation、绕过控制层的写路径，均直接判定失败。
+任一 Telegram 差异、缺失或实际不可达的 API operation、生产组合未挂载领域 router、绕过共享 Control 的写路径或错误的业务级联，均直接判定失败。第 4.6 节的后续安全候选不参与本轮 Done 判定。
 
 ### 1.3 明确不做
 
@@ -54,7 +58,7 @@ Management API Adapter┘                 │
 - 不把 `src/auth.py::validate()` 复用为管理鉴权。它验证的是推理侧 Bearer/`x-api-key`，返回 key 名称和模型权限，与管理身份是两个安全域。
 - 不提供通用的 `GET/PUT config.json` API；管理 API 只能暴露本文件列出的、经过类型校验且已脱敏的资源。
 - 不因现有文件过大而重排 Telegram UI、改文案或更换 callback；大文件只随业务逻辑自然下沉而缩小。
-- 不为本轮引入消息总线、插件框架、通用工作流引擎或 Web UI 专属 BFF。若现有 StateStore 不适合高频 session touch、一次性 approval、审计和 operation 状态，允许增加一个职责单一的 `management-state` SQLite store；它不得演变成第二套业务配置/渠道/OAuth 数据库。
+- 不为本轮引入消息总线、插件框架、通用工作流引擎、Web UI 专属 BFF、新角色体系或通用安全扫描框架。Session/approval/operation 所需状态只按当前功能的最小职责实现，不演变成第二套业务配置、渠道或 OAuth 数据库。
 
 ---
 
@@ -90,8 +94,8 @@ Management API Adapter┘                 │
 
 ```text
 src/management_auth/
-  principal.py          # ManagementPrincipal、认证来源、角色/能力
-  policy.py             # 统一 authorize(principal, capability)
+  principal.py          # ManagementPrincipal、认证来源与管理员身份
+  policy.py             # 统一 authorize(principal, action)
   sessions.py           # session 生命周期；不含 HTTP/TG 渲染
   approvals.py          # TG 带外 challenge 生命周期
 
@@ -150,7 +154,7 @@ src/telegram/
 - 不含 Telegram HTML、emoji、按钮文字、callback、chat/message id；
 - 不返回 FastAPI `Response`、status code 或 cookie；
 - 不把供应商异常文本原样作为公共错误码；
-- 所有 mutation 在控制层再次执行 capability 授权，Adapter 的前置检查不是授权边界。
+- 所有 mutation 在控制层再次执行统一管理授权，Adapter 的前置检查不是授权边界。
 
 Telegram Adapter 继续用原有格式化函数把控制结果渲染成**完全相同**的字符串；Management API Adapter 只做 DTO/schema 转换和 HTTP 错误映射。
 
@@ -172,28 +176,21 @@ Telegram Adapter 继续用原有格式化函数把控制结果渲染成**完全�
 
 ---
 
-## 4. 统一管理身份与 Session
+## 4. 统一管理身份、授权与 Session
 
-### 4.1 Principal 与授权
+### 4.1 Principal 与本轮授权边界
 
 `ManagementPrincipal` 至少包含：
 
 ```text
-subjectId, authMethod, roles, capabilities, issuedAt, sessionId?
+subjectId, authMethod, issuedAt, sessionId?
 ```
 
-本轮角色可只有 `administrator`，但 endpoint 和 control 必须按 capability 授权，不得散落 `if admin`。最低能力集合：
+本轮只需要表达“已认证的管理者”这一授权事实，不新增产品角色层级、细粒度 capability 矩阵或治理机制。`management_auth` 统一判断 principal 是否可执行管理动作；Control 对 mutation 和受保护读取再次调用 `authorize(principal, action)`，不得把授权散落为 Adapter 内的 `if admin`。
 
-- `management.read`
-- `management.write`
-- `management.secrets.write`
-- `management.destructive`
-- `management.update`
-- `management.logs.body.read`
+现有 Telegram `adminIds` 映射为同类管理 principal。未授权 TG update 的忽略/提示行为保持基线，不因统一授权增加消息。Management API 的领域 principal 只能来自有效 Management Session；固定管理密钥、推理 API Key 或 approval credential 本身都不是领域 principal。
 
-现有 Telegram `adminIds` 映射为同一个 administrator principal。未授权 TG update 的忽略/提示行为保持基线，不因统一授权增加消息。Management API principal 只能来自有效 Management Session。
-
-### 4.2 固定长密钥换 Session
+### 4.2 固定管理密钥换 Session
 
 ```http
 POST /api/management/v1/auth/sessions
@@ -202,41 +199,47 @@ Content-Type: application/json
 {"grantType":"managementKey","managementKey":"<writeOnly>"}
 ```
 
-成功返回 session 摘要和一次性可交付的 session credential；失败统一为 `AUTHENTICATION_FAILED`，不得暴露“未配置/长度/哪一段错误”。长密钥不得作为普通 API Bearer 长期访问资源，也不得复用推理 API Key。程序化客户端必须支持标准 `Authorization: Bearer`；未来 Web UI 可在实现阶段选择同一 Session 的 HttpOnly Cookie 传输，本文不提前锁死二者之一。
+成功返回 session 摘要和一次性可交付的 session credential；失败统一为 `AUTHENTICATION_FAILED`，不回显提交值或具体匹配细节。固定管理密钥只用于换取 Session，不得作为领域 API 的长期直接凭据，也不得复用下游推理 API Key。程序化客户端使用 OpenAPI 声明的 `Authorization: Bearer <management-session>` 传递 Session；未来 Web UI 的传输选择不在本轮决定。
+
+按用户给出的认证方向，Session 默认 3 天滑动有效：有效期内有访问则续期；家、公司、手机等多个 Session 可以并存，不要求唯一登录。token 具体格式、持久化和更严格的绝对期限属于实现或后续加固细节，不扩张本轮功能范围。
 
 ### 4.3 Telegram 带外批准换 Session
 
-固定协议为：
+协议入口为：
 
-1. `POST /auth/telegram-approvals` 创建 challenge，返回 `approvalId`、一次性 `exchangeSecret`、`expiresAt`、`pollAfterSeconds`；
-2. 系统向允许的 Telegram admin 发送一条**新增且隔离**的批准/拒绝消息；callback 使用新命名空间 `mauth:`，不得改动任何既有命令、菜单或 callback；
-3. `GET /auth/telegram-approvals/{approvalId}` 使用 `Authorization: Approval <exchangeSecret>` 查询 `pending|approved|denied|expired|consumed`；
-4. `POST /auth/sessions` 以 `grantType=telegramApproval`、`approvalId`、`exchangeSecret` 进行一次性交换；成功后 challenge 立即变为 `consumed`。
+1. `POST /auth/telegram-approvals` 创建自创建时起 3 分钟有效的 challenge，返回 `approvalId`、`exchangeSecret`、`expiresAt` 和客户端轮询所需状态；
+2. 系统向配置中的 Telegram admin 发送一条**新增且隔离**的批准/拒绝消息；callback 使用新命名空间 `mauth:`，不得改动任何既有命令、菜单或 callback；
+3. `GET /auth/telegram-approvals/{approvalId}` 使用该 challenge 的 exchange credential 查询 `pending|approved|denied|expired|consumed`；
+4. `POST /auth/sessions` 以 `grantType=telegramApproval` 和该 challenge 的交换材料换取 Management Session；未获批准不能创建 Session。
 
-批准消息必须展示足够的请求来源信息（时间、客户端名称、来源地址/设备摘要），但不得展示 management key、session token 或 exchange secret。只有配置中的 TG admin 可批准。重复点击、过期、拒绝、跨 challenge 交换均失败且不创建 session。
+批准消息不得展示 management key、session credential 或 exchange credential。TG approval 只承担第二种 Session 入口，不为 Telegram 增加新的业务管理路径；既有 TG surface 仍按第 14 节冻结。3 分钟有效期是本轮认证方向；在此之外更严格的重放、浏览器绑定和过期处置属于第 4.6 节后续加固，不扩张本轮验收矩阵。
 
 ### 4.4 Session 路由
 
 | method/path | operationId | 语义 |
 |---|---|---|
 | `POST /auth/sessions` | `createManagementSession` | 两种 grant 换 session |
-| `GET /auth/session` | `getCurrentManagementSession` | 当前 subject、method、过期时间、capabilities |
-| `DELETE /auth/session` | `revokeCurrentManagementSession` | 当前 session 立即失效 |
+| `GET /auth/session` | `getCurrentManagementSession` | 当前 subject、method 和 session 摘要 |
+| `DELETE /auth/session` | `revokeCurrentManagementSession` | 当前 session 失效 |
 | `POST /auth/telegram-approvals` | `createTelegramApproval` | 创建带外 challenge |
-| `GET /auth/telegram-approvals/{approvalId}` | `getTelegramApproval` | 仅 challenge secret 可查询 |
+| `GET /auth/telegram-approvals/{approvalId}` | `getTelegramApproval` | 仅对应 challenge credential 可查询 |
 
-### 4.5 必须满足的安全性质
+### 4.5 本轮必要的基础安全边界
 
-具体密码学/存储由实现决定，但必须满足：
+以下条款是本轮门禁，边界以已声明的结构化 API 为限：
 
-- management key 采用恒时验证；未配置时 fail closed；认证尝试有按来源和全局的有界限速；
-- session/challenge token 具有足够熵，只存不可反推的验证材料；支持空闲和绝对过期、主动吊销、服务重启后的明确策略；
-- key 轮换可使旧 key 和按策略签发的旧 session 失效；challenge 有短 TTL、一次性、绑定发起浏览器；
-- cookie 至少 `HttpOnly`、`SameSite=Strict`，生产 TLS 下 `Secure`；所有有副作用的 cookie 请求校验 Origin/CSRF；
-- token/key/credential 不进 URL、access log、异常、审计 detail 或 OpenAPI example；所有 auth 响应 `Cache-Control: no-store`；
-- 审计记录 actor、action、target、result、时间和 requestId，不记录秘密；
-- 默认只监听已批准的管理网络边界；不得因新增 API 自动开放公网；
-- API 的 401/403 信息不得被 Telegram 原样显示，Telegram 保持自己的既有错误文案。
+- 除第 4.2～4.4 节创建、交换或查询 Session 所需的认证引导路由外，第 6～12 节所有领域 operation 均须有效 Management Session；领域 router 使用同一认证依赖，Control 使用同一管理 principal；
+- 固定管理密钥和 TG approval 是仅有的两种换 Session 入口；推理 API Key 与管理认证严格分离，不能互相替代；
+- request schema 中语义明确的 secret 字段标记 `writeOnly`；创建、生成或轮换 secret 时可按 operation 合同返回一次，后续普通 GET 不主动回显；
+- 不提供 raw config dump；已知 URL credential 字段以 URL 结构解析并遮蔽 userinfo，不靠扫描任意文本猜测秘密；
+- 公共 `Operation`、公共错误和 API 自有诊断摘要不主动塞入 raw exception、提交的 credential 或供应商 credential；Control 提供稳定错误信息，由 API/TG Adapter 分别渲染；
+- Telegram 继续使用既有错误文案和未授权行为，API 认证错误不得反向改变第 14 节轨迹。
+
+### 4.6 后续安全加固候选（不阻断本轮）
+
+以下事项可在用户另行确定威胁模型、部署方式和兼容策略后开展，但**不属于本轮 Done、逐 operation 测试矩阵或 Gate**：更严格的 session/challenge replay 防护和绝对过期策略、认证限速、CSRF/Origin、cookie policy、TLS 与 network exposure；对任意自由文本、任意 nested object、转义 JSON 中 token/key/secret/credential 变体的穷举扫描；Camel/Pascal/ALL_CAPS/concatenated suffix 分类；把普通 Bearer/Basic 文案启发式判为 credential；为 generic `key` 建 schema-depth marker/exception；递归遍历异常 `__cause__`/`__context__`。
+
+本轮不得为这些候选引入通用秘密分类器、递归异常审计系统、额外角色/策略框架，也不得用无休止的相邻安全 probe 阻断功能验收。发现明确违反第 4.5 或 5.3 节的已知结构化泄露仍应修复；这不等于扩大到任意文本推断。
 
 ---
 
@@ -274,23 +277,25 @@ Content-Type: application/json
 |---|---|
 | 400 | `INVALID_REQUEST`, `CONFIRMATION_REQUIRED`, `INVALID_OPERATION_STATE` |
 | 401 | `SESSION_REQUIRED`, `SESSION_EXPIRED`, `AUTHENTICATION_FAILED` |
-| 403 | `CAPABILITY_DENIED`, `ORIGIN_DENIED` |
+| 403 | `CAPABILITY_DENIED` |
 | 404 | `RESOURCE_NOT_FOUND`, `OPERATION_NOT_FOUND` |
 | 409 | `RESOURCE_CONFLICT`, `IDENTITY_CONFLICT`, `REVISION_CONFLICT`, `STATE_CONFLICT` |
 | 422 | `VALIDATION_FAILED`, `UNSUPPORTED_VALUE` |
-| 429 | `RATE_LIMITED`, `OPERATION_ALREADY_RUNNING` |
+| 429 | `OPERATION_ALREADY_RUNNING` |
 | 502 | `UPSTREAM_ERROR` |
 | 503 | `SERVICE_NOT_READY`, `DEPENDENCY_UNAVAILABLE` |
 | 504 | `UPSTREAM_TIMEOUT` |
 
-`error.code` 是客户端分支依据；英文/中文 message 均不构成稳定契约。Control 抛 `ManagementError(code, fields, retryable)`；HTTP mapper 和 Telegram mapper分别处理，禁止 Control 内硬编码 HTTP 或 TG 文案。
+`error.code` 是客户端分支依据；英文/中文 message 均不构成稳定契约。`CAPABILITY_DENIED` 在本轮只是统一授权拒绝的稳定错误名，不引入角色/capability 产品矩阵。Control 抛 `ManagementError(code, fields, retryable)`；HTTP mapper 和 Telegram mapper分别处理，禁止 Control 内硬编码 HTTP 或 TG 文案。
 
-### 5.3 秘密字段
+### 5.3 已知秘密字段与公共输出
 
-- OAuth access/refresh token、API channel key、proxy 密码、TG bot token、management key/session/challenge secret 标记 `writeOnly`；普通 GET 只返回 `configured`、必要时返回不可逆 `maskedHint`。
-- 下游 API Key 的新值只在 create/generate/rotate 成功响应中返回一次；之后只能看到名称、前缀提示和状态。
-- 不提供 config dump，不回显提交的 credential，不把秘密放入 Operation result。
-- 日志 body 属于受保护业务数据，不是 credential API；只有 `management.logs.body.read` 可访问，且沿用现有解密/不可读加密内容的安全展示语义。
+- OAuth access/refresh token、API channel key、proxy 密码、TG bot token、management key/session/challenge secret 等**语义明确的 request 字段**标记 `writeOnly`；普通 GET 只返回功能所需的 `configured`，必要时返回既有不可逆 `maskedHint`。
+- 下游 API Key 的新值只在 create/generate/rotate 成功响应中返回一次；之后只能看到名称、前缀提示和状态。其他 secret 若 operation 明确承担创建或轮换，也遵循“一次返回、后续 GET 不主动回显”。
+- 不提供 config dump，不回显提交的 credential，不把已知 secret 放入公共 Operation result 或错误对象。
+- 已知可携带 credential 的 URL 字段必须结构化解析并遮蔽 userinfo 后再输出；不能通过字符串替换声称完成 URL 遮蔽。
+- 公共错误和 Operation 只承载稳定 code、结构化字段及面向调用方的摘要，不主动复制 raw exception 或 credential。这里不要求扫描任意业务文本、转义 JSON、任意嵌套键或递归异常链；此类增强按第 4.6 节处理。
+- 日志 body 属于受保护业务数据，不是 credential API；须有有效 Management Session，并沿用现有解密/不可读加密内容的展示语义。不得用通用 credential 猜测器改变原始业务日志的功能语义。
 
 ### 5.4 异步 Operation
 
@@ -314,7 +319,7 @@ Operation store 必须有界、按 session/actor 授权、不持久化秘密；�
 
 ### 5.5 可发现性
 
-`GET /meta` (`getManagementMetadata`) 返回 API 版本、应用版本、支持的 capability、枚举和文档链接；`GET /capabilities` (`getManagementCapabilities`) 返回按领域组织的 provider/preset/protocol/mode/action schema。每个 route 必须有唯一 `operationId`、tag、request/response schema、enum、敏感字段标记和至少一个脱敏 example。禁止用 `dict[str, Any]` 作为对外主 schema 来逃避合同。
+`GET /meta` (`getManagementMetadata`) 返回 API 版本、应用版本、支持的功能摘要、枚举和文档链接；`GET /capabilities` (`getManagementCapabilities`) 返回按领域组织的 provider/preset/protocol/mode/action schema。这里的 capabilities 是客户端可发现的产品能力，不是本轮新增角色体系。每个 route 必须有唯一 `operationId`、tag、request/response schema、enum和已知敏感字段标记。禁止用 `dict[str, Any]` 作为对外主 schema 来逃避合同。
 
 ---
 
@@ -371,7 +376,7 @@ OAuth 覆盖不得变成隐式 upsert。Control 的 replace plan/nonce 必须绑
 | `POST /oauth/accounts/{id}/actions/reset-quota` | `resetOAuthQuota` | 一次性 commit；不支持者返回 `UNSUPPORTED_VALUE` |
 | `POST /oauth/accounts/{id}/actions/clear-errors` | `clearOAuthAccountErrors` | 清理该账号 runtime error/cooldown 的现有范围 |
 | `POST /oauth/accounts/{id}/actions/clear-affinity` | `clearOAuthAccountAffinity` | 同时保持 server/client affinity 现有语义 |
-| `POST /oauth/actions/clear-errors` | `clearAllOAuthErrors` | 全局显式 destructive capability |
+| `POST /oauth/actions/clear-errors` | `clearAllOAuthErrors` | 全局显式 destructive action |
 | `GET /oauth/accounts/{id}/models` | `listOAuthAccountModels` | 状态、disabled、cooldown、metadata source、context、service tier；API pageSize 独立于 TG 的 6 |
 | `PATCH /oauth/accounts/{id}/models` | `updateOAuthAccountModels` | body 为显式 modelIds + disabled；支持批量，全有或全无 |
 | `PATCH /oauth/accounts/{id}/models/settings` | `updateOAuthAccountModelSettings` | Cursor `maxContextDefault` 等账号级模型设置 |
@@ -458,7 +463,7 @@ TG 继续接受 period `0|3|7|month` 和 dim `all|channel|model|apikey`；Adapte
 | `GET /logs` | `listRequestLogs` | status、apiKey、model、channel、protocol、query、time range、sort/page；返回 retry-chain 和计费摘要 |
 | `GET /logs/filter-options` | `getRequestLogFilterOptions` | 可选 key/model/channel/status 枚举与 counts |
 | `GET /logs/{logId}` | `getRequestLog` | stages/attempts、usage、latency、billing、error、request/response body availability |
-| `GET /logs/{logId}/body` | `getRequestLogBody` | kind=`request|response`，结构化 items、kind counts、search/sort/page；需 body-read capability |
+| `GET /logs/{logId}/body` | `getRequestLogBody` | kind=`request|response`，结构化 items、kind counts、search/sort/page；需有效 Management Session |
 | `GET /logs/{logId}/body/items/{itemId}` | `getRequestLogBodyItem` | full item；沿用不可读 encrypted payload 的安全处理 |
 | `GET /logs/{logId}/raw-body` | `getRequestLogRawBody` | 显式 body-read；只返回已允许的 request/response raw，不返回系统 credential |
 
@@ -640,7 +645,7 @@ TG model/scope picker 每页 10 条；开关、system message、model/fallback/l
 | `GET /updates/backups` | `listUpdateBackups` | 已有 backup metadata |
 | `GET /updates/failure-log` | `getUpdateFailureLog` | 脱敏 failure log |
 | `POST /updates/{version}/actions/stage` | `stageUpdate` | backup -> pull -> staged，返回 Operation |
-| `POST /updates/staged/actions/restart` | `activateStagedUpdate` | `management.update` + plan/If-Match；重启后 health/rollback |
+| `POST /updates/staged/actions/restart` | `activateStagedUpdate` | 显式 plan/If-Match；重启后 health/rollback |
 | `DELETE /updates/staged` | `cancelStagedUpdate` | 取消可取消的 staged 状态 |
 
 不得提供绕过 backup/stage/health rollback 的“一步 shell command”接口。服务重启导致当前 session/operation 中断时，客户端通过 health 和新 session 恢复，不能返回虚假成功。
@@ -697,7 +702,7 @@ TG model/scope picker 每页 10 条；开关、system message、model/fallback/l
 
 ## 14. Telegram 零变化完整功能清单
 
-本节每个 `TG-*` 是必须有自动化轨迹的验收项。轨迹需覆盖 v0.31.13 实际存在的每个列出 callback family/state 分支的成功、取消、过期/非法输入和业务失败；同一模式可参数化，但不得只测“打开首页”。若清单中的名词同时来自 API 合同、而基线源码不存在对应 TG 成功分支，必须按第 19 节核实并在本文明确记录，以“入口不存在”或真实 fallback/非法行为的负向轨迹冻结；不得伪造 trace，也不得新增 Telegram 交互来凑齐清单。
+本节 53 个 `TG-*` ID 是必须有自动化轨迹的验收项。`aa035ea` 的裁决继续有效：以 v0.31.13 实际源码和真实可达路径为准，不把 Management API 名词反向伪造成 Telegram 分支。轨迹需覆盖基线实际存在的 callback family/state 分支的成功、取消、过期/非法输入和业务失败；同一模式可参数化，但不得只测“打开首页”。若清单中的名词同时来自 API 合同、而基线源码不存在对应 TG 成功分支，必须按第 19 节核实并在本文明确记录，以“入口不存在”或真实 fallback/非法行为的负向轨迹冻结；不得伪造 trace，也不得新增 Telegram 交互来凑齐清单。
 
 ### 14.1 核心、命令、主菜单
 
@@ -808,20 +813,16 @@ src/tests/fixtures/management_api/v1-operation-ids.txt
 
 测试从 `/openapi.json` 提取实际集合与其逐行比较。
 
-### 15.2 每个 operation 的最小测试矩阵
+### 15.2 operation 功能测试与横切门禁
 
-每个 operationId 至少验证：
+每个 operationId 至少验证与自身语义相关的最小功能闭环：
 
-1. 无 Session -> 401；无 capability -> 403；
-2. happy path 的 status、schema、字段类型和 OpenAPI example；
-3. 非法 enum/范围/未知字段 -> 422 且 `error.fields` 定位；
-4. missing ID -> 404；适用时 stale revision/identity conflict -> 409；
-5. response、日志、Operation 和审计中无 writeOnly secret；
-6. Control 被调用一次且参数/actor 正确，router 未自行读写 config；
-7. mutation 后 config/state/runtime 的权威副作用与同一 Control 用例一致；
-8. 长动作返回 202，可轮询到终态，失败能保留稳定 code；
-9. list filter/sort/page 边界和 total；
-10. 重复 commit、过期 plan/challenge、重放 token 明确失败。
+1. route 在实际应用组合中可达，happy path 的 status、response schema 和字段类型正确；
+2. request schema 拒绝该 operation 已声明的非法 enum、范围或未知字段；资源型 operation 覆盖适用的 missing/conflict，而不是为不适用的分支凑矩阵；
+3. Adapter 调用预期的 Control 用例且传入当前 principal/context；查询结果正确，mutation 的 config/state/runtime 权威副作用和业务级联正确；
+4. 长动作按合同返回 Operation 并可到达终态；列表 operation 覆盖其已声明的 filter/sort/page。
+
+认证和已知秘密边界采用集中式横切测试，不再给每个 operation 复制十项安全矩阵：证明认证引导路由以外的全部领域 route 使用统一 Session 依赖，固定管理密钥/TG approval 只能换 Session，推理 API Key 不能访问管理资源；检查声明为 secret 的 request schema 为 `writeOnly`，一次返回操作及后续 GET 符合第 5.3 节，并对公共错误、Operation 和已知 URL credential 做代表性结构化测试。测试到此边界即收口，不扩展为第 4.6 节的任意 nested key、自由文本、转义 JSON、命名变体、递归异常链或相邻 probe 审计。
 
 ### 15.3 领域级 parity
 
@@ -859,9 +860,9 @@ Parity 比较的是共享业务结果；不得要求 Management API 返回 Teleg
 - [ ] 所有新 `.py` 源码文件 `<= 1000` 行；接近上限时按资源拆分，不创建 `utils2.py` 式垃圾桶。
 - [ ] API router 只调 control；Telegram 新代码只调 control；control 不含 transport/UI。
 - [ ] mutation 只有一个权威实现，旧菜单直写已删除或有带到期包的临时 allow-list。
-- [ ] DTO 不泄密，错误码稳定，operation 可终止/查询。
+- [ ] 已知 secret 字段、一次返回、URL 结构化遮蔽及公共错误/Operation 满足第 4.5、5.3 节；不以第 4.6 节候选阻断。
 - [ ] 本包全部 TG case baseline == actual；无 snapshot 更新。
-- [ ] API expected operation、schema、auth、副作用测试齐全。
+- [ ] API expected operation、schema、Session 接线、Control 调用和业务副作用测试齐全。
 - [ ] 未修改真实 config，测试使用 `tmp_path`、fake account/credential/transport。
 
 ---
@@ -874,12 +875,15 @@ Parity 比较的是共享业务结果；不得要求 Management API 返回 Teleg
 - 固定 clock/random/network，生成第 14.6 节 manifest；
 - 记录当前全套 `2524 passed` 是已知输入，最终仍需在目标分支重跑，不能只引用该数字。
 
-### Gate B：结构与安全
+### Gate B：结构、组合根与基础认证边界
 
 - 静态依赖检查：API 不 import 业务/TG；control 不 import FastAPI/TG；业务不反向 import management；
-- 新源码文件行数检查；
-- secret schema/writeOnly、响应和 captured log 扫描；
-- auth replay/expiry/revoke/rate limit/CSRF/Origin 测试。
+- 新源码文件行数检查，所有新增 `.py` 文件不超过 1000 行且按领域拆分；
+- 实际应用组合根挂载全部领域 router；TG/API 注入同一 Control/业务依赖，领域 route 不只存在于测试 app；
+- 集中验证所有领域 route 使用有效 Management Session，两个 grant 只换 Session，推理 API Key 不被接受；
+- 检查已声明 secret 的 `writeOnly`、一次返回/后续 GET、无 raw config dump、已知 URL credential 结构化遮蔽，以及公共错误/Operation 不主动包含 raw exception 或 credential。
+
+第 4.6 节的 replay/绝对过期/rate limit/CSRF/Origin/cookie/TLS/network exposure 与通用文本/异常链扫描明确不在 Gate B 中，不得恢复为本轮阻断项。
 
 ### Gate C：领域功能
 
@@ -897,7 +901,9 @@ Parity 比较的是共享业务结果；不得要求 Management API 返回 Teleg
 
 ### Gate E：全量与运行环境
 
-完整 suite 必须通过项目规定的 `src/tests/isolated_pytest.py` 启动，并且**不继承**开发服务的 `PARROT_NO_REFRESH=1`；该变量会短路显式刷新测试，已在基线实测造成 11 项误失败。测试隔离器负责阻断真实 provider/TG。只有长期开发服务和其 `127.0.0.1:22123` smoke 使用 `PARROT_NO_REFRESH=1`；smoke 只使用 fake/专用凭据并覆盖 session -> meta -> 一个只读 endpoint -> revoke，且不替代自动化门禁。
+所有实现、开发服务、smoke 和测试均只在隔离 worktree/开发副本中进行，使用临时配置、临时数据库及 fake/专用凭据；不得读取或写入生产 `/opt/src-space/parrot`，不得连接、重启或改变生产进程与生产数据。
+
+完整 suite 必须通过项目规定的 `src/tests/isolated_pytest.py` 启动，并且测试进程必须显式 **unset `PARROT_NO_REFRESH`**（例如 `env -u PARROT_NO_REFRESH ...`）；该变量会短路显式刷新测试，已在基线实测造成 11 项误失败。测试隔离器负责阻断真实 provider/TG。`PARROT_NO_REFRESH=1` 只允许用于隔离开发副本中的长期服务及其 `127.0.0.1:22123` smoke；smoke 只使用 fake/专用凭据并覆盖 session -> meta -> 一个只读 endpoint -> revoke，且不替代自动化门禁。
 
 最终验收报告必须逐项列出：
 
@@ -931,4 +937,4 @@ Gate / checklist ID | PASS/FAIL | test/path | decisive evidence
 4. 不得用通用 config endpoint、router 直连业务、复制菜单逻辑或放宽测试来“完成”清单；
 5. 只有经主控更新本文规范后，才允许改变公开 v1 合同或零变化标准。
 
-本文冻结的是 v0.31.13 的既有 Telegram 合同和本轮 Management API v1 合同。后续 Web UI 必须消费本 API，不得反向要求 Telegram 菜单、业务模块或 config 为前端提供私有捷径。
+本文冻结的是 v0.31.13 的既有 Telegram 合同和本轮 Management API v1 功能合同。冲突处理始终遵循本轮优先级：先保 TG 原版一致、API 完整可达、共享 Control 与正确副作用，再守住第 4.5/5.3 节基础边界；不得以第 4.6 节后续安全候选改写或阻断这些主线。后续 Web UI 必须消费本 API，不得反向要求 Telegram 菜单、业务模块或 config 为前端提供私有捷径。
