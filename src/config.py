@@ -932,17 +932,18 @@ def _load_from_disk() -> dict:
             _write_atomic(merged)
             return merged
 
-        # Keep pre-management migrations on their original failure boundary,
-        # then isolate only persistence of the newly generated credential.  A
-        # key that was never durably written must not become a usable,
-        # process-local management credential.
+        # Remove only the generated management credential to determine whether
+        # this load also contains a pre-existing migration.  Existing migrations
+        # retain their original single atomic write and failure boundary; only a
+        # write caused solely by the new credential is isolated from inference.
         inference_config = copy.deepcopy(merged)
         if "management" in raw:
             inference_config["management"] = copy.deepcopy(raw["management"])
         else:
             inference_config.pop("management", None)
         if inference_config != raw:
-            _write_atomic(inference_config)
+            _write_atomic(merged)
+            return merged
         try:
             _write_atomic(merged)
         except OSError as exc:
