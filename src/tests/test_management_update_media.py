@@ -217,6 +217,104 @@ def test_reaudit3_update_token_cancelled_plan_never_revives_on_same_version_rest
         assert fixture.update_gateway.activate_calls == 1
 
 
+def test_cancel_success_skips_unavailable_post_state_and_retires_plan(tmp_path):
+    app, runtime, fixture = build_auxiliary_app(tmp_path)
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        staged = client.post(
+            BASE + "/updates/0.32.0/actions/stage",
+            headers={**headers, "Idempotency-Key": "stage-before-successful-direct-cancel"},
+        )
+        assert staged.status_code == 202, staged.text
+        terminal = _poll(client, headers, staged.json()["data"]["id"])
+        assert terminal["status"] == "succeeded"
+        active_digest = fixture.controls.updates._active_plan_digest
+        assert active_digest is not None
+
+        state_reads = 0
+        original_state = fixture.update_gateway.state
+
+        def unavailable_state():
+            nonlocal state_reads
+            state_reads += 1
+            raise OSError("post-cancel state is unavailable")
+
+        def successful_cancel_then_break_state_read():
+            fixture.update_gateway.cancel_calls += 1
+            fixture.update_gateway.update_state = {"stage": "idle", "mode": "docker"}
+            fixture.update_gateway.state = unavailable_state
+            return True, "cancelled"
+
+        fixture.update_gateway.cancel = successful_cancel_then_break_state_read
+        direct_session = runtime.sessions.issue_for_principal(
+            subject_id="telegram:update-admin",
+            auth_method=AuthMethod.TELEGRAM_APPROVAL,
+            roles=(),
+            capabilities=(Capability.READ, Capability.UPDATE),
+        )
+        direct_context = ManagementContext(
+            request_id="successful-direct-cancel-without-read-back",
+            actor=direct_session.principal,
+        )
+
+        cancelled = fixture.controls.updates.cancel_direct(direct_context)
+        assert cancelled == (True, "cancelled")
+        assert state_reads == 0
+        assert fixture.update_gateway.cancel_calls == 1
+        assert fixture.controls.updates._active_plan_digest is None
+        assert fixture.controls.updates._plans[active_digest].consumed is True
+        fixture.update_gateway.state = original_state
+
+
+def test_failed_direct_cancel_preserves_contract_when_post_state_read_fails(tmp_path):
+    app, runtime, fixture = build_auxiliary_app(tmp_path)
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        staged = client.post(
+            BASE + "/updates/0.32.0/actions/stage",
+            headers={**headers, "Idempotency-Key": "stage-before-unreadable-failed-cancel"},
+        )
+        assert staged.status_code == 202, staged.text
+        terminal = _poll(client, headers, staged.json()["data"]["id"])
+        assert terminal["status"] == "succeeded"
+        active_digest = fixture.controls.updates._active_plan_digest
+        assert active_digest is not None
+
+        state_reads = 0
+        original_state = fixture.update_gateway.state
+        cancel_detail = "original cancel failure"
+
+        def unavailable_state():
+            nonlocal state_reads
+            state_reads += 1
+            raise OSError("post-cancel state is unavailable")
+
+        def failed_cancel_then_break_state_read():
+            fixture.update_gateway.cancel_calls += 1
+            fixture.update_gateway.state = unavailable_state
+            return False, cancel_detail
+
+        fixture.update_gateway.cancel = failed_cancel_then_break_state_read
+        direct_session = runtime.sessions.issue_for_principal(
+            subject_id="telegram:update-admin",
+            auth_method=AuthMethod.TELEGRAM_APPROVAL,
+            roles=(),
+            capabilities=(Capability.READ, Capability.UPDATE),
+        )
+        direct_context = ManagementContext(
+            request_id="failed-direct-cancel-with-unreadable-state",
+            actor=direct_session.principal,
+        )
+
+        cancelled = fixture.controls.updates.cancel_direct(direct_context)
+        assert cancelled == (False, cancel_detail)
+        assert state_reads == 1
+        assert fixture.update_gateway.cancel_calls == 1
+        assert fixture.controls.updates._active_plan_digest == active_digest
+        assert fixture.controls.updates._plans[active_digest].consumed is False
+        fixture.update_gateway.state = original_state
+
+
 def test_reaudit4_failed_cancel_that_clears_stage_retires_plan_before_direct_restage(tmp_path):
     app, runtime, fixture = build_auxiliary_app(tmp_path)
     with TestClient(app) as client:

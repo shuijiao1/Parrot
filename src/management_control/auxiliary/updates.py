@@ -663,8 +663,14 @@ class UpdateControl:
 
     def _retire_plan_after_cancel(self, digest: str | None, *, ok: bool) -> None:
         """Retire a plan whenever cancel has actually left the staged state."""
-        post_state = self._state_without_auth()
-        if ok or post_state.stage != STAGE_STAGED:
+        if ok:
+            self._retire_plan(digest)
+            return
+        try:
+            post_state = self._state_without_auth()
+        except Exception:
+            return
+        if post_state.stage != STAGE_STAGED:
             self._retire_plan(digest)
 
     def _start_stage(self, operation_id: str, context: ManagementContext, payload: Any) -> None:
