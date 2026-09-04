@@ -5013,9 +5013,14 @@ def log_detail(request_id: str) -> dict:
     ).fetchall()
     effective_billing = [_effective_attempt_row(row) for row in billing_rows]
     rendered_log = _sanitize_request_timing(log_row) if log_row else None
+    rendered_detail = dict(detail_row) if detail_row else None
+    if rendered_log is not None and rendered_detail is not None:
+        # Preserve the historical response contract without selecting the large
+        # body twice: both views share the object materialized by the detail row.
+        rendered_log["response_body"] = rendered_detail["response_body"]
     return {
         "log": rendered_log,
-        "detail": dict(detail_row) if detail_row else None,
+        "detail": rendered_detail,
         "retry_chain": [_sanitize_retry_timing(r) for r in chain_rows],
         "proxy_chain": [_sanitize_proxy_timing(r) for r in proxy_rows],
         "local_web_log": [dict(r) for r in local_web_rows],

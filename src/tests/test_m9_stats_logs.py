@@ -737,11 +737,22 @@ def test_log_detail_reads_large_response_body_once(m):
 
     conn = m["log_db"]._get_conn()
     statements: list[str] = []
+    materialized_detail_bodies: list[str] = []
+    original_row_factory = conn.row_factory
+
+    def tracking_row_factory(cursor, row):
+        columns = tuple(column[0] for column in cursor.description)
+        if columns == ("request_headers", "request_body", "response_body"):
+            materialized_detail_bodies.append(row[2])
+        return original_row_factory(cursor, row)
+
+    conn.row_factory = tracking_row_factory
     conn.set_trace_callback(statements.append)
     try:
         detail = m["log_db"].log_detail("detail-single-body-read")
     finally:
         conn.set_trace_callback(None)
+        conn.row_factory = original_row_factory
 
     detail_reads = [
         sql for sql in statements
@@ -749,8 +760,12 @@ def test_log_detail_reads_large_response_body_once(m):
     ]
     assert len(detail_reads) == 1, detail_reads
     assert detail_reads[0].lower().count("response_body") == 1
+    assert len(materialized_detail_bodies) == 1
+    assert materialized_detail_bodies[0] == response_body
+    assert detail["log"]["response_body"] == response_body
     assert detail["detail"]["response_body"] == response_body
-    assert "response_body" not in detail["log"]
+    assert detail["log"]["response_body"] is detail["detail"]["response_body"]
+    assert detail["detail"]["response_body"] is materialized_detail_bodies[0]
 
 
 def test_stats_group_by_channel(m):
