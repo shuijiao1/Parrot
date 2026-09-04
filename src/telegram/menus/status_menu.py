@@ -14,12 +14,12 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from ... import affinity, apikey_limiter, concurrency, config, cooldown, load_balancing, log_db, oauth_manager, quota_errors, scorer, state_db
+from ... import affinity, apikey_limiter, concurrency, config, cooldown, load_balancing, oauth_manager, quota_errors, scorer, state_db
 from ...oauth_ids import account_key as _account_key
 from ...openai.codex_constants import codex_cli_version
 from ...channel import registry
 from ...management_control.observability import DEFAULT_STATUS_CONTROL, telegram_context
-from .. import ui
+from .. import menu_cache, ui
 
 
 _CONTROL = DEFAULT_STATUS_CONTROL
@@ -186,7 +186,7 @@ def _fastest_channels_by_family(top_per_family: int = 5) -> dict:
     return result
 
 
-def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
+def _quota_warnings(threshold_pct: float = 80.0, *, cfg: dict | None = None) -> list[str]:
     """OAuth 账户用量 >= threshold 的告警条目（按 provider 读不同的 util 字段）。
 
     Anthropic 账户的指标维度：5h / 7d / Sonnet / Opus
@@ -194,14 +194,7 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
                            + codex_primary / codex_secondary（codex 专属，更精细）
     """
     out: list[str] = []
-    cfg = _CONTROL.config_snapshot(_CONTEXT)
-    account_keys = [
-        _account_key(a) for a in cfg.get("oauthAccounts", [])
-        if a.get("email") and not a.get("disabled_reason")
-        and _CONTROL.provider_of(_CONTEXT, a) in ("claude", "openai", "xai", "cursor")
-    ]
-    if account_keys:
-        _CONTROL.refresh_telegram_quota(_CONTEXT, account_keys)
+    cfg = cfg if cfg is not None else _CONTROL.config_snapshot(_CONTEXT)
     for acc in cfg.get("oauthAccounts", []):
         email = acc.get("email")
         if not email:
@@ -255,49 +248,38 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
     return out
 
 
+def _status_metrics(overall: dict) -> dict:
+    return {
+        "total": int(overall.get("total") or 0),
+        "succ": int(overall.get("success_count") or 0),
+        "err": int(overall.get("error_count") or 0),
+        "avg_first": overall.get("avg_first_token_ms"),
+        "avg_total": overall.get("avg_total_ms"),
+        "avg_tps": overall.get("avg_tps"),
+    }
+
+
 def _today_snapshot_by_family() -> dict:
-    """今日请求按家族分组的快照。
+    """只读中央调度器最近一次成功的今日快照，未就绪时沿用空统计展示。"""
+    since = menu_cache.today_start_ts()
+    period = menu_cache.PERIOD_STATS.peek(("period", int(since))).value or {}
+    summary = period.get("summary") if isinstance(period.get("summary"), dict) else {}
+    families = period.get("families") if isinstance(period.get("families"), dict) else {}
 
-    返回 {"anthropic": {...}, "openai": {...}, "total": total_all}。
-    每家族有 total/succ/err/avg_first/avg_total/avg_tps。
-    """
-    from datetime import datetime, timedelta, timezone
-    bjt = timezone(timedelta(hours=8))
-    today = datetime.now(bjt).replace(hour=0, minute=0, second=0, microsecond=0)
-    since = today.timestamp()
-
-    def _snap(fam: str | None) -> dict:
-        try:
-            r = _CONTROL.stats_summary(_CONTEXT, since_ts=since, family=fam)
-            o = r.get("overall") or {}
-            return {
-                "total": int(o.get("total") or 0),
-                "succ": int(o.get("success_count") or 0),
-                "err": int(o.get("error_count") or 0),
-                "avg_first": o.get("avg_first_token_ms"),
-                "avg_total": o.get("avg_total_ms"),
-                "avg_tps": o.get("avg_tps"),
-            }
-        except Exception:
-            return {"total": 0, "succ": 0, "err": 0,
-                    "avg_first": None, "avg_total": None, "avg_tps": None}
+    def _family_metrics(family: str) -> dict:
+        row = families.get(family) if isinstance(families.get(family), dict) else {}
+        return _status_metrics(row.get("overall") or {})
 
     return {
-        "anthropic": _snap("anthropic"),
-        "openai": _snap("openai"),
-        "total_all": _snap(None)["total"],
+        "anthropic": _family_metrics("anthropic"),
+        "openai": _family_metrics("openai"),
+        "total_all": _status_metrics(summary.get("overall") or {})["total"],
     }
 
 
 def _month_tps_by_channel_model() -> dict:
-    """本月按 (channel_key, model) 的平均 TPS lookup；供"最快渠道"补充展示。"""
-    from datetime import datetime, timedelta, timezone
-    bjt = timezone(timedelta(hours=8))
-    month_start = datetime.now(bjt).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    try:
-        return _CONTROL.tps_by_channel_model(_CONTEXT, since_ts=month_start.timestamp())
-    except Exception:
-        return {}
+    """只读中央调度器最近一次成功的本月渠道模型 TPS 快照。"""
+    return menu_cache.STATUS_TPS.peek("month").value or {}
 
 
 # ─── 渲染 ─────────────────────────────────────────────────────────
@@ -380,13 +362,13 @@ def _fmt_aklim_seconds(seconds: int) -> str:
     return f"{seconds}s"
 
 
-def _apikey_limiter_block() -> list[str]:
-    totals = _CONTROL.concurrency_snapshot(_CONTEXT)["apiKeyTotals"]
+def _apikey_limiter_block(snapshot: dict) -> list[str]:
+    totals = snapshot["apiKeyTotals"]
     out = [
         f"  在途 <b>{totals['in_flight']}</b> · 排队 <b>{totals['waiting']}</b> · 追踪 {totals['tracked_keys']} 个 Key",
     ]
     interesting = [
-        r for r in _CONTROL.concurrency_snapshot(_CONTEXT)["apiKeys"]
+        r for r in snapshot["apiKeys"]
         if r.get("in_flight", 0) > 0 or r.get("waiting", 0) > 0
     ]
     if not interesting:
@@ -406,9 +388,9 @@ def _apikey_limiter_block() -> list[str]:
     return out
 
 
-def _concurrency_block(cc_cfg: dict) -> list[str]:
+def _concurrency_block(cc_cfg: dict, snapshot: dict) -> list[str]:
     """状态总览里的并发信息块：总计 + 配置 + 各渠道一行。"""
-    totals = _CONTROL.concurrency_snapshot(_CONTEXT)["channelTotals"]
+    totals = snapshot["channelTotals"]
     default_max = int(cc_cfg.get("defaultMaxConcurrent", 0))
     queue_wait = int(cc_cfg.get("queueWaitSeconds", 30))
     out = [
@@ -418,7 +400,7 @@ def _concurrency_block(cc_cfg: dict) -> list[str]:
         f"  默认上限 <code>{default_max if default_max > 0 else '不限'}</code>"
         f" · 队列等待 <code>{queue_wait}s</code>",
     ]
-    snap = _CONTROL.concurrency_snapshot(_CONTEXT)["channels"]
+    snap = snapshot["channels"]
     # 只列"有在途 / 有排队 / 已饱和"的渠道，减少噪声
     interesting = [
         r for r in snap
@@ -468,9 +450,10 @@ def _compose() -> tuple[str, dict]:
     today = _today_snapshot_by_family()
     fastest_by_fam = _fastest_channels_by_family(top_per_family=5)
     problems = _problem_channels()
-    quota_warn = _quota_warnings(80.0)
+    quota_warn = _quota_warnings(80.0, cfg=cfg)
+    concurrency_snapshot = _CONTROL.concurrency_snapshot(_CONTEXT)
 
-    # 月度 TPS 映射（只查一次）
+    # 月度 TPS 映射（只读一次缓存）
     any_fastest = bool(fastest_by_fam.get("anthropic")) or bool(fastest_by_fam.get("openai"))
     tps_map = _month_tps_by_channel_model() if any_fastest else {}
 
@@ -522,16 +505,16 @@ def _compose() -> tuple[str, dict]:
 
     # API Key 限流队列
     ak_cfg = cfg.get("apiKeyConcurrency") or {}
-    ak_totals = _CONTROL.concurrency_snapshot(_CONTEXT)["apiKeyTotals"]
+    ak_totals = concurrency_snapshot["apiKeyTotals"]
     if bool(ak_cfg.get("enabled", True)) or ak_totals.get("in_flight", 0) > 0 or ak_totals.get("waiting", 0) > 0:
         lines += ["", "<b>🔑 API Key 队列:</b>"]
-        lines += _apikey_limiter_block()
+        lines += _apikey_limiter_block(concurrency_snapshot)
 
     # 并发队列（只要启用了并发限制就显示）
     cc_cfg = cfg.get("concurrency") or {}
     if bool(cc_cfg.get("enabled", True)):
         lines += ["", "<b>⚡ 渠道并发队列:</b>"]
-        lines += _concurrency_block(cc_cfg)
+        lines += _concurrency_block(cc_cfg, concurrency_snapshot)
 
     # 问题渠道
     if problems:
