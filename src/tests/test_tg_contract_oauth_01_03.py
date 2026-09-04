@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-from src import oauth_manager
+from src import cooldown, oauth_manager
 from src.telegram import states, ui
 from src.telegram.menus import oauth_menu as om
 from src.tests.test_tg_contract_oauth_support import (
@@ -196,7 +196,7 @@ def _run_oa03(case, monkeypatch):
         om.on_clear_affinity(42, 100, "cb-affinity", short)
     elif op == "clear_all":
         env.cfg["oauthAccounts"].append(env.account("openai", 2))
-        monkeypatch.setattr(cooldown := om.cooldown, "clear", env.cooldown_clear)
+        monkeypatch.setattr(cooldown, "clear", env.cooldown_clear)
         om.on_clear_all_errors(42, 100, "cb-clear-all", page=2, filter_key="quota")
     elif op == "delete_ask_exec":
         om.on_delete_ask(42, 100, "cb-ask", short, 2, "invalid")

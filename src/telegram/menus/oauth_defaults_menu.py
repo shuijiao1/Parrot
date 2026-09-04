@@ -42,10 +42,8 @@ from ...management_control.oauth import OAuthFamily
 from ...management_control.oauth.menu_bridge import (
     ModelsDiscoveryError,
     account_key as _account_key,
-    config,
     control as oauth_control,
     discover_models,
-    oauth_manager,
     telegram_context as _management_context,
 )
 from .. import states, ui

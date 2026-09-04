@@ -683,17 +683,6 @@ def test_models_settings_preferences_defaults_actions_and_operations(tmp_path):
 def test_oauth_read_write_parity_between_telegram_adapter_and_api(tmp_path, monkeypatch):
     tg_control, tg_backend = build_control()
     monkeypatch.setattr(oauth_menu, "oauth_control", tg_control)
-    monkeypatch.setattr(
-        oauth_menu.config,
-        "get",
-        lambda: {
-            "quotaMonitor": {
-                "enabled": tg_backend.settings[0],
-                "intervalSeconds": tg_backend.settings[1],
-                "disableThresholdPercent": tg_backend.settings[2],
-            }
-        },
-    )
     monkeypatch.setattr(oauth_menu.ui, "answer_cb", lambda *args, **kwargs: None)
     monkeypatch.setattr(oauth_menu.ui, "edit", lambda *args, **kwargs: None)
 

@@ -37,6 +37,13 @@ from ...management_auth import AuthMethod, ManagementPrincipal
 from ...management_control import ManagementContext, ManagementError
 from ...management_control.apikey import ApiKeyControl, ApiKeySource
 from .. import menu_cache, states, ui
+from .sort_primitives import (
+    move_bottom as _move_bottom,
+    move_down as _move_down,
+    move_top as _move_top,
+    move_up as _move_up,
+    split_number_rows as _split_number_rows,
+)
 
 
 _CONTROL = ApiKeyControl()
@@ -1242,21 +1249,6 @@ def on_perm_cancel(chat_id: int, message_id: int, cb_id: str, short: str) -> Non
 # ─── API Key 排序 ────────────────────────────────────────────────
 
 
-def _split_number_rows(n: int, max_cols: int = 6) -> list[list[int]]:
-    if n <= 0:
-        return []
-    rows_count = math.ceil(n / max_cols)
-    base = n // rows_count
-    extra = n % rows_count
-    rows: list[list[int]] = []
-    cur = 1
-    for r in range(rows_count):
-        size = base + (1 if r < extra else 0)
-        rows.append(list(range(cur, cur + size)))
-        cur += size
-    return rows
-
-
 def _sort_state_data(chat_id: int) -> Optional[dict]:
     st = states.get_state(chat_id)
     if not st or st.get("action") != "ak_sort":
@@ -1371,42 +1363,6 @@ def on_sort_select(chat_id: int, message_id: int, cb_id: str, idx_str: str) -> N
         selected.add(idx)
     _set_sort_state(chat_id, draft, page=data.get("page") or 1, selected=selected)
     _show_sort(chat_id, message_id, cb_id)
-
-
-def _move_top(draft: list[str], selected: set[int]) -> list[str]:
-    idxs = [i - 1 for i in sorted(selected)]
-    chosen = [draft[i] for i in idxs]
-    rest = [x for i, x in enumerate(draft) if i not in idxs]
-    return chosen + rest
-
-
-def _move_bottom(draft: list[str], selected: set[int]) -> list[str]:
-    idxs = [i - 1 for i in sorted(selected)]
-    chosen = [draft[i] for i in idxs]
-    rest = [x for i, x in enumerate(draft) if i not in idxs]
-    return rest + chosen
-
-
-def _move_up(draft: list[str], selected: set[int]) -> tuple[list[str], set[int]]:
-    arr = list(draft)
-    sel = {i - 1 for i in selected}
-    for i in range(1, len(arr)):
-        if i in sel and (i - 1) not in sel:
-            arr[i - 1], arr[i] = arr[i], arr[i - 1]
-            sel.remove(i)
-            sel.add(i - 1)
-    return arr, {i + 1 for i in sel}
-
-
-def _move_down(draft: list[str], selected: set[int]) -> tuple[list[str], set[int]]:
-    arr = list(draft)
-    sel = {i - 1 for i in selected}
-    for i in range(len(arr) - 2, -1, -1):
-        if i in sel and (i + 1) not in sel:
-            arr[i + 1], arr[i] = arr[i], arr[i + 1]
-            sel.remove(i)
-            sel.add(i + 1)
-    return arr, {i + 1 for i in sel}
 
 
 def on_sort_move(chat_id: int, message_id: int, cb_id: str, op: str) -> None:

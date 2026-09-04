@@ -16,6 +16,7 @@ import time
 from ... import concurrency, config, log_db
 from ...management_control.observability import DEFAULT_STATS_CONTROL, telegram_context
 from .. import menu_cache, ui
+from .status_update_banner import suffix_status_update_banner as _maybe_suffix_status_banner
 
 
 _CONTROL = DEFAULT_STATS_CONTROL
@@ -628,28 +629,6 @@ def _kb(period: str, dim: str) -> dict:
 
 
 # ─── 编排 + 入口 ─────────────────────────────────────────────────
-
-def _maybe_suffix_status_banner(text: str) -> str:
-    """在文本底部追加 banner：上游故障 + 新版本可用（任一存在即拼到末尾）。"""
-    extras: list[str] = []
-    try:
-        from ... import status_monitor
-        line = status_monitor.get_active_summary()
-        if line:
-            extras.append(line)
-    except Exception:
-        pass
-    try:
-        from ... import update_checker
-        line = update_checker.get_update_banner()
-        if line:
-            extras.append(line)
-    except Exception:
-        pass
-    if not extras:
-        return text
-    return text + "\n\n" + "\n".join(extras)
-
 
 def _slice_result(result: dict, dim: str, *, family: bool = False) -> dict:
     """从完整 period 快照切出旧 UI 所需的 Top 3 / Top 10。"""

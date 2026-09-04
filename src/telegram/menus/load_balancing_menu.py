@@ -17,6 +17,13 @@ from typing import Optional
 
 from ...management_control.load_balancing import load_balancing_control
 from .. import states, ui
+from .sort_primitives import (
+    move_bottom as _move_bottom,
+    move_down as _move_down,
+    move_top as _move_top,
+    move_up as _move_up,
+    split_number_rows as _split_number_rows,
+)
 
 _MODE_LABELS = {
     "smart": "智能调度",
@@ -85,21 +92,6 @@ def _format_order_lines(keys: list[str], *, model_context: bool = False) -> list
         _format_item_line(i, key, model_context=model_context)
         for i, key in enumerate(keys, start=1)
     ]
-
-
-def _split_number_rows(n: int, max_cols: int = 6) -> list[list[int]]:
-    if n <= 0:
-        return []
-    rows_count = math.ceil(n / max_cols)
-    base = n // rows_count
-    extra = n % rows_count
-    rows: list[list[int]] = []
-    current = 1
-    for row_index in range(rows_count):
-        size = base + (1 if row_index < extra else 0)
-        rows.append(list(range(current, current + size)))
-        current += size
-    return rows
 
 
 def _client_models() -> list[str]:
@@ -338,42 +330,6 @@ def _toggle_select(chat_id: int, message_id: int, cb_id: str, raw_index: str) ->
     data["selected"] = sorted(selected)
     _store_edit_state(chat_id, data)
     _show_edit(chat_id, message_id, cb_id)
-
-
-def _move_top(draft: list[str], selected: set[int]) -> list[str]:
-    indexes = [index - 1 for index in sorted(selected)]
-    chosen = [draft[index] for index in indexes]
-    rest = [value for index, value in enumerate(draft) if index not in indexes]
-    return chosen + rest
-
-
-def _move_bottom(draft: list[str], selected: set[int]) -> list[str]:
-    indexes = [index - 1 for index in sorted(selected)]
-    chosen = [draft[index] for index in indexes]
-    rest = [value for index, value in enumerate(draft) if index not in indexes]
-    return rest + chosen
-
-
-def _move_up(draft: list[str], selected: set[int]) -> tuple[list[str], set[int]]:
-    result = list(draft)
-    zero_based = {index - 1 for index in selected}
-    for index in range(1, len(result)):
-        if index in zero_based and index - 1 not in zero_based:
-            result[index - 1], result[index] = result[index], result[index - 1]
-            zero_based.remove(index)
-            zero_based.add(index - 1)
-    return result, {index + 1 for index in zero_based}
-
-
-def _move_down(draft: list[str], selected: set[int]) -> tuple[list[str], set[int]]:
-    result = list(draft)
-    zero_based = {index - 1 for index in selected}
-    for index in range(len(result) - 2, -1, -1):
-        if index in zero_based and index + 1 not in zero_based:
-            result[index + 1], result[index] = result[index], result[index + 1]
-            zero_based.remove(index)
-            zero_based.add(index + 1)
-    return result, {index + 1 for index in zero_based}
 
 
 def _move(chat_id: int, message_id: int, cb_id: str, operation: str) -> None:

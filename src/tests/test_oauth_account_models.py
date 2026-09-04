@@ -618,7 +618,7 @@ def test_oauth_pagination_over_ten_and_fault_clear_keeps_user_disable(monkeypatc
     account_key = "openai:a@x:ws-a"
     assert "old" in oauth_manager.account_disabled_models(account_key)
     cleared = []
-    monkeypatch.setattr(oauth_account_models_menu.cooldown, "clear", lambda ck, model=None: cleared.append((ck, model)))
+    monkeypatch.setattr(cooldown, "clear", lambda ck, model=None: cleared.append((ck, model)))
     short, model_ref = oauth_account_models_menu.ui.register_code(account_key), oauth_account_models_menu.ui.register_code("old")
     monkeypatch.setattr(oauth_account_models_menu.ui, "answer_cb", lambda *a, **k: None)
     monkeypatch.setattr(oauth_account_models_menu.ui, "edit", lambda *a, **k: None)

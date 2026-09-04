@@ -116,10 +116,6 @@ class FakeEnv:
         mp.setattr(ui, "api", self.capture.api)
         mp.setattr(config, "get", lambda: self.cfg)
         mp.setattr(config, "update", self.config_update)
-        mp.setattr(om.config, "get", lambda: self.cfg)
-        mp.setattr(om.config, "update", self.config_update)
-        mp.setattr(odm.config, "get", lambda: self.cfg)
-        mp.setattr(odm.config, "update", self.config_update)
         mp.setattr(state_db, "quota_load", lambda key: deepcopy(self.quota.get(key)))
         mp.setattr(state_db, "quota_save", self.quota_save)
         mp.setattr(state_db, "quota_delete", lambda key: self.quota.pop(key, None))
@@ -150,7 +146,6 @@ class FakeEnv:
             key, page=page, filter_key=filt, month_snapshot={}, model_stats=[]
         ))
         mp.setattr(oauth_manager, "evaluate_and_toggle_by_cached_quota", lambda key: None)
-        mp.setattr(om.oauth_manager, "evaluate_and_toggle_by_cached_quota", lambda key: None)
         mp.setattr(om.threading, "Thread", ImmediateThread)
         ImmediateThread.events = []
         DeferredThread.events = []

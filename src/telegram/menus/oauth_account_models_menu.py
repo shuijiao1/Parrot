@@ -9,10 +9,7 @@ from typing import Optional
 
 from ...management_control.oauth.menu_bridge import (
     control as oauth_control,
-    cooldown,
-    cursor_model_catalog,
     model_metadata,
-    oauth_manager,
     telegram_context as _management_context,
 )
 from .. import menu_cache, states, ui

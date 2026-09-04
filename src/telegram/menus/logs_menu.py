@@ -19,6 +19,7 @@ from typing import Optional
 from ... import config, log_db, oauth_manager
 from ...management_control.observability import DEFAULT_LOGS_CONTROL, telegram_context
 from .. import log_inspector, states, ui
+from .status_update_banner import suffix_status_update_banner as _maybe_suffix_status_banner
 
 
 _CONTROL = DEFAULT_LOGS_CONTROL
@@ -186,28 +187,6 @@ def _page_rows(state: dict) -> tuple[list[dict], int, int, int, dict]:
         offset=(page - 1) * _LIST_PAGE_SIZE, **filters,
     )
     return rows, total, page, total_pages, st
-
-
-def _maybe_suffix_status_banner(text: str) -> str:
-    """在文本底部追加 banner：上游故障 + 新版本可用（任一存在即拼到末尾）。"""
-    extras: list[str] = []
-    try:
-        from ... import status_monitor
-        line = status_monitor.get_active_summary()
-        if line:
-            extras.append(line)
-    except Exception:
-        pass
-    try:
-        from ... import update_checker
-        line = update_checker.get_update_banner()
-        if line:
-            extras.append(line)
-    except Exception:
-        pass
-    if not extras:
-        return text
-    return text + "\n\n" + "\n".join(extras)
 
 
 def _display_index(page: int, idx: int) -> int:
