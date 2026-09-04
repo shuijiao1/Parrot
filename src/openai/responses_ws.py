@@ -96,6 +96,7 @@ from .handler import (
 )
 from .responses_ws_runtime import (
     dump_frame,
+    flatten_ws_response_headers,
     identity_expose_frame,
     identity_log_text,
     loads_frame,
@@ -754,26 +755,26 @@ async def _run_ws_failover(
             idx += 1
             continue
 
-        attempt_proxy = _pick_non_direct_proxy_name(ch, resolved_model)
-        attempt_started_monotonic = time.monotonic()
-        attempt_id = await asyncio.to_thread(
-            log_db.record_retry_attempt,
-            request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
-            proxy_name=attempt_proxy,
-            upstream_protocol=getattr(ch, "protocol", "openai-responses"),
-            client_visible_model=client_visible_model,
-        )
-        if attempt_proxy:
-            await asyncio.to_thread(
-                log_db.update_pending, request_id, proxy_name=attempt_proxy,
-            )
-
         turn_capacity = _WsTurnCapacity(
             api_key_lease=api_key_lease,
             channel_key=channel_state.effect_key(ch),
             channel_held=True,
         )
         try:
+            attempt_proxy = _pick_non_direct_proxy_name(ch, resolved_model)
+            attempt_started_monotonic = time.monotonic()
+            attempt_id = await asyncio.to_thread(
+                log_db.record_retry_attempt,
+                request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
+                proxy_name=attempt_proxy,
+                upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+                client_visible_model=client_visible_model,
+            )
+            if attempt_proxy:
+                await asyncio.to_thread(
+                    log_db.update_pending, request_id, proxy_name=attempt_proxy,
+                )
+
             result = await _try_ws_channel(
                 websocket, first_obj=first_obj,
                 ch=ch, resolved_model=resolved_model, body=body,
@@ -917,7 +918,11 @@ async def _run_ws_failover(
         )
         if not result.openai_oauth_html_403:
             finalize_policy.apply_error_health_effects(
-                finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+                finalize_policy.error_plan(
+                    result.outcome,
+                    failure_policy="runtime",
+                    http_status=result.http_status,
+                ),
                 scorer=scorer,
                 cooldown=cooldown,
                 channel_key=channel_state.effect_key(ch),
@@ -954,21 +959,21 @@ async def _run_ws_failover(
                 ch, resolved_model = payload  # type: ignore[assignment]
                 attempt_order += 1
                 last_ch, last_model = ch, resolved_model
-                attempt_proxy = _pick_non_direct_proxy_name(ch, resolved_model)
-                attempt_started_monotonic2 = time.monotonic()
-                attempt_id = await asyncio.to_thread(
-                    log_db.record_retry_attempt,
-                    request_id, attempt_order, ch.key, ch.type, resolved_model,
-                    time.time(), proxy_name=attempt_proxy,
-                    upstream_protocol=getattr(ch, "protocol", "openai-responses"),
-                    client_visible_model=client_visible_model,
-                )
                 turn_capacity = _WsTurnCapacity(
                     api_key_lease=api_key_lease,
                     channel_key=channel_state.effect_key(ch),
                     channel_held=True,
                 )
                 try:
+                    attempt_proxy = _pick_non_direct_proxy_name(ch, resolved_model)
+                    attempt_started_monotonic2 = time.monotonic()
+                    attempt_id = await asyncio.to_thread(
+                        log_db.record_retry_attempt,
+                        request_id, attempt_order, ch.key, ch.type, resolved_model,
+                        time.time(), proxy_name=attempt_proxy,
+                        upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+                        client_visible_model=client_visible_model,
+                    )
                     result = await _try_ws_channel(
                         websocket, first_obj=first_obj,
                         ch=ch, resolved_model=resolved_model, body=body,
@@ -1051,7 +1056,11 @@ async def _run_ws_failover(
                 )
                 if not result.openai_oauth_html_403:
                     finalize_policy.apply_error_health_effects(
-                        finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+                        finalize_policy.error_plan(
+                            result.outcome,
+                            failure_policy="runtime",
+                            http_status=result.http_status,
+                        ),
                         scorer=scorer,
                         cooldown=cooldown,
                         channel_key=channel_state.effect_key(ch),
@@ -1854,12 +1863,13 @@ async def _try_sse_channel(
             detail = body_bytes.decode("utf-8", errors="replace")[:2000] or detail
         except asyncio.CancelledError:
             response_text = b"".join(parts).decode("utf-8", errors="replace")
-            timing_snapshot = await await_ws_owned(asyncio.to_thread(
-                finalize_opened_http_response,
-                opened,
-                "cancelled",
-                "HTTP error response read cancelled",
-            ))
+            timing_snapshot = await await_ws_owned(
+                finalize_opened_http_response(
+                    opened,
+                    "cancelled",
+                    "HTTP error response read cancelled",
+                )
+            )
             _sync_http_proxy_bytes(proxy_bytes, opened)
             normalized = model_pricing.normalize_response_billing(response_text)
             usage = {
@@ -1969,8 +1979,7 @@ async def _try_sse_channel(
             retry_after_seconds=_retry_after_from_headers(response.headers),
         )
         _sync_http_proxy_bytes(proxy_bytes, opened)
-        await asyncio.to_thread(
-            finalize_opened_http_response,
+        await finalize_opened_http_response(
             opened,
             result.outcome,
             result.error_detail,
@@ -2004,9 +2013,7 @@ async def _try_sse_channel(
         nonlocal round_terminalized
         if round_terminalized:
             return
-        await asyncio.to_thread(
-            finalize_opened_http_response, opened, outcome, error_detail,
-        )
+        await finalize_opened_http_response(opened, outcome, error_detail)
         _apply_http_snapshot(result, opened, terminal=True)
         _sync_http_proxy_bytes(proxy_bytes, opened)
         round_terminalized = True
@@ -2099,7 +2106,11 @@ async def _try_sse_channel(
             ))
         else:
             finalize_policy.apply_error_health_effects(
-                finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+                finalize_policy.error_plan(
+                    result.outcome,
+                    failure_policy="runtime",
+                    http_status=result.http_status,
+                ),
                 scorer=scorer,
                 cooldown=cooldown,
                 channel_key=channel_state.effect_key(ch),
@@ -2655,7 +2666,11 @@ async def _relay_ws_session(
             ))
         else:
             finalize_policy.apply_error_health_effects(
-                finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+                finalize_policy.error_plan(
+                    result.outcome,
+                    failure_policy="runtime",
+                    http_status=result.http_status,
+                ),
                 scorer=scorer,
                 cooldown=cooldown,
                 channel_key=channel_state.effect_key(ch),
@@ -3209,7 +3224,7 @@ def _maybe_record_codex_ws_snapshot(ch: Channel, ws_response: Any) -> None:
         headers_obj = getattr(ws_response, "headers", None)
         if not headers_obj:
             return
-        headers = {str(k): str(v) for k, v in headers_obj.items()}
+        headers = flatten_ws_response_headers(headers_obj)
         from .. import failover
         # Reuse HTTP failover's response-header path so passive quota snapshot,
         # threshold auto-disable, and notification behavior stay identical.
@@ -3229,7 +3244,11 @@ async def _finalize_ws_attempt_after_accept(
     start_time: float,
     start_monotonic: float,
 ) -> None:
-    plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
+    plan = finalize_policy.error_plan(
+        result.outcome,
+        failure_policy="runtime",
+        http_status=result.http_status,
+    )
     finalize_policy.apply_error_health_effects(
         plan,
         scorer=scorer,
@@ -3405,6 +3424,7 @@ async def _send_terminal_error_frame(
         "authentication_error" if http_status == 401 else
         "permission_error" if http_status == 403 else
         "payment_required" if http_status == 402 else
+        "not_found_error" if http_status == 404 else
         "rate_limit_error" if http_status == 429 else
         "api_error"
     )
@@ -3541,6 +3561,8 @@ def _aggregate_failed_candidate_status(statuses: list[int]) -> int:
         return 403
     if unique == {402}:
         return 402
+    if unique == {404}:
+        return 404
     if unique == {429}:
         return 429
     return 503
@@ -3553,6 +3575,7 @@ def _safe_terminal_failure_message(http_status: int, *, attempted: bool) -> str:
         401: "All upstream candidates rejected authentication",
         402: "All upstream candidates reported insufficient balance",
         403: "All upstream candidates denied permission",
+        404: "All upstream candidates reported the requested resource was not found",
         429: "All upstream candidates are rate limited",
     }
     return summaries.get(http_status, "Upstream candidates failed")

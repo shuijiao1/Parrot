@@ -7,12 +7,16 @@ All transport objects are local fakes; this module performs no network I/O.
 from __future__ import annotations
 
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from src.tests import conftest as test_conftest
 from src.transports import http_runtime
+from src.transports.timing import HttpAttemptTiming
 
 
 class _Stats:
@@ -186,7 +190,8 @@ async def test_direct_stream_round_records_direct_and_only_nonempty_raw_bytes_ar
             aiter, opened.timing, opened.round_timeouts,
         )
     opened.timing.mark_io_complete()
-    terminal = http_runtime.finalize_opened_http_response(opened, "success")
+    terminal = await http_runtime.finalize_opened_http_response(opened, "success")
+    await http_runtime._drain_proxy_attempt_persistence()
 
     assert first == b"first"
     assert second == b"second"
@@ -252,7 +257,8 @@ async def test_nonstream_connection_is_send_complete_first_is_null_and_idle_star
         round_timeouts=opened.round_timeouts,
     )
     assert body.error is None and body.raw == b"payload"
-    terminal = http_runtime.finalize_opened_http_response(opened, "success")
+    terminal = await http_runtime.finalize_opened_http_response(opened, "success")
+    await http_runtime._drain_proxy_attempt_persistence()
     assert terminal.connection_ms is not None
     assert terminal.first_byte_ms is None
     assert terminal.idle_ms is not None
@@ -280,6 +286,7 @@ async def test_proxy_switch_creates_fresh_round_and_terminalizes_previous_round(
 
     monkeypatch.setattr(http_runtime, "open_stream", open_stream)
     opened = await http_runtime.open_response_with_proxy_chain(**_open_kwargs())
+    await http_runtime._drain_proxy_attempt_persistence()
 
     assert opened.ok
     assert [row["proxy_name"] for row in inserted] == ["p1", "direct"]
@@ -303,7 +310,12 @@ async def test_proxy_route_is_not_replayed_after_request_dispatch_started(monkey
     monkeypatch.setattr(
         http_runtime.log_db,
         "mark_retry_attempt_dispatch",
-        lambda retry_id, body, **_kwargs: dispatched.append((retry_id, body)),
+        lambda retry_id, body, *, dispatch_metadata, dispatched_at: dispatched.append({
+            "retry_id": retry_id,
+            "body": body,
+            "dispatch_metadata": dispatch_metadata,
+            "dispatched_at": dispatched_at,
+        }),
     )
 
     def open_stream(client, request):
@@ -313,11 +325,16 @@ async def test_proxy_route_is_not_replayed_after_request_dispatch_started(monkey
 
     monkeypatch.setattr(http_runtime, "open_stream", open_stream)
     opened = await http_runtime.open_response_with_proxy_chain(**_open_kwargs())
+    await http_runtime._drain_proxy_attempt_persistence()
 
     assert opened.error is not None and opened.error.outcome == "read_timeout"
     assert calls == 1
     assert [row["proxy_name"] for row in inserted] == ["p1"]
-    assert dispatched == [("retry-handle", b"{}")]
+    assert len(dispatched) == 1
+    assert dispatched[0]["retry_id"] == "retry-handle"
+    assert dispatched[0]["body"] == b"{}"
+    assert dispatched[0]["dispatch_metadata"] is None
+    assert isinstance(dispatched[0]["dispatched_at"], float)
     assert updates[-1][1]["outcome"] == "read_timeout"
 
 
@@ -345,10 +362,78 @@ async def test_httpx_transport_timeouts_remain_distinct_from_business_timeouts(
     )
 
     opened = await http_runtime.open_response_with_proxy_chain(**_open_kwargs())
+    await http_runtime._drain_proxy_attempt_persistence()
     assert opened.error is not None
     assert opened.error.outcome == outcome
     assert updates[-1][1]["outcome"] == outcome
     assert updates[-1][1]["total_ms"] is not None
+
+
+@pytest.mark.asyncio
+async def test_terminal_timing_freezes_before_real_executor_queue(monkeypatch):
+    now = {"monotonic": 0.0, "wall": 1000.0}
+    timing = HttpAttemptTiming(
+        response_mode="stream",
+        clock=lambda: now["monotonic"],
+        wall_clock=lambda: now["wall"],
+    )
+    timing.mark_connection_complete(at=0.1)
+    now["monotonic"] = 0.2
+    timing.mark_response_body_byte(b"first")
+    now["monotonic"] = 0.5
+    opened = http_runtime.OpenedHttpResponse(
+        timing=timing,
+        proxy_attempt_id="route-queued",
+        proxy_bytes={"up": 1, "down": 2},
+    )
+
+    persisted = []
+    monkeypatch.setattr(
+        http_runtime.log_db,
+        "update_proxy_attempt",
+        lambda handle, **kwargs: persisted.append((handle, kwargs)),
+    )
+    monkeypatch.setattr(asyncio, "to_thread", test_conftest._ORIG_TO_THREAD)
+
+    worker_started = threading.Event()
+    allow_worker = threading.Event()
+
+    def occupy_only_worker():
+        worker_started.set()
+        assert allow_worker.wait(timeout=5)
+
+    loop = asyncio.get_running_loop()
+    previous_executor = getattr(loop, "_default_executor", None)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            loop.set_default_executor(executor)
+            occupied = loop.run_in_executor(None, occupy_only_worker)
+            assert worker_started.wait(timeout=5)
+
+            finalizer = asyncio.create_task(
+                http_runtime.finalize_opened_http_response(opened, "success")
+            )
+            await asyncio.sleep(0)
+            assert timing.terminal is True
+            assert finalizer.done() is True
+            terminal = finalizer.result()
+            assert persisted == []
+
+            # Advancing the source clock while the real worker is queued must not
+            # extend metrics or delay the caller that can proceed to failover.
+            now["monotonic"] = 9.0
+            now["wall"] = 1008.5
+            allow_worker.set()
+            await occupied
+            await http_runtime._drain_proxy_attempt_persistence()
+    finally:
+        loop._default_executor = previous_executor
+
+    assert terminal.total_ms == 500
+    assert terminal.idle_ms == 300
+    assert persisted[0][0] == "route-queued"
+    assert persisted[0][1]["total_ms"] == 500
+    assert persisted[0][1]["idle_ms"] == 300
 
 
 @pytest.mark.asyncio
@@ -375,6 +460,7 @@ async def test_precommit_cancel_closes_owned_context_persists_cancel_and_rethrow
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    await http_runtime._drain_proxy_attempt_persistence()
 
     assert contexts[0].exited is True
     assert updates[-1][1]["outcome"] == "cancelled"

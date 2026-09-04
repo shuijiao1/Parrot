@@ -8,11 +8,15 @@ import json
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from starlette.websockets import WebSocketState
 
 from src.channel.base import build_dispatch_metadata
+from src.protocols.runtime import AttemptResult
+from src.scheduler import ScheduleResult
 
 from src.tests import conftest as test_conftest
 from src.tests import test_protocol_fake_upstreams as fake
@@ -186,6 +190,167 @@ async def test_http_stream_all_log_writes_run_outside_event_loop(monkeypatch, m)
     assert "worker path" in text
     assert write_threads
     assert all(thread_id != loop_thread for _name, thread_id in write_threads), write_threads
+
+
+@pytest.mark.parametrize(
+    ("transport", "saturated", "blocked_write"),
+    [
+        ("http", False, "record_retry_attempt"),
+        ("http", False, "update_pending"),
+        ("http", False, "update_retry_attempt"),
+        ("http", True, "record_retry_attempt"),
+        ("ws", False, "record_retry_attempt"),
+        ("ws", False, "update_pending"),
+        ("ws", True, "record_retry_attempt"),
+    ],
+)
+async def test_channel_slot_release_survives_real_executor_log_cancellation(
+    monkeypatch, m, transport, saturated, blocked_write,
+):
+    """Every post-acquire log await has an already-established release owner."""
+
+    fake._setup(m)
+    channel = fake._make_openai_channel(
+        f"cancel-{transport}-{blocked_write}-{int(saturated)}",
+        "https://cancel-slot.example",
+        protocol="openai-responses",
+        alias="model",
+        real="real-model",
+        extra={"maxConcurrent": 1},
+    )
+    fake._install_channels(m, [channel])
+    concurrency = m["failover"].concurrency
+    with concurrency._slots_guard:
+        concurrency._slots.clear()
+
+    entered = threading.Event()
+    allow_worker = threading.Event()
+    worker_done = threading.Event()
+    worker_threads = []
+    loop_thread = threading.get_ident()
+
+    def blocked(*_args, **_kwargs):
+        worker_threads.append(threading.get_ident())
+        entered.set()
+        try:
+            assert allow_worker.wait(timeout=5)
+            return "attempt-id" if blocked_write == "record_retry_attempt" else None
+        finally:
+            worker_done.set()
+
+    monkeypatch.setattr(m["log_db"], "record_retry_attempt", (
+        blocked if blocked_write == "record_retry_attempt" else
+        lambda *_args, **_kwargs: "attempt-id"
+    ))
+    monkeypatch.setattr(m["log_db"], "update_pending", (
+        blocked if blocked_write == "update_pending" else
+        lambda *_args, **_kwargs: None
+    ))
+    monkeypatch.setattr(m["log_db"], "update_retry_attempt", (
+        blocked if blocked_write == "update_retry_attempt" else
+        lambda *_args, **_kwargs: None
+    ))
+    monkeypatch.setattr(asyncio, "to_thread", test_conftest._ORIG_TO_THREAD)
+
+    route = ScheduleResult(
+        candidates=[] if saturated else [(channel, "real-model")],
+        saturated=[(channel, "real-model")] if saturated else [],
+        affinity_hit=False,
+        fp_query=None,
+        client_key="client:cancel",
+    )
+    body = {"model": "model", "input": "hello", "stream": False}
+
+    if transport == "http":
+        monkeypatch.setattr(
+            m["failover"], "_pick_non_direct_proxy_name",
+            lambda *_args: "proxy-a" if blocked_write == "update_pending" else None,
+        )
+        monkeypatch.setattr(
+            m["failover"], "_should_use_responses_upstream_ws",
+            lambda *_args, **_kwargs: False,
+        )
+
+        async def successful_attempt(*_args, **_kwargs):
+            return AttemptResult(success=True, outcome="success")
+
+        monkeypatch.setattr(m["failover"], "_try_channel", successful_attempt)
+        request = m["failover"].run_failover(
+            route,
+            body,
+            "cancel-request",
+            "key",
+            "1.2.3.4",
+            is_stream=False,
+            start_time=time.time(),
+            ingress_protocol="responses",
+        )
+    else:
+        monkeypatch.setattr(
+            m["responses_ws"], "_pick_non_direct_proxy_name",
+            lambda *_args: "proxy-a" if blocked_write == "update_pending" else None,
+        )
+
+        async def must_not_reach_upstream(*_args, **_kwargs):
+            raise AssertionError("cancellation point was not reached before dispatch")
+
+        monkeypatch.setattr(m["responses_ws"], "_try_ws_channel", must_not_reach_upstream)
+        request = m["responses_ws"]._run_ws_failover(
+            SimpleNamespace(application_state=WebSocketState.CONNECTED),
+            first_obj={"type": "response.create", **body},
+            schedule_result=route,
+            body=body,
+            request_id="cancel-request",
+            api_key_name="key",
+            client_ip="1.2.3.4",
+            start_time=time.time(),
+            start_monotonic=time.monotonic(),
+            fp_query=None,
+        )
+
+    task = asyncio.create_task(request)
+    try:
+        for _ in range(200):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert entered.is_set()
+        slot = next(
+            row for row in concurrency.snapshot()
+            if row["channel_key"] == channel.key
+        )
+        assert slot["in_flight"] == 1
+        assert worker_done.is_set() is False
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+
+        # The cancelled await doesn't cancel its underlying thread.  Release must
+        # nevertheless be complete before that worker is allowed to finish.
+        slot = next(
+            row for row in concurrency.snapshot()
+            if row["channel_key"] == channel.key
+        )
+        assert slot["in_flight"] == 0
+        assert worker_done.is_set() is False
+    finally:
+        allow_worker.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    for _ in range(200):
+        if worker_done.is_set():
+            break
+        await asyncio.sleep(0.005)
+    assert worker_done.is_set()
+    assert worker_threads and all(thread != loop_thread for thread in worker_threads)
+    slot = next(
+        row for row in concurrency.snapshot()
+        if row["channel_key"] == channel.key
+    )
+    assert slot["in_flight"] == 0
 
 
 @pytest.mark.parametrize(

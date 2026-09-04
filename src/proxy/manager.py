@@ -69,18 +69,15 @@ _snapshot = _EMPTY_SNAPSHOT
 # ── Init / Reload ────────────────────────────────────────────────
 
 def init() -> None:
-    """Initialize once; config reload callbacks own every later generation."""
+    """Poll config cheaply and build at most once for each loaded generation."""
     global _callback_registered, _initialized
-    if _initialized:
-        return
     with _lock:
-        if _initialized:
-            return
         if not _callback_registered:
             config.on_reload(_on_config_reload)
             _callback_registered = True
-        # Keep _initialized false until the complete first snapshot is visible,
-        # so concurrent callers cannot return while initialization is partial.
+        # config.get() performs the baseline mtime poll.  Its callback may install
+        # the new generation re-entrantly; the identity check below makes that and
+        # stable repeated init() calls no-ops without rebuilding runtime objects.
         _install_config_locked(config.get())
         _initialized = True
 

@@ -50,6 +50,7 @@ class OpenedHttpResponse:
     proxy_attempt_id: Any | None = None
     round_timeouts: RoundTimeouts | None = None
     error: AttemptResult | None = None
+    terminal_persistence_scheduled: bool = False
 
     @property
     def ok(self) -> bool:
@@ -1174,21 +1175,17 @@ def _resolve_http_route_chain(channel, resolved_model: str) -> tuple[list[tuple[
         return [("direct", None)], None
 
 
-def _persist_proxy_attempt_timing(
+def _persist_proxy_attempt_snapshot(
     proxy_attempt_id,
-    timing: HttpAttemptTiming,
+    snapshot,
     *,
     outcome: str | None,
     error_detail: str | None,
     proxy_bytes: dict,
-    terminal: bool,
-):
-    snapshot = (
-        timing.finish(outcome or "transport_error", error_detail)
-        if terminal else timing.snapshot()
-    )
+) -> None:
+    """Persist an already-frozen event-loop snapshot from a worker thread."""
     if proxy_attempt_id is None:
-        return snapshot
+        return
     try:
         log_db.update_proxy_attempt(
             proxy_attempt_id,
@@ -1215,26 +1212,87 @@ def _persist_proxy_attempt_timing(
         )
     except Exception:
         pass
-    return snapshot
 
 
-def finalize_opened_http_response(
+async def _persist_frozen_proxy_attempt(
+    proxy_attempt_id,
+    snapshot,
+    *,
+    outcome: str | None,
+    error_detail: str | None,
+    proxy_bytes: dict,
+) -> None:
+    if proxy_attempt_id is None:
+        return
+    await asyncio.to_thread(
+        _persist_proxy_attempt_snapshot,
+        proxy_attempt_id,
+        snapshot,
+        outcome=outcome,
+        error_detail=error_detail,
+        proxy_bytes=proxy_bytes,
+    )
+
+
+_proxy_persistence_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_frozen_proxy_attempt_persistence(
+    proxy_attempt_id,
+    snapshot,
+    *,
+    outcome: str | None,
+    error_detail: str | None,
+    proxy_bytes: dict,
+) -> None:
+    """Own a DB-only worker without holding up proxy or candidate failover."""
+    if proxy_attempt_id is None:
+        return
+    task = asyncio.create_task(_persist_frozen_proxy_attempt(
+        proxy_attempt_id,
+        snapshot,
+        outcome=outcome,
+        error_detail=error_detail,
+        proxy_bytes=dict(proxy_bytes),
+    ))
+    _proxy_persistence_tasks.add(task)
+
+    def completed(done: asyncio.Task) -> None:
+        _proxy_persistence_tasks.discard(done)
+        try:
+            done.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    task.add_done_callback(completed)
+
+
+async def _drain_proxy_attempt_persistence() -> None:
+    """Wait for currently owned proxy DB workers in deterministic tests."""
+    while _proxy_persistence_tasks:
+        await asyncio.gather(*tuple(_proxy_persistence_tasks), return_exceptions=True)
+
+
+async def finalize_opened_http_response(
     opened: OpenedHttpResponse,
     outcome: str,
     error_detail: str | None = None,
 ):
-    """Idempotently terminalize and persist one opened HTTP route round."""
+    """Freeze a route round on the event loop, then offload only persistence."""
 
     if opened.timing is None:
         return None
-    return _persist_proxy_attempt_timing(
-        opened.proxy_attempt_id,
-        opened.timing,
-        outcome=outcome,
-        error_detail=error_detail,
-        proxy_bytes=opened.proxy_bytes,
-        terminal=True,
-    )
+    snapshot = opened.timing.finish(outcome, error_detail)
+    if not opened.terminal_persistence_scheduled:
+        opened.terminal_persistence_scheduled = True
+        _schedule_frozen_proxy_attempt_persistence(
+            opened.proxy_attempt_id,
+            snapshot,
+            outcome=outcome,
+            error_detail=error_detail,
+            proxy_bytes=opened.proxy_bytes,
+        )
+    return snapshot
 
 
 async def _finish_pre_header_round(
@@ -1249,6 +1307,9 @@ async def _finish_pre_header_round(
     proxy_bytes: dict,
     persist_dispatch=None,
 ) -> AttemptResult:
+    # The raised I/O result is the terminal boundary.  Freeze before dispatch
+    # bookkeeping, socket cleanup, or an executor queue can extend the round.
+    snapshot = timing.finish(outcome, detail)
     if persist_dispatch is not None:
         await persist_dispatch()
     if ctx is not None:
@@ -1257,14 +1318,12 @@ async def _finish_pre_header_round(
     result = _attempt_result(
         outcome, detail, bucket=proxy_bytes, proxy_name=proxy_name,
     )
-    await asyncio.to_thread(
-        _persist_proxy_attempt_timing,
+    _schedule_frozen_proxy_attempt_persistence(
         proxy_attempt_id,
-        timing,
+        snapshot,
         outcome=outcome,
         error_detail=detail,
         proxy_bytes=proxy_bytes,
-        terminal=True,
     )
     return timing.apply_to(result, terminal=False)
 
@@ -1451,10 +1510,6 @@ async def open_response_with_proxy_chain(
                 ),
             )
         except Exception as exc:
-            await close_proxy_client(proxy_client)
-            if connector is not None:
-                connector.stats.total_failures += 1
-                connector.stats.last_error = str(exc)[:200]
             last_pre_header = _with_timing(timing, _attempt_result(
                 connection_lifecycle_outcome(
                     exc, http_phase="pre_headers",
@@ -1463,14 +1518,19 @@ async def open_response_with_proxy_chain(
                 bucket=proxy_bytes,
                 proxy_name=proxy_name_used,
             ))
-            await asyncio.to_thread(
-                _persist_proxy_attempt_timing,
+            snapshot = timing.finish(
+                last_pre_header.outcome, last_pre_header.error_detail,
+            )
+            await close_proxy_client(proxy_client)
+            if connector is not None:
+                connector.stats.total_failures += 1
+                connector.stats.last_error = str(exc)[:200]
+            _schedule_frozen_proxy_attempt_persistence(
                 proxy_attempt_id,
-                timing,
+                snapshot,
                 outcome=last_pre_header.outcome,
                 error_detail=last_pre_header.error_detail,
                 proxy_bytes=proxy_bytes,
-                terminal=True,
             )
             continue
 
@@ -1573,15 +1633,14 @@ async def open_response_with_proxy_chain(
                 return OpenedHttpResponse(error=last_pre_header)
             continue
 
-        connect_ms = timing.snapshot().connect_ms
-        await asyncio.to_thread(
-            _persist_proxy_attempt_timing,
+        open_snapshot = timing.snapshot()
+        connect_ms = open_snapshot.connect_ms
+        await _persist_frozen_proxy_attempt(
             proxy_attempt_id,
-            timing,
+            open_snapshot,
             outcome="open",
             error_detail=None,
             proxy_bytes=proxy_bytes,
-            terminal=False,
         )
         if connector is not None:
             connector.stats.total_successes += 1

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -72,7 +74,7 @@ def test_init_rebuilds_once_per_generation_and_reload_is_immediately_visible(mon
         manager.init()
 
     assert builds == [first]
-    assert config_reads == [first]
+    assert config_reads == [first] * 100
     assert callbacks == [manager._on_config_reload]
     old_connector = manager.get_connector("p1")
     old_connector.stats.total_attempts = 7
@@ -82,7 +84,7 @@ def test_init_rebuilds_once_per_generation_and_reload_is_immediately_visible(mon
     callbacks[0](second)
 
     assert builds == [first, second]
-    assert config_reads == [first, second]
+    assert config_reads == ([first] * 100) + [second]
     assert manager.get_connector("p1") is not old_connector
     assert manager.get_connector("p1").stats is old_connector.stats
     assert manager.get_connector("p1").stats.total_attempts == 7
@@ -93,7 +95,7 @@ def test_init_rebuilds_once_per_generation_and_reload_is_immediately_visible(mon
     for _ in range(100):
         manager.init()
     assert builds == [first, second]
-    assert config_reads == [first, second]
+    assert config_reads == ([first] * 100) + ([second] * 101)
     assert callbacks == [manager._on_config_reload]
 
     # Public copies cannot mutate the immutable generation held by the manager.
@@ -103,6 +105,59 @@ def test_init_rebuilds_once_per_generation_and_reload_is_immediately_visible(mon
     routing["accounts"]["account"].append("injected")
     assert manager.get_group("group-second") == ["p1", "p2"]
     assert manager.resolve_proxy_chain(account_key="account") == ["p1", "p2"]
+
+
+def test_repeated_init_detects_external_config_replacement_without_rebuilding_stable_generation(
+    monkeypatch, tmp_path,
+):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_config("first", ("p1",))), encoding="utf-8")
+
+    monkeypatch.setattr(manager.config, "CONFIG_PATH", str(path))
+    monkeypatch.setattr(manager.config, "_cache", None)
+    monkeypatch.setattr(manager.config, "_mtime", 0.0)
+    monkeypatch.setattr(manager.config, "_reload_callbacks", [])
+    monkeypatch.setattr(manager, "_initialized", False)
+    monkeypatch.setattr(manager, "_callback_registered", False)
+    monkeypatch.setattr(manager, "_config_generation", None)
+    monkeypatch.setattr(manager, "_snapshot", manager._EMPTY_SNAPSHOT)
+    monkeypatch.setattr(
+        manager,
+        "connector_from_config",
+        lambda name, cfg: _FakeConnector(name, cfg["marker"]),
+    )
+    builds = []
+    real_build = manager._build_snapshot
+
+    def counted_build(cfg, previous):
+        builds.append(cfg)
+        return real_build(cfg, previous)
+
+    monkeypatch.setattr(manager, "_build_snapshot", counted_build)
+    manager.init()
+    first_snapshot = manager._snapshot
+    assert manager.resolve_proxy_chain(account_key="account") == ["p1"]
+
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text(
+        json.dumps(_config("second", ("p1", "p2"))), encoding="utf-8",
+    )
+    current_mtime_ns = path.stat().st_mtime_ns
+    os.utime(replacement, ns=(current_mtime_ns + 2_000_000_000,) * 2)
+    os.replace(replacement, path)
+
+    # No explicit config.reload/update and no manual callback: init() itself must
+    # retain the baseline mtime-poll trigger while generation identity avoids work.
+    manager.init()
+    second_snapshot = manager._snapshot
+    assert second_snapshot is not first_snapshot
+    assert manager.resolve_proxy_chain(account_key="account") == ["p1", "p2"]
+    assert manager.get_connector("p2").marker == "second"
+    assert len(builds) == 2
+
+    manager.init()
+    assert manager._snapshot is second_snapshot
+    assert len(builds) == 2
 
 
 def test_concurrent_first_init_registers_and_builds_once(monkeypatch):
@@ -138,7 +193,7 @@ def test_concurrent_first_init_registers_and_builds_once(monkeypatch):
             future.result(timeout=5)
 
     assert build_count == 1
-    assert config_reads == [cfg]
+    assert config_reads == [cfg] * 24
     assert callbacks == [manager._on_config_reload]
     assert list(manager.all_connectors()) == ["p1", "p2", "p3", "direct"]
     assert manager.get_group("group-only") == ["p1", "p2", "p3"]

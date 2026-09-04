@@ -36,6 +36,7 @@ from .transform import cc_mimicry
 from .openai import compaction_owner, deepseek_reasoning, reasoning_replay
 from .openai.codex_identity_confuse import ConfuseState
 from .openai.responses_ws_runtime import (
+    flatten_ws_response_headers,
     identity_expose_frame,
     identity_log_text,
     prepare_oauth_responses_ws_request_parts,
@@ -1706,23 +1707,9 @@ async def run_failover(
             idx += 1
             continue
 
-        # Resolve proxy for this attempt (read from proxy manager)
-        _attempt_proxy: str | None = _pick_non_direct_proxy_name(ch, resolved_model)
-
-        attempt_started_monotonic = time.monotonic()
-        attempt_id = await asyncio.to_thread(
-            log_db.record_retry_attempt,
-            request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
-            proxy_name=_attempt_proxy,
-            upstream_protocol=getattr(ch, "protocol", "anthropic"),
-            client_visible_model=client_visible_model,
-        )
-        if _attempt_proxy:
-            await asyncio.to_thread(
-                log_db.update_pending, request_id, proxy_name=_attempt_proxy,
-            )
-
         release_done = False
+        slot_phase_complete = False
+
         def _release_once(_key=channel_state.effect_key(ch)):
             nonlocal release_done
             if release_done:
@@ -1731,6 +1718,22 @@ async def run_failover(
             concurrency.release(_key)
 
         try:
+            # Resolve proxy for this attempt (read from proxy manager)
+            _attempt_proxy: str | None = _pick_non_direct_proxy_name(ch, resolved_model)
+
+            attempt_started_monotonic = time.monotonic()
+            attempt_id = await asyncio.to_thread(
+                log_db.record_retry_attempt,
+                request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
+                proxy_name=_attempt_proxy,
+                upstream_protocol=getattr(ch, "protocol", "anthropic"),
+                client_visible_model=client_visible_model,
+            )
+            if _attempt_proxy:
+                await asyncio.to_thread(
+                    log_db.update_pending, request_id, proxy_name=_attempt_proxy,
+                )
+
             candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
             candidate_openai_local_web_loop = openai_local_web_loop_active
             effective_is_stream = is_stream and not (candidate_local_web_loop or candidate_openai_local_web_loop)
@@ -1761,43 +1764,50 @@ async def run_failover(
                     attempt_start_monotonic=attempt_started_monotonic,
                     terminal_release=_release_once,
                 )
-        except BaseException:
-            _release_once()
-            raise
-        result = _request_invalid_result_if_needed(result)
-        last_result = result
-        quota_exhaustion = bounded_account_quota_error(result)
-        if not result.success and not result.stream_started:
-            structured_attempts.append(
-                _structured_attempt_error(result, attempt_order, ch),
-            )
-        if _attempt_proxy and not result.proxy_name:
-            result.proxy_name = _attempt_proxy
+            result = _request_invalid_result_if_needed(result)
+            last_result = result
+            quota_exhaustion = bounded_account_quota_error(result)
+            if not result.success and not result.stream_started:
+                structured_attempts.append(
+                    _structured_attempt_error(result, attempt_order, ch),
+                )
+            if _attempt_proxy and not result.proxy_name:
+                result.proxy_name = _attempt_proxy
 
-        await asyncio.to_thread(
-            log_db.update_retry_attempt,
-            attempt_id,
-            final_round_id=result.round_id,
-            connect_ms=result.connect_ms,
-            first_byte_ms=result.first_byte_ms,
-            idle_ms=result.idle_ms,
-            attempt_elapsed_ms=(
-                None if result.stream_started else _elapsed_ms(attempt_started_monotonic)
-            ),
-            request_upload_ms=result.request_upload_ms,
-            response_headers_wait_ms=result.response_headers_wait_ms,
-            response_body_first_byte_wait_ms=result.response_body_first_byte_wait_ms,
-            total_ms=result.total_ms,
-            ended_at=(None if result.stream_started else time.time()),
-            outcome=("open" if result.stream_started else result.outcome),
-            error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
-            proxy_name=result.proxy_name,
-            bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
-            bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
-            response_body=getattr(result, "full_response_text", None),
-            usage=getattr(result, "usage", None),
-            usage_observed=getattr(result, "usage_observed", None),
-        )
+            await asyncio.to_thread(
+                log_db.update_retry_attempt,
+                attempt_id,
+                final_round_id=result.round_id,
+                connect_ms=result.connect_ms,
+                first_byte_ms=result.first_byte_ms,
+                idle_ms=result.idle_ms,
+                attempt_elapsed_ms=(
+                    None if result.stream_started else _elapsed_ms(attempt_started_monotonic)
+                ),
+                request_upload_ms=result.request_upload_ms,
+                response_headers_wait_ms=result.response_headers_wait_ms,
+                response_body_first_byte_wait_ms=result.response_body_first_byte_wait_ms,
+                total_ms=result.total_ms,
+                ended_at=(None if result.stream_started else time.time()),
+                outcome=("open" if result.stream_started else result.outcome),
+                error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
+                proxy_name=result.proxy_name,
+                bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
+                bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
+                response_body=getattr(result, "full_response_text", None),
+                usage=getattr(result, "usage", None),
+                usage_observed=getattr(result, "usage_observed", None),
+            )
+            slot_phase_complete = True
+        finally:
+            if not slot_phase_complete:
+                _release_once()
+
+        # No later await may retain a completed non-stream/error upstream slot.
+        if (result.success and (candidate_local_web_loop or candidate_openai_local_web_loop)) or (
+            not result.success and not result.stream_started
+        ):
+            _release_once()
 
         if result.success and candidate_local_web_loop:
             assistant_msg = result.assistant_response if isinstance(result.assistant_response, dict) else None
@@ -2122,7 +2132,11 @@ async def run_failover(
             error_detail=result.error_detail,
         )
         if quota_reset_ms is not None:
-            plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
+            plan = finalize_policy.error_plan(
+                result.outcome,
+                failure_policy="runtime",
+                http_status=result.http_status,
+            )
             if plan.record_cooldown_error:
                 cooldown.record_error(
                     channel_state.effect_key(ch),
@@ -2171,7 +2185,11 @@ async def run_failover(
 
         # 普通失败处理；HTML 403 只推进候选，不归咎账号或渠道健康。
         if not result.openai_oauth_html_403:
-            plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
+            plan = finalize_policy.error_plan(
+                result.outcome,
+                failure_policy="runtime",
+                http_status=result.http_status,
+            )
             finalize_policy.apply_error_health_effects(
                 plan,
                 scorer=scorer,
@@ -2213,27 +2231,30 @@ async def run_failover(
             if acquired is not None:
                 _ch_key, payload = acquired
                 ch, resolved_model = payload  # type: ignore[assignment]
-                attempt_order += 1
-                last_ch_key, last_ch_type, last_model = ch.key, ch.type, resolved_model
-                last_ch_protocol = getattr(ch, "protocol", "anthropic")
-
-                _attempt_proxy2: str | None = _pick_non_direct_proxy_name(ch, resolved_model)
-                attempt_started_monotonic2 = time.monotonic()
-                attempt_id = await asyncio.to_thread(
-                    log_db.record_retry_attempt,
-                    request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
-                    proxy_name=_attempt_proxy2,
-                    upstream_protocol=getattr(ch, "protocol", "anthropic"),
-                    client_visible_model=client_visible_model,
-                )
                 release_done2 = False
+                slot_phase_complete2 = False
+
                 def _release_q(_key=channel_state.effect_key(ch)):
                     nonlocal release_done2
                     if release_done2:
                         return
                     release_done2 = True
                     concurrency.release(_key)
+
                 try:
+                    attempt_order += 1
+                    last_ch_key, last_ch_type, last_model = ch.key, ch.type, resolved_model
+                    last_ch_protocol = getattr(ch, "protocol", "anthropic")
+
+                    _attempt_proxy2: str | None = _pick_non_direct_proxy_name(ch, resolved_model)
+                    attempt_started_monotonic2 = time.monotonic()
+                    attempt_id = await asyncio.to_thread(
+                        log_db.record_retry_attempt,
+                        request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
+                        proxy_name=_attempt_proxy2,
+                        upstream_protocol=getattr(ch, "protocol", "anthropic"),
+                        client_visible_model=client_visible_model,
+                    )
                     candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
                     candidate_openai_local_web_loop = openai_local_web_loop_active
                     effective_is_stream = is_stream and not (candidate_local_web_loop or candidate_openai_local_web_loop)
@@ -2264,41 +2285,48 @@ async def run_failover(
                             attempt_start_monotonic=attempt_started_monotonic2,
                             terminal_release=_release_q,
                         )
-                except BaseException:
-                    _release_q()
-                    raise
-                result = _request_invalid_result_if_needed(result)
-                last_result = result
-                if not result.success and not result.stream_started:
-                    structured_attempts.append(
-                        _structured_attempt_error(result, attempt_order, ch),
+                    result = _request_invalid_result_if_needed(result)
+                    last_result = result
+                    if not result.success and not result.stream_started:
+                        structured_attempts.append(
+                            _structured_attempt_error(result, attempt_order, ch),
+                        )
+                    if _attempt_proxy2 and not result.proxy_name:
+                        result.proxy_name = _attempt_proxy2
+                    await asyncio.to_thread(
+                        log_db.update_retry_attempt,
+                        attempt_id,
+                        final_round_id=result.round_id,
+                        connect_ms=result.connect_ms,
+                        first_byte_ms=result.first_byte_ms,
+                        idle_ms=result.idle_ms,
+                        attempt_elapsed_ms=(
+                            None if result.stream_started else _elapsed_ms(attempt_started_monotonic2)
+                        ),
+                        request_upload_ms=result.request_upload_ms,
+                        response_headers_wait_ms=result.response_headers_wait_ms,
+                        response_body_first_byte_wait_ms=result.response_body_first_byte_wait_ms,
+                        total_ms=result.total_ms,
+                        ended_at=(None if result.stream_started else time.time()),
+                        outcome=("open" if result.stream_started else result.outcome),
+                        error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
+                        proxy_name=result.proxy_name,
+                        bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
+                        bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
+                        response_body=getattr(result, "full_response_text", None),
+                        usage=getattr(result, "usage", None),
+                        usage_observed=getattr(result, "usage_observed", None),
                     )
-                if _attempt_proxy2 and not result.proxy_name:
-                    result.proxy_name = _attempt_proxy2
-                await asyncio.to_thread(
-                    log_db.update_retry_attempt,
-                    attempt_id,
-                    final_round_id=result.round_id,
-                    connect_ms=result.connect_ms,
-                    first_byte_ms=result.first_byte_ms,
-                    idle_ms=result.idle_ms,
-                    attempt_elapsed_ms=(
-                        None if result.stream_started else _elapsed_ms(attempt_started_monotonic2)
-                    ),
-                    request_upload_ms=result.request_upload_ms,
-                    response_headers_wait_ms=result.response_headers_wait_ms,
-                    response_body_first_byte_wait_ms=result.response_body_first_byte_wait_ms,
-                    total_ms=result.total_ms,
-                    ended_at=(None if result.stream_started else time.time()),
-                    outcome=("open" if result.stream_started else result.outcome),
-                    error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
-                    proxy_name=result.proxy_name,
-                    bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
-                    bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
-                    response_body=getattr(result, "full_response_text", None),
-                    usage=getattr(result, "usage", None),
-                    usage_observed=getattr(result, "usage_observed", None),
-                )
+                    slot_phase_complete2 = True
+                finally:
+                    if not slot_phase_complete2:
+                        _release_q()
+
+                if (result.success and (candidate_local_web_loop or candidate_openai_local_web_loop)) or (
+                    not result.success and not result.stream_started
+                ):
+                    _release_q()
+
                 if result.success and candidate_local_web_loop and downstream_stream_requested:
                     result.response = local_web_tools.maybe_wrap_anthropic_json_response_as_sse(result.response)
                 if result.success and candidate_openai_local_web_loop and downstream_stream_requested:
@@ -2345,7 +2373,11 @@ async def run_failover(
                     )
                 # 排队拿到的这次也失败了 → 落入"全失败"分支
                 if not result.openai_oauth_html_403:
-                    plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
+                    plan = finalize_policy.error_plan(
+                        result.outcome,
+                        failure_policy="runtime",
+                        http_status=result.http_status,
+                    )
                     finalize_policy.apply_error_health_effects(
                         plan,
                         scorer=scorer,
@@ -2394,6 +2426,11 @@ async def run_failover(
     ):
         status = 403
         err_type = "api_error"
+    elif structured_attempts and {
+        item.get("status") for item in structured_attempts
+    } == {404}:
+        status = 404
+        err_type = protocol_errors.legacy_anthropic_error_type_for_http_status(404)
     elif structured_attempts and classifications <= {"authentication_error", "permission_error"}:
         statuses = {item.get("status") for item in structured_attempts}
         status = 401 if statuses == {401} else 403
@@ -2601,7 +2638,7 @@ def _maybe_record_codex_ws_snapshot(ch: Channel, ws_response: Any) -> None:
         headers_obj = getattr(ws_response, "headers", None)
         if not headers_obj:
             return
-        headers = {str(k): str(v) for k, v in headers_obj.items()}
+        headers = flatten_ws_response_headers(headers_obj)
         fake_resp = type("_WsResp", (), {"headers": headers})()
         _maybe_record_codex_snapshot(ch, fake_resp)
     except Exception as exc:
@@ -3592,7 +3629,11 @@ async def _finalize_oauth_ws_error(
     timing: WsAttemptTiming,
 ) -> None:
     result = _request_invalid_result_if_needed(result)
-    plan = finalize_policy.error_plan(result.outcome, failure_policy="cooldown_only")
+    plan = finalize_policy.error_plan(
+        result.outcome,
+        failure_policy="cooldown_only",
+        http_status=result.http_status,
+    )
     finalize_policy.apply_error_health_effects(
         plan,
         scorer=scorer,
@@ -4168,7 +4209,7 @@ async def _try_channel(
                 and is_html_error_document(result.full_response_text)
             )
             result = _request_invalid_result_if_needed(result)
-            result = await asyncio.to_thread(_finalize_http_attempt, opened, result)
+            result = await _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
             return result
 
@@ -4191,7 +4232,7 @@ async def _try_channel(
                 cancel_state=cancel_state,
             )
             result = _attach_retry_after_from_response(result, upstream_resp, ch)
-            result = await asyncio.to_thread(_finalize_http_attempt, opened, result)
+            result = await _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
             return result
 
@@ -4220,7 +4261,7 @@ async def _try_channel(
         )
         result = _attach_retry_after_from_response(result, upstream_resp, ch)
         if not result.stream_started:
-            result = await asyncio.to_thread(_finalize_http_attempt, opened, result)
+            result = await _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
         return result
     except asyncio.CancelledError:
@@ -4231,7 +4272,7 @@ async def _try_channel(
             error_detail="upstream HTTP round cancelled before downstream commit",
         )
         cancelled = await await_ws_owned(
-            asyncio.to_thread(_finalize_http_attempt, opened, cancelled)
+            _finalize_http_attempt(opened, cancelled)
         )
         try:
             await await_ws_owned(finish_cancelled_http_attempt(
@@ -4254,11 +4295,11 @@ async def _try_channel(
             outcome=lifecycle or "transport_error",
             error_detail=f"unexpected: {exc}",
         )
-        return await asyncio.to_thread(_finalize_http_attempt, opened, result)
+        return await _finalize_http_attempt(opened, result)
 
 
-def _finalize_http_attempt(opened, result: AttemptResult) -> AttemptResult:
-    finalize_opened_http_response(opened, result.outcome, result.error_detail)
+async def _finalize_http_attempt(opened, result: AttemptResult) -> AttemptResult:
+    await finalize_opened_http_response(opened, result.outcome, result.error_detail)
     if opened.timing is not None:
         opened.timing.apply_to(result, terminal=False)
     return result
@@ -4716,8 +4757,7 @@ async def _consume_stream(
         if timing is None:
             return None
         if opened_response is not None:
-            return await asyncio.to_thread(
-                finalize_opened_http_response,
+            return await finalize_opened_http_response(
                 opened_response,
                 outcome,
                 error_detail,
@@ -4926,7 +4966,11 @@ async def _consume_stream(
         # 不是渠道健康问题，即使在流中途才被上游明确揭示，也按 runtime
         # request_invalid 语义处理，避免误伤渠道评分/冷却。
         failure_policy = "runtime" if outcome == "request_invalid" else "post_commit_stream"
-        plan = finalize_policy.error_plan(outcome, failure_policy=failure_policy)
+        plan = finalize_policy.error_plan(
+            outcome,
+            failure_policy=failure_policy,
+            http_status=(400 if outcome == "request_invalid" else upstream_status),
+        )
         finalize_policy.apply_error_health_effects(
             plan,
             scorer=scorer,
