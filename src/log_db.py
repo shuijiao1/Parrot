@@ -2915,7 +2915,15 @@ def _attempt_rows_exist(conn: sqlite3.Connection) -> bool:
 
 
 _COST_TICKS_SUM_TOKEN = "__parrot_cost_ticks_sum__"
-_EXACT_COST_TICKS_SUM_FUNCTION = "_parrot_exact_int_sum"
+_EXACT_INT_SUM_FUNCTION = "_parrot_exact_int_sum"
+# Retain the cost-specific name for existing callers and regression probes.
+_EXACT_COST_TICKS_SUM_FUNCTION = _EXACT_INT_SUM_FUNCTION
+_TOKEN_SUM_TOKENS = {
+    "inp": "__parrot_input_tokens_sum__",
+    "outp": "__parrot_output_tokens_sum__",
+    "cc": "__parrot_cache_creation_tokens_sum__",
+    "cr": "__parrot_cache_read_tokens_sum__",
+}
 
 
 class _ExactIntSum:
@@ -2960,6 +2968,33 @@ def _cost_aggregate_rows(
         _COST_TICKS_SUM_TOKEN,
         f"{_EXACT_COST_TICKS_SUM_FUNCTION}({clamped})",
     )
+    return conn.execute(exact_sql, args).fetchall()
+
+
+def _token_aggregate_rows(
+    conn: sqlite3.Connection,
+    sql_template: str,
+    args: tuple,
+    *,
+    expressions: dict[str, str],
+) -> list[sqlite3.Row]:
+    """Group token totals natively, retrying with exact text sums on overflow."""
+
+    sql = sql_template
+    for name, expression in expressions.items():
+        sql = sql.replace(_TOKEN_SUM_TOKENS[name], f"SUM({expression})")
+    try:
+        return conn.execute(sql, args).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "integer overflow" not in str(exc).casefold():
+            raise
+    conn.create_aggregate(_EXACT_INT_SUM_FUNCTION, 1, _ExactIntSum)
+    exact_sql = sql_template
+    for name, expression in expressions.items():
+        exact_sql = exact_sql.replace(
+            _TOKEN_SUM_TOKENS[name],
+            f"{_EXACT_INT_SUM_FUNCTION}({expression})",
+        )
     return conn.execute(exact_sql, args).fetchall()
 
 
@@ -4092,15 +4127,16 @@ def _replace_summary_tokens_with_attempts(
         "request_log.upstream_protocol"
         if "upstream_protocol" in _table_columns(conn, "request_log") else "NULL"
     )
-    roots = conn.execute(
+    roots = _token_aggregate_rows(
+        conn,
         f"""SELECT request_log.final_channel_key AS channel_key,
                    request_log.requested_model AS model_key,
                    request_log.api_key_name AS apikey_key,
                    {request_protocol_expr} AS family_protocol,
-                   SUM(request_log.input_tokens) AS inp,
-                   SUM(request_log.output_tokens) AS outp,
-                   SUM(request_log.cache_creation_tokens) AS cc,
-                   SUM(request_log.cache_read_tokens) AS cr,
+                   {_TOKEN_SUM_TOKENS['inp']} AS inp,
+                   {_TOKEN_SUM_TOKENS['outp']} AS outp,
+                   {_TOKEN_SUM_TOKENS['cc']} AS cc,
+                   {_TOKEN_SUM_TOKENS['cr']} AS cr,
                    SUM(CASE WHEN request_log.cache_creation_tokens>0 THEN 1 ELSE 0 END) AS cc_rows,
                    SUM(CASE WHEN request_log.cache_read_tokens>0 THEN 1 ELSE 0 END) AS cr_rows
             FROM request_log
@@ -4108,7 +4144,13 @@ def _replace_summary_tokens_with_attempts(
               AND {_final_observed_attempt_sql(conn)}
             GROUP BY channel_key, model_key, apikey_key, family_protocol""",
         args,
-    ).fetchall()
+        expressions={
+            "inp": "request_log.input_tokens",
+            "outp": "request_log.output_tokens",
+            "cc": "request_log.cache_creation_tokens",
+            "cr": "request_log.cache_read_tokens",
+        },
+    )
 
     def apply_root(row, sign: int, targets: tuple[dict, dict, dict, dict]) -> None:
         target_overall, target_channels, target_models, target_apikeys = targets
@@ -4145,14 +4187,15 @@ def _replace_summary_tokens_with_attempts(
 
     attempt_protocol_expr = _attempt_protocol_expr(conn)
     effective = _effective_attempt_exprs(conn, alias="a")
-    attempts = conn.execute(
+    attempts = _token_aggregate_rows(
+        conn,
         f"""SELECT a.channel_key, request_log.requested_model AS model_key,
                    request_log.api_key_name AS apikey_key,
                    {attempt_protocol_expr} AS family_protocol,
-                   SUM({effective['input']}) AS inp,
-                   SUM({effective['output']}) AS outp,
-                   SUM({effective['cache_creation']}) AS cc,
-                   SUM({effective['cache_read']}) AS cr,
+                   {_TOKEN_SUM_TOKENS['inp']} AS inp,
+                   {_TOKEN_SUM_TOKENS['outp']} AS outp,
+                   {_TOKEN_SUM_TOKENS['cc']} AS cc,
+                   {_TOKEN_SUM_TOKENS['cr']} AS cr,
                    SUM(CASE WHEN {effective['cache_creation']}>0 THEN 1 ELSE 0 END) AS cc_rows,
                    SUM(CASE WHEN {effective['cache_read']}>0 THEN 1 ELSE 0 END) AS cr_rows
             FROM upstream_attempt_usage a
@@ -4163,7 +4206,13 @@ def _replace_summary_tokens_with_attempts(
               AND COALESCE(a.call_request_id, '')<>''
             GROUP BY a.channel_key, model_key, apikey_key, family_protocol""",
         args,
-    ).fetchall()
+        expressions={
+            "inp": effective["input"],
+            "outp": effective["output"],
+            "cc": effective["cache_creation"],
+            "cr": effective["cache_read"],
+        },
+    )
     for row in attempts:
         apply_root(row, 1, all_targets)
         fam = _family_from_protocol(row["family_protocol"])
@@ -5345,7 +5394,40 @@ def _casefold_collation(left: object, right: object) -> int:
     return (a > b) - (a < b)
 
 
-def _management_logs_order(sort: str, descending: bool) -> str:
+def _management_candidate_tie_order(
+    *,
+    statuses: list[str] | None,
+    api_keys: list[str] | None,
+    channel_keys: list[str] | None,
+) -> str:
+    """Return the frozen recent_logs() order within one created_at value.
+
+    Without a pushed equality filter SQLite scans idx_log_created backwards, so
+    equal timestamps arrive by rowid descending.  The frozen selector pushed a
+    single status and API-key/channel selections into recent_logs(); on the
+    current schema those scans use the corresponding equality index and feed
+    the stable timestamp sort by index value then rowid ascending.  Channel is
+    the planner's last applicable index, followed by API key and then status.
+    """
+
+    channels = [str(value) for value in (channel_keys or []) if str(value)]
+    if channels:
+        return "final_channel_key ASC, id ASC"
+    keys = [str(value) for value in (api_keys or []) if str(value)]
+    if keys:
+        return "api_key_name ASC, id ASC"
+    clean_statuses = [str(value) for value in (statuses or []) if str(value)]
+    if len(clean_statuses) == 1:
+        return "status ASC, id ASC"
+    return "id DESC"
+
+
+def _management_logs_order(
+    sort: str,
+    descending: bool,
+    *,
+    candidate_tie_order: str = "id DESC",
+) -> str:
     direction = "DESC" if descending else "ASC"
     if sort == "status":
         primary = "COALESCE(status,'')"
@@ -5359,11 +5441,12 @@ def _management_logs_order(sort: str, descending: bool) -> str:
         )
     else:
         primary = "created_at"
-    # The old Python selector was stable over the current store's created-at
-    # descending scan.  Make that implicit tie order explicit and deterministic.
+    # The old Python selector was stable over recent_logs(created_at DESC).
+    # Preserve the actual candidate scan's tie order rather than imposing one
+    # id direction on both indexed-filter and created-at-index paths.
     if primary == "created_at":
-        return f"created_at {direction}, id DESC"
-    return f"{primary} {direction}, created_at DESC, id DESC"
+        return f"created_at {direction}, {candidate_tie_order}"
+    return f"{primary} {direction}, created_at DESC, {candidate_tie_order}"
 
 
 def _management_text_matches(row: dict[str, Any], query: str) -> bool:
@@ -5411,7 +5494,16 @@ def management_logs_page(
         started_at=started_at,
         ended_at=ended_at,
     )
-    order = _management_logs_order(sort, bool(descending))
+    candidate_tie_order = _management_candidate_tie_order(
+        statuses=statuses,
+        api_keys=api_keys,
+        channel_keys=channel_keys,
+    )
+    order = _management_logs_order(
+        sort,
+        bool(descending),
+        candidate_tie_order=candidate_tie_order,
+    )
     size = max(1, int(page_size or 50))
     offset = max(0, (max(1, int(page or 1)) - 1) * size)
     projection = _compatible_recent_cols(conn)
