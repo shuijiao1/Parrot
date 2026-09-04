@@ -93,4 +93,3 @@ async def test_cancel_while_open_proxy_snapshot_waits_closes_ctx_and_client_once
     assert client.close_calls == 1
     assert [row["outcome"] for row in logs.proxy_updates] == ["open", "cancelled"]
     assert sum(row["outcome"] == "cancelled" for row in logs.proxy_updates) == 1
-

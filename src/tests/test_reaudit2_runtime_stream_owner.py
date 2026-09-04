@@ -447,5 +447,3 @@ async def test_responses_ws_cancel_during_preaccept_retry_update_terminalizes_al
     assert len(logs.request_terminals) == 1
     assert logs.request_terminals[0]["status"] == "cancelled"
     assert logs.request_terminals[0]["http_status"] == 499
-
-
