@@ -69,11 +69,7 @@ class RetentionControl:
         self._idempotent_creates: dict[tuple[str, str | None, str], str] = {}
         self._expired_ids: OrderedDict[str, tuple[str, str | None]] = OrderedDict()
         self._lock = threading.RLock()
-        self._start_worker = start_worker or self._thread_worker
-
-    @staticmethod
-    def _thread_worker(callable_: Callable[[], None]) -> None:
-        threading.Thread(target=callable_, daemon=True, name="retention-operation").start()
+        self._start_worker = start_worker
 
     def _audit(self, context: ManagementContext, action: str, target: str, result: str) -> None:
         if self.audit_sink is not None:
@@ -392,12 +388,14 @@ class RetentionControl:
                 self._audit(context, "retention.plan.commit", plan_id, "failed")
 
         try:
-            self._start_worker(worker)
+            if self._start_worker is not None:
+                self._start_worker(worker)
+            else:
+                operations.submit(operation.id, worker)
         except Exception as exc:
-            operations.fail(
+            operations.fail_if_active(
                 operation.id,
                 code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
-                message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value,
                 retryable=True,
             )
             self._audit(context, "retention.plan.commit", plan_id, "failed")

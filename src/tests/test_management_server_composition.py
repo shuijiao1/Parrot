@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -85,8 +86,8 @@ def test_server_mounts_all_domain_routers_and_preserves_lifecycle_order():
     assert source.index("translation.init()") < source.index("_initialize_management_runtime(app)")
     assert source.index("provider_usage.schedule_startup_refresh()") < source.index("tgbot.start()")
     stop = source.index("tgbot.stop()")
-    assert stop < source.index("_close_management_runtime(app)", stop)
-    assert source.index("_close_management_runtime(app)", stop) < source.index(
+    assert stop < source.index("await _close_management_runtime(app)", stop)
+    assert source.index("await _close_management_runtime(app)", stop) < source.index(
         "await provider_usage.stop()", stop,
     )
 
@@ -101,7 +102,7 @@ def test_management_initialization_and_shutdown_are_isolated(tmp_path, monkeypat
     assert (tmp_path / "management-composition.db").exists()
     output = capsys.readouterr().out
     assert values["managementKey"] not in output
-    server._close_management_runtime(app)
+    asyncio.run(server._close_management_runtime(app))
     assert app.state.management_runtime is None
     assert server.tgbot._management_approval_handler is None
 
@@ -140,8 +141,48 @@ def test_server_metadata_links_to_served_fastapi_documentation(
         assert "/api/management/v1/meta" in openapi.json()["paths"]
     finally:
         server.app.state.management_runtime = original_runtime
-        server._close_management_runtime(holder)
+        asyncio.run(server._close_management_runtime(holder))
         server.drain.reset_for_tests()
+
+
+def test_runtime_close_orders_operations_before_store_and_is_idempotent():
+    class Operations:
+        def __init__(self, events):
+            self.events = events
+
+        def close(self):
+            self.events.append("operations")
+
+        async def aclose(self):
+            self.events.append("operations")
+
+    class StateStore:
+        def __init__(self, events):
+            self.events = events
+
+        def close(self):
+            self.events.append("store")
+
+    for asynchronous in (False, True):
+        events = []
+        runtime = ManagementRuntime(
+            sessions=None,
+            approvals=None,
+            operations=Operations(events),
+            operation_registry=None,
+            audit_sink=None,
+            state_store=StateStore(events),
+            allowed_origins=frozenset(),
+            application_version="test",
+            documentation_url="/docs",
+        )
+        if asynchronous:
+            asyncio.run(runtime.aclose())
+            asyncio.run(runtime.aclose())
+        else:
+            runtime.close()
+            runtime.close()
+        assert events == ["operations", "store"]
 
 
 def test_management_initialization_failure_stays_fail_closed_and_inference_health_works(

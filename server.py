@@ -203,14 +203,14 @@ def _initialize_management_runtime(app: FastAPI) -> ManagementRuntime | None:
         return None
 
 
-def _close_management_runtime(app: FastAPI) -> None:
+async def _close_management_runtime(app: FastAPI) -> None:
     runtime = getattr(app.state, "management_runtime", None)
     app.state.management_runtime = None
     tgbot.configure_management_approval_handler(None)
     if not isinstance(runtime, ManagementRuntime):
         return
     try:
-        runtime.close()
+        await runtime.aclose()
     except Exception as exc:
         print(f"[management] shutdown failed ({type(exc).__name__})")
 
@@ -478,7 +478,7 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(*_background_tasks, return_exceptions=True)
         await apikey_limiter.shutdown_spooling()
         tgbot.stop()
-        _close_management_runtime(app)
+        await _close_management_runtime(app)
         # Provider workers may mutate state; stop them before the final snapshot.
         await provider_usage.stop()
         await upstream.close_client()

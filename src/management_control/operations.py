@@ -1,15 +1,18 @@
-"""Bounded management Operation lifecycle without owning a worker pool."""
+"""Bounded management Operation records and runtime-owned execution lifecycle."""
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import secrets
+import time
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
-from threading import RLock
-from typing import Any, Callable, Mapping
+from threading import Event, RLock
+from typing import Any, Callable, Coroutine, Mapping
 
 from src.management_auth.policy import CapabilityDenied, authorize
 from src.management_auth.principal import Capability
@@ -32,6 +35,12 @@ _TERMINAL = {
     OperationStatus.FAILED,
     OperationStatus.CANCELLED,
 }
+
+# Internal resource limits, deliberately not product/user configuration.  The
+# former OAuth-only executor already used four workers; all Management
+# operations now share that same process budget.
+MANAGEMENT_OPERATION_MAX_WORKERS = 4
+MANAGEMENT_OPERATION_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
 def _coerce_public_value(value: Any) -> Any:
@@ -90,7 +99,7 @@ OperationStarter = Callable[[str, ManagementContext, Any], None]
 
 
 class OperationStore:
-    """Thread-safe bounded lifecycle store; execution remains with existing workers."""
+    """Thread-safe bounded records plus one owned worker/task lifecycle."""
 
     def __init__(
         self,
@@ -98,14 +107,31 @@ class OperationStore:
         max_operations: int = 500,
         clock: Clock | None = None,
         audit_sink: AuditSink | None = None,
+        max_workers: int = MANAGEMENT_OPERATION_MAX_WORKERS,
+        shutdown_timeout_seconds: float = MANAGEMENT_OPERATION_SHUTDOWN_TIMEOUT_SECONDS,
     ) -> None:
         if max_operations < 1:
             raise ValueError("max_operations must be positive")
+        if max_workers < 1:
+            raise ValueError("max_workers must be positive")
+        if shutdown_timeout_seconds < 0:
+            raise ValueError("shutdown_timeout_seconds must not be negative")
         self._max_operations = max_operations
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._audit_sink = audit_sink
         self._items: OrderedDict[str, ManagementOperation] = OrderedDict()
         self._lock = RLock()
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="management-operation",
+        )
+        self._shutdown_timeout_seconds = float(shutdown_timeout_seconds)
+        self._futures: dict[str, Future[None]] = {}
+        self._tasks: dict[str, asyncio.Task[Any]] = {}
+        self._accepting = True
+        self._closing = False
+        self._closed = False
+        self._close_complete = Event()
 
     def _now(self) -> datetime:
         now = self._clock()
@@ -156,6 +182,11 @@ class OperationStore:
         if not kind or len(kind) > 120:
             raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
         with self._lock:
+            if not self._accepting:
+                raise ManagementError(
+                    ManagementErrorCode.SERVICE_NOT_READY,
+                    retryable=True,
+                )
             self._make_room()
             operation_id = f"op_{secrets.token_urlsafe(18)}"
             operation = ManagementOperation(
@@ -287,6 +318,12 @@ class OperationStore:
                 raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
             if not operation.cancellable:
                 raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            future = self._futures.get(operation_id)
+            if future is not None:
+                future.cancel()
+            task = self._tasks.get(operation_id)
+            if task is not None:
+                task.get_loop().call_soon_threadsafe(task.cancel)
             self._items[operation_id] = replace(
                 operation,
                 status=OperationStatus.CANCELLED,
@@ -294,6 +331,12 @@ class OperationStore:
                 cancellable=False,
             )
         self._audit(context, "operation.cancel", operation_id, "cancelled")
+
+    def cancel_requested(self, operation_id: str) -> bool:
+        """Cooperative cancellation probe for workers that support checkpoints."""
+        with self._lock:
+            operation = self._items.get(operation_id)
+            return operation is not None and operation.status is OperationStatus.CANCELLED
 
     def interrupt_active(self) -> int:
         """Mark lifecycle-owned active records failed during orderly shutdown."""
@@ -304,6 +347,7 @@ class OperationStore:
                     self._items[operation_id] = replace(
                         operation,
                         status=OperationStatus.FAILED,
+                        result=None,
                         error=OperationFailure(
                             code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
                             message="Operation interrupted by service shutdown",
@@ -315,9 +359,213 @@ class OperationStore:
                     changed += 1
         return changed
 
+    def fail_if_active(
+        self,
+        operation_id: str,
+        *,
+        code: ManagementErrorCode,
+        retryable: bool,
+    ) -> None:
+        with self._lock:
+            operation = self._items.get(operation_id)
+            if operation is None or operation.status not in {
+                OperationStatus.QUEUED,
+                OperationStatus.RUNNING,
+            }:
+                return
+            self._items[operation_id] = replace(
+                operation,
+                status=OperationStatus.FAILED,
+                result=None,
+                error=OperationFailure(code=code, message=code.value, retryable=retryable),
+                finished_at=self._now(),
+                cancellable=False,
+            )
+
+    def _submission_error(
+        self,
+        operation_id: str,
+        code: ManagementErrorCode,
+    ) -> ManagementError:
+        self.fail_if_active(operation_id, code=code, retryable=True)
+        return ManagementError(code, retryable=True, operation_id=operation_id)
+
+    def _run_owned(self, operation_id: str, worker: Callable[[], None]) -> None:
+        try:
+            worker()
+        except BaseException:
+            # Every owned execution must leave a terminal record.  Domain workers
+            # normally map their own stable error; this is the last-resort path.
+            self.fail_if_active(
+                operation_id,
+                code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                retryable=True,
+            )
+
+    def _discard_future(self, operation_id: str, future: Future[None]) -> None:
+        with self._lock:
+            if self._futures.get(operation_id) is future:
+                self._futures.pop(operation_id, None)
+
+    def submit(self, operation_id: str, worker: Callable[[], None]) -> None:
+        """Submit a native-thread operation to the shared bounded executor."""
+        if not callable(worker):
+            raise ValueError("worker must be callable")
+        with self._lock:
+            if not self._accepting:
+                raise self._submission_error(
+                    operation_id, ManagementErrorCode.SERVICE_NOT_READY,
+                )
+            operation = self._items.get(operation_id)
+            if operation is None:
+                raise ManagementError(ManagementErrorCode.OPERATION_NOT_FOUND)
+            if operation.status is not OperationStatus.QUEUED:
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            if operation_id in self._futures or operation_id in self._tasks:
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            try:
+                future = self._executor.submit(self._run_owned, operation_id, worker)
+            except RuntimeError as exc:
+                raise self._submission_error(
+                    operation_id, ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                ) from exc
+            self._futures[operation_id] = future
+            future.add_done_callback(
+                lambda completed, oid=operation_id: self._discard_future(oid, completed)
+            )
+
+    def _task_done(self, operation_id: str, task: asyncio.Task[Any]) -> None:
+        with self._lock:
+            if self._tasks.get(operation_id) is task:
+                self._tasks.pop(operation_id, None)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except (asyncio.CancelledError, RuntimeError):
+            return
+        if error is not None:
+            self.fail_if_active(
+                operation_id,
+                code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                retryable=True,
+            )
+
+    def create_task(self, operation_id: str, coroutine: Coroutine[Any, Any, Any]) -> None:
+        """Retain an event-loop operation without converting it to a worker thread."""
+        with self._lock:
+            if not self._accepting:
+                coroutine.close()
+                raise self._submission_error(
+                    operation_id, ManagementErrorCode.SERVICE_NOT_READY,
+                )
+            operation = self._items.get(operation_id)
+            if operation is None:
+                coroutine.close()
+                raise ManagementError(ManagementErrorCode.OPERATION_NOT_FOUND)
+            if operation.status is not OperationStatus.QUEUED:
+                coroutine.close()
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            if operation_id in self._futures or operation_id in self._tasks:
+                coroutine.close()
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            try:
+                task = asyncio.get_running_loop().create_task(coroutine)
+            except BaseException:
+                coroutine.close()
+                raise
+            self._tasks[operation_id] = task
+            task.add_done_callback(
+                lambda completed, oid=operation_id: self._task_done(oid, completed)
+            )
+
+    def _begin_close(self) -> bool:
+        with self._lock:
+            if self._closed or self._closing:
+                return False
+            self._accepting = False
+            self._closing = True
+            # Future.cancel() succeeds only before native execution starts.
+            for future in tuple(self._futures.values()):
+                future.cancel()
+            # An asyncio Task whose record is still queued has not entered its
+            # operation body. Running tasks get the same bounded grace period as
+            # native workers.
+            for operation_id, task in tuple(self._tasks.items()):
+                operation = self._items.get(operation_id)
+                if operation is not None and operation.status is OperationStatus.QUEUED:
+                    task.cancel()
+            return True
+
+    def _unfinished(self) -> tuple[tuple[Future[None], ...], tuple[asyncio.Task[Any], ...]]:
+        with self._lock:
+            futures = tuple(future for future in self._futures.values() if not future.done())
+            tasks = tuple(task for task in self._tasks.values() if not task.done())
+        return futures, tasks
+
+    def _finish_close(self) -> int:
+        futures, _tasks = self._unfinished()
+        with self._lock:
+            for task in tuple(self._tasks.values()):
+                if not task.done():
+                    task.cancel()
+        interrupted = self.interrupt_active()
+        # If every native task observed the grace period, join idle workers now.
+        # A timed-out running Python thread cannot be force-stopped, so only that
+        # case uses non-blocking executor shutdown.
+        self._executor.shutdown(wait=not futures, cancel_futures=True)
+        with self._lock:
+            self._closed = True
+            self._closing = False
+            self._close_complete.set()
+        return interrupted
+
+    def close(self, timeout_seconds: float | None = None) -> int:
+        """Stop intake, cancel queued work, wait boundedly, then interrupt."""
+        timeout = self._shutdown_timeout_seconds if timeout_seconds is None else max(0.0, timeout_seconds)
+        if not self._begin_close():
+            self._close_complete.wait(timeout + 0.1)
+            return 0
+        deadline = time.monotonic() + timeout
+        futures, _tasks = self._unfinished()
+        if futures:
+            wait(futures, timeout=max(0.0, deadline - time.monotonic()))
+        # Synchronous callers cannot drive event-loop tasks, but still honor the
+        # same wall-time bound. Production lifespan uses aclose() below.
+        while time.monotonic() < deadline:
+            _futures, tasks = self._unfinished()
+            if not _futures and not tasks:
+                break
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        return self._finish_close()
+
+    async def aclose(self, timeout_seconds: float | None = None) -> int:
+        """Async shutdown variant that lets owned event-loop tasks make progress."""
+        timeout = self._shutdown_timeout_seconds if timeout_seconds is None else max(0.0, timeout_seconds)
+        if not self._begin_close():
+            deadline = asyncio.get_running_loop().time() + timeout + 0.1
+            while not self._close_complete.is_set() and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+            return 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            futures, tasks = self._unfinished()
+            if not futures and not tasks:
+                break
+            await asyncio.sleep(min(0.01, max(0.0, deadline - loop.time())))
+        _futures, tasks = self._unfinished()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            # Give cooperative asyncio cancellation one event-loop turn before
+            # the runtime closes its backing state store.
+            await asyncio.sleep(0)
+        return self._finish_close()
+
 
 class OperationRegistry:
-    """Registers domain starters while leaving scheduling to their existing owner."""
+    """Registers domain starters that submit into the runtime-owned lifecycle."""
 
     def __init__(self, store: OperationStore) -> None:
         self._store = store
@@ -348,10 +596,9 @@ class OperationRegistry:
         try:
             starter(operation.id, context, payload)
         except ManagementError as exc:
-            self._store.fail(
+            self._store.fail_if_active(
                 operation.id,
                 code=exc.code,
-                message=exc.message,
                 retryable=exc.retryable,
             )
             raise ManagementError(
@@ -362,10 +609,9 @@ class OperationRegistry:
                 operation_id=operation.id,
             ) from exc
         except Exception as exc:
-            self._store.fail(
+            self._store.fail_if_active(
                 operation.id,
                 code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
-                message="Operation could not be scheduled",
                 retryable=True,
             )
             raise ManagementError(

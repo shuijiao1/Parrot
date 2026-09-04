@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from threading import Event, RLock
 from typing import Annotated, Callable
 
 from fastapi import Depends, Request, Security
@@ -45,10 +47,47 @@ class ManagementRuntime:
     allowed_origins: frozenset[str]
     application_version: str
     documentation_url: str
+    _close_lock: RLock = field(default_factory=RLock, init=False, repr=False)
+    _close_complete: Event = field(default_factory=Event, init=False, repr=False)
+    _closing: bool = field(default=False, init=False, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def _claim_close(self) -> bool:
+        with self._close_lock:
+            if self._closed or self._closing:
+                return False
+            self._closing = True
+            return True
+
+    def _finish_close(self) -> None:
+        try:
+            self.state_store.close()
+        finally:
+            with self._close_lock:
+                self._closed = True
+                self._closing = False
+                self._close_complete.set()
 
     def close(self) -> None:
-        self.operations.interrupt_active()
-        self.state_store.close()
+        if not self._claim_close():
+            self._close_complete.wait(5.1)
+            return
+        try:
+            self.operations.close()
+        finally:
+            self._finish_close()
+
+    async def aclose(self) -> None:
+        if not self._claim_close():
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5.1
+            while not self._close_complete.is_set() and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+            return
+        try:
+            await self.operations.aclose()
+        finally:
+            self._finish_close()
 
 
 @dataclass(frozen=True, slots=True)

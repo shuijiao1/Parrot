@@ -90,7 +90,6 @@ class ChannelControl:
         self._operation_registry = operation_registry
         self._operation_store = operation_store
         self._audit_sink = audit_sink
-        self._tasks: set[asyncio.Task] = set()
         if operation_registry is not None:
             operation_registry.register(_DISCOVERY_KIND, self._start_discovery_owner)
             operation_registry.register(_DRAFT_PROBE_KIND, self._start_draft_probe_owner)
@@ -880,13 +879,15 @@ class ChannelControl:
             context, kind=_USAGE_KIND, payload={"channel_id": channel_id}, cancellable=False,
         )
 
-    def _retain_task(self, coroutine: Any) -> None:
-        task = asyncio.get_running_loop().create_task(coroutine)
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+    def _retain_task(self, operation_id: str, coroutine: Any) -> None:
+        assert self._operation_store is not None
+        self._operation_store.create_task(operation_id, coroutine)
 
     def _start_discovery_owner(self, operation_id: str, context: ManagementContext, payload: Any) -> None:
-        self._retain_task(self._run_discovery_operation(operation_id, context, payload))
+        self._retain_task(
+            operation_id,
+            self._run_discovery_operation(operation_id, context, payload),
+        )
 
     async def _run_discovery_operation(
         self, operation_id: str, context: ManagementContext, command: DiscoveryCommand
@@ -913,7 +914,10 @@ class ChannelControl:
             )
 
     def _start_draft_probe_owner(self, operation_id: str, context: ManagementContext, payload: Any) -> None:
-        self._retain_task(self._run_draft_probe_operation(operation_id, context, payload))
+        self._retain_task(
+            operation_id,
+            self._run_draft_probe_operation(operation_id, context, payload),
+        )
 
     async def _run_draft_probe_operation(
         self, operation_id: str, context: ManagementContext, command: DraftProbeCommand
@@ -934,7 +938,10 @@ class ChannelControl:
             )
 
     def _start_diagnostic_owner(self, operation_id: str, context: ManagementContext, payload: Any) -> None:
-        self._retain_task(self._run_diagnostic_operation(operation_id, context, payload))
+        self._retain_task(
+            operation_id,
+            self._run_diagnostic_operation(operation_id, context, payload),
+        )
 
     async def _run_diagnostic_operation(
         self, operation_id: str, context: ManagementContext, payload: dict[str, str]

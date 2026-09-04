@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Protocol
 
@@ -119,10 +118,6 @@ class ModuleStatusGateway:
 Scheduler = Callable[[Callable[[], None], str], None]
 
 
-def _thread_scheduler(task: Callable[[], None], name: str) -> None:
-    threading.Thread(target=task, daemon=True, name=name).start()
-
-
 class StatusAlertControl:
     REFRESH_KIND = "status-alerts.refresh"
 
@@ -137,7 +132,7 @@ class StatusAlertControl:
         self._config = config_gateway or ModuleConfigGateway()
         self._status = status_gateway or ModuleStatusGateway()
         self._audit_sink = audit_sink
-        self._scheduler = scheduler or _thread_scheduler
+        self._scheduler = scheduler
         self._operation_store: OperationStore | None = None
         self._operation_registry: OperationRegistry | None = None
         self._bound_registries: set[int] = set()
@@ -503,5 +498,8 @@ class StatusAlertControl:
                     retryable=True,
                 )
 
-        self._scheduler(run, "management-status-alert-refresh")
+        if self._scheduler is not None:
+            self._scheduler(run, "management-status-alert-refresh")
+        else:
+            store.submit(operation_id, run)
         audit(self._audit_sink, context, action="status-alerts.refresh", target=operation_id, result="queued")

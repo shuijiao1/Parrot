@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import threading
 from dataclasses import dataclass
 from ipaddress import ip_address
 from typing import Any, Mapping
@@ -715,11 +714,7 @@ class ProxyControl(DomainControl):
                 )
                 self._audit(context, kind, target, "failed")
 
-        threading.Thread(
-            target=worker,
-            daemon=True,
-            name=f"management-{kind.replace('.', '-')}",
-        ).start()
+        self._operation_store.submit(operation.id, worker)
         return operation
 
     def start_proxy_test(self, context: ManagementContext, proxy_id: str):

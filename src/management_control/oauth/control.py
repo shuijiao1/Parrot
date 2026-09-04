@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import secrets
-from concurrent.futures import Executor, ThreadPoolExecutor
+from concurrent.futures import Executor
 from datetime import datetime, timezone
 from typing import Callable, Iterable
 
@@ -61,9 +61,6 @@ from .plans import OneShotPlanStore
 from .queries import OAuthQueryControlMixin
 
 
-_LONG_ACTION_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="oauth-control")
-
-
 def _page(items: list, spec: PageSpec) -> tuple[list, PageMeta]:
     if spec.page < 1 or spec.page_size < 1 or spec.page_size > 200:
         raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
@@ -97,7 +94,9 @@ class OAuthControl(
         self.backend = backend or OAuthBackend()
         self._audit_sink = audit_sink
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._executor = executor or _LONG_ACTION_EXECUTOR
+        # Explicit executors remain a deterministic unit-test seam. Production
+        # operations submit through their runtime-owned OperationStore.
+        self._executor = executor
         self._flows = OAuthFlowService(self.backend, clock=self._clock)
         self._replace_plans: OneShotPlanStore[dict] = OneShotPlanStore(
             prefix="oreplace", clock=self._clock,
@@ -541,7 +540,10 @@ class OAuthControl(
                 )
                 self._audit(context, kind, operation.id, "failed")
 
-        self._executor.submit(run)
+        if self._executor is not None:
+            self._executor.submit(run)
+        else:
+            store.submit(operation.id, run)
         self._audit(context, kind, operation.id, "queued")
         return operation
 

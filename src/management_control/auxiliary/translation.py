@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
@@ -172,10 +171,6 @@ class ModuleTranslationGateway:
 Scheduler = Callable[[Callable[[], None], str], None]
 
 
-def _thread_scheduler(task: Callable[[], None], name: str) -> None:
-    threading.Thread(target=task, daemon=True, name=name).start()
-
-
 class TranslationControl:
     TEST_KIND = "translation.test"
 
@@ -190,7 +185,7 @@ class TranslationControl:
         self._config = config_gateway or ModuleConfigGateway()
         self._translation = translation_gateway or ModuleTranslationGateway()
         self._audit_sink = audit_sink
-        self._scheduler = scheduler or _thread_scheduler
+        self._scheduler = scheduler
         self._operation_store: OperationStore | None = None
         self._operation_registry: OperationRegistry | None = None
         self._bound_registries: set[int] = set()
@@ -545,5 +540,8 @@ class TranslationControl:
                     retryable=True,
                 )
 
-        self._scheduler(run, "management-translation-test")
+        if self._scheduler is not None:
+            self._scheduler(run, "management-translation-test")
+        else:
+            store.submit(operation_id, run)
         audit(self._audit_sink, context, action="translation.test", target=operation_id, result="queued")

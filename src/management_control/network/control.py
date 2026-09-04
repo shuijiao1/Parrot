@@ -100,11 +100,18 @@ class NetworkControl(DomainControl):
         self._plans: OrderedDict[str, _Plan] = OrderedDict()
         self._expired: OrderedDict[str, tuple[str, str | None]] = OrderedDict()
         self._lock = threading.RLock()
-        self._start_worker = start_worker or self._thread_worker
+        self._start_worker = start_worker
 
-    @staticmethod
-    def _thread_worker(worker: Callable[[], None]) -> None:
-        threading.Thread(target=worker, daemon=True, name="network-operation").start()
+    def _submit_worker(
+        self,
+        store: OperationStore,
+        operation_id: str,
+        worker: Callable[[], None],
+    ) -> None:
+        if self._start_worker is not None:
+            self._start_worker(worker)
+        else:
+            store.submit(operation_id, worker)
 
     @staticmethod
     def _dependency(callable_):
@@ -347,9 +354,13 @@ class NetworkControl(DomainControl):
                 self._audit(actual, "network.dns.test", "dns", "failed")
         launch_failed = False
         try:
-            self._start_worker(worker)
+            self._submit_worker(store, operation.id, worker)
         except Exception:
-            store.fail(operation.id, code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE, message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value, retryable=True)
+            store.fail_if_active(
+                operation.id,
+                code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                retryable=True,
+            )
             self._audit(actual, "network.dns.test", "dns", "failed")
             launch_failed = True
         if launch_failed:
@@ -422,9 +433,13 @@ class NetworkControl(DomainControl):
                 self._audit(actual, "network.socks5.test", "socks5", "failed")
         launch_failed = False
         try:
-            self._start_worker(worker)
+            self._submit_worker(store, operation.id, worker)
         except Exception:
-            store.fail(operation.id, code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE, message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value, retryable=True)
+            store.fail_if_active(
+                operation.id,
+                code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                retryable=True,
+            )
             self._audit(actual, "network.socks5.test", "socks5", "failed")
             launch_failed = True
         if launch_failed:
@@ -848,9 +863,13 @@ class NetworkControl(DomainControl):
                 self._audit(actual, "network.monitor.run", "monitor", "failed")
         launch_failed = False
         try:
-            self._start_worker(worker)
+            self._submit_worker(store, operation.id, worker)
         except Exception:
-            store.fail(operation.id, code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE, message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value, retryable=True)
+            store.fail_if_active(
+                operation.id,
+                code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                retryable=True,
+            )
             self._audit(actual, "network.monitor.run", "monitor", "failed")
             launch_failed = True
         if launch_failed:

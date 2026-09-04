@@ -787,7 +787,12 @@ class MappingControl(DomainControl):
                 with self._sync_lock:
                     self.__class__._sync_running = False
 
-        threading.Thread(target=worker, daemon=True, name="management-metadata-sync").start()
+        try:
+            self._operation_store.submit(operation.id, worker)
+        except Exception:
+            with self._sync_lock:
+                self.__class__._sync_running = False
+            raise
         return operation
 
     # Telegram compatibility façade. Every call remains a control use case while

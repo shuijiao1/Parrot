@@ -206,10 +206,6 @@ Scheduler = Callable[[Callable[[], None], str], None]
 Clock = Callable[[], datetime]
 
 
-def _thread_scheduler(task: Callable[[], None], name: str) -> None:
-    threading.Thread(target=task, daemon=True, name=name).start()
-
-
 def _actor_key(context: ManagementContext) -> str:
     return context.actor.session_id or context.actor.subject_id
 
@@ -236,7 +232,7 @@ class UpdateControl:
         self._config = config_gateway or ModuleConfigGateway()
         self._updates = update_gateway or ModuleUpdateGateway()
         self._audit_sink = audit_sink
-        self._scheduler = scheduler or _thread_scheduler
+        self._scheduler = scheduler
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._plan_ttl = timedelta(seconds=plan_ttl_seconds)
         self._operation_store: OperationStore | None = None
@@ -712,7 +708,10 @@ class UpdateControl:
             except Exception:
                 fail()
 
-        self._scheduler(run, "management-update-stage")
+        if self._scheduler is not None:
+            self._scheduler(run, "management-update-stage")
+        else:
+            store.submit(operation_id, run)
         audit(self._audit_sink, context, action="updates.stage", target=operation_id, result="queued")
 
     def _state_without_auth(self) -> UpdateState:
@@ -824,7 +823,10 @@ class UpdateControl:
             # in-memory operation interrupted. The restarted process/health endpoint
             # is authoritative; returning success here would be false success.
 
-        self._scheduler(run, "management-update-activate")
+        if self._scheduler is not None:
+            self._scheduler(run, "management-update-activate")
+        else:
+            store.submit(operation_id, run)
 
     def cancel_staged(
         self,

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -248,3 +251,253 @@ def test_registry_preserves_stable_starter_error_with_created_operation_id():
     assert operation.error is not None
     assert operation.error.code is ManagementErrorCode.UPSTREAM_TIMEOUT
     assert operation.error.retryable is True
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.005)
+    assert predicate()
+
+
+def test_owned_executor_bounds_burst_and_preserves_results():
+    store = OperationStore(max_workers=3)
+    owner = context()
+    release = threading.Event()
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def worker(operation_id: str) -> None:
+        nonlocal active, peak
+        store.mark_running(operation_id)
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        release.wait(2)
+        with lock:
+            active -= 1
+        store.succeed(operation_id, {"operationId": operation_id})
+
+    operations = []
+    try:
+        for index in range(18):
+            operation = store.create(
+                owner, kind=f"burst.{index}", cancellable=True,
+            )
+            operations.append(operation)
+            store.submit(operation.id, lambda oid=operation.id: worker(oid))
+        _wait_until(
+            lambda: sum(
+                store.get(owner, item.id).status is OperationStatus.RUNNING
+                for item in operations
+            ) == 3
+        )
+        statuses = [store.get(owner, item.id).status for item in operations]
+        assert statuses.count(OperationStatus.RUNNING) == 3
+        assert statuses.count(OperationStatus.QUEUED) == 15
+        assert peak == 3
+        assert sum(
+            thread.name.startswith("management-operation")
+            for thread in threading.enumerate()
+        ) <= 3
+    finally:
+        release.set()
+    _wait_until(
+        lambda: all(
+            store.get(owner, item.id).status is OperationStatus.SUCCEEDED
+            for item in operations
+        )
+    )
+    for operation in operations:
+        terminal = store.get(owner, operation.id)
+        assert terminal.error is None
+        assert terminal.result == {"operationId": operation.id}
+    store.close()
+
+
+def test_queued_cancel_prevents_execution_and_running_completes():
+    store = OperationStore(max_workers=1)
+    owner = context()
+    first_started = threading.Event()
+    release = threading.Event()
+    queued_started = threading.Event()
+
+    first = store.create(owner, kind="cancel.first", cancellable=True)
+
+    def run_first() -> None:
+        store.mark_running(first.id)
+        first_started.set()
+        release.wait(2)
+        store.succeed(first.id, {"done": True})
+
+    store.submit(first.id, run_first)
+    assert first_started.wait(1)
+    queued = store.create(owner, kind="cancel.queued", cancellable=True)
+
+    def run_queued() -> None:
+        queued_started.set()
+        store.mark_running(queued.id)
+        store.succeed(queued.id)
+
+    store.submit(queued.id, run_queued)
+    store.cancel(owner, queued.id)
+    release.set()
+    _wait_until(
+        lambda: store.get(owner, first.id).status is OperationStatus.SUCCEEDED
+    )
+    assert not queued_started.is_set()
+    assert store.get(owner, queued.id).status is OperationStatus.CANCELLED
+    store.close()
+
+
+def test_close_waits_for_running_then_rejects_and_is_idempotent():
+    store = OperationStore(max_workers=1, shutdown_timeout_seconds=0.5)
+    owner = context()
+    started = threading.Event()
+    release = threading.Event()
+    operation = store.create(owner, kind="close.graceful", cancellable=False)
+
+    def worker() -> None:
+        store.mark_running(operation.id)
+        started.set()
+        release.wait(2)
+        store.succeed(operation.id, {"completed": True})
+
+    store.submit(operation.id, worker)
+    assert started.wait(1)
+    timer = threading.Timer(0.05, release.set)
+    timer.start()
+    began = time.monotonic()
+    store.close()
+    elapsed = time.monotonic() - began
+    timer.join()
+    assert 0.03 <= elapsed < 0.5
+    assert store.get(owner, operation.id).result == {"completed": True}
+    assert store.get(owner, operation.id).status is OperationStatus.SUCCEEDED
+
+    repeated = time.monotonic()
+    store.close()
+    assert time.monotonic() - repeated < 0.05
+    with pytest.raises(ManagementError) as rejected:
+        store.create(owner, kind="close.rejected", cancellable=False)
+    assert rejected.value.code is ManagementErrorCode.SERVICE_NOT_READY
+    assert rejected.value.retryable is True
+
+
+def test_close_cancels_queue_and_interrupts_unstoppable_running_worker():
+    store = OperationStore(max_workers=1, shutdown_timeout_seconds=0.05)
+    owner = context()
+    started = threading.Event()
+    release = threading.Event()
+    queued_started = threading.Event()
+    running = store.create(owner, kind="close.running", cancellable=False)
+
+    def run_blocked() -> None:
+        store.mark_running(running.id)
+        started.set()
+        release.wait(2)
+        store.succeed(running.id)
+
+    store.submit(running.id, run_blocked)
+    assert started.wait(1)
+    queued = store.create(owner, kind="close.queued", cancellable=False)
+    store.submit(queued.id, lambda: queued_started.set())
+
+    began = time.monotonic()
+    store.close()
+    elapsed = time.monotonic() - began
+    assert 0.03 <= elapsed < 0.3
+    assert not queued_started.is_set()
+    for operation in (running, queued):
+        terminal = store.get(owner, operation.id)
+        assert terminal.status is OperationStatus.FAILED
+        assert terminal.result is None
+        assert terminal.error is not None
+        assert terminal.error.code is ManagementErrorCode.DEPENDENCY_UNAVAILABLE
+        assert terminal.error.retryable is True
+        assert terminal.error.message == "Operation interrupted by service shutdown"
+    with pytest.raises(ManagementError) as rejected:
+        store.submit(queued.id, lambda: None)
+    assert rejected.value.code is ManagementErrorCode.SERVICE_NOT_READY
+    assert rejected.value.operation_id == queued.id
+    store.close()
+    release.set()
+    _wait_until(
+        lambda: not any(
+            thread.name.startswith("management-operation")
+            for thread in threading.enumerate()
+        )
+    )
+
+
+def test_submit_close_race_leaves_no_active_or_unowned_operation():
+    store = OperationStore(max_workers=2, shutdown_timeout_seconds=0.05)
+    owner = context()
+    operations = [
+        store.create(owner, kind=f"race.{index}", cancellable=False)
+        for index in range(30)
+    ]
+    barrier = threading.Barrier(len(operations) + 1)
+    errors = []
+
+    def submit(operation, delay: bool) -> None:
+        barrier.wait(timeout=2)
+        if delay:
+            time.sleep(0.01)
+        try:
+            store.submit(
+                operation.id,
+                lambda oid=operation.id: (
+                    store.mark_running(oid), store.succeed(oid, {"done": True})
+                ),
+            )
+        except ManagementError as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=submit, args=(operation, index % 2 == 0))
+        for index, operation in enumerate(operations)
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=2)
+    store.close()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    assert errors
+    assert all(error.code is ManagementErrorCode.SERVICE_NOT_READY for error in errors)
+    statuses = [store.get(owner, operation.id).status for operation in operations]
+    assert all(status in {OperationStatus.SUCCEEDED, OperationStatus.FAILED} for status in statuses)
+    assert OperationStatus.QUEUED not in statuses
+    assert OperationStatus.RUNNING not in statuses
+
+
+def test_async_channel_style_tasks_are_owned_and_cancelled_after_timeout():
+    async def scenario() -> None:
+        store = OperationStore(shutdown_timeout_seconds=0.02)
+        owner = context()
+        started = asyncio.Event()
+        operation = store.create(owner, kind="channel.async", cancellable=False)
+
+        async def worker() -> None:
+            store.mark_running(operation.id)
+            started.set()
+            await asyncio.Event().wait()
+
+        store.create_task(operation.id, worker())
+        await started.wait()
+        await store.aclose()
+        await asyncio.sleep(0)
+        terminal = store.get(owner, operation.id)
+        assert terminal.status is OperationStatus.FAILED
+        assert terminal.error is not None
+        assert terminal.error.code is ManagementErrorCode.DEPENDENCY_UNAVAILABLE
+        futures, tasks = store._unfinished()
+        assert futures == () and tasks == ()
+
+    asyncio.run(scenario())
