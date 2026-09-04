@@ -14,12 +14,12 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from ... import affinity, apikey_limiter, concurrency, config, cooldown, load_balancing, oauth_manager, quota_errors, scorer, state_db
+from ... import affinity, apikey_limiter, concurrency, config, cooldown, load_balancing, log_db, oauth_manager, quota_errors, scorer, state_db
 from ...oauth_ids import account_key as _account_key
 from ...openai.codex_constants import codex_cli_version
 from ...channel import registry
 from ...management_control.observability import DEFAULT_STATUS_CONTROL, telegram_context
-from .. import menu_cache, ui
+from .. import ui
 
 
 _CONTROL = DEFAULT_STATUS_CONTROL
@@ -195,6 +195,13 @@ def _quota_warnings(threshold_pct: float = 80.0, *, cfg: dict | None = None) -> 
     """
     out: list[str] = []
     cfg = cfg if cfg is not None else _CONTROL.config_snapshot(_CONTEXT)
+    account_keys = [
+        _account_key(account) for account in cfg.get("oauthAccounts", [])
+        if account.get("email") and not account.get("disabled_reason")
+        and _CONTROL.provider_of(_CONTEXT, account) in ("claude", "openai", "xai", "cursor")
+    ]
+    if account_keys:
+        _CONTROL.refresh_telegram_quota(_CONTEXT, account_keys)
     for acc in cfg.get("oauthAccounts", []):
         email = acc.get("email")
         if not email:
@@ -260,26 +267,37 @@ def _status_metrics(overall: dict) -> dict:
 
 
 def _today_snapshot_by_family() -> dict:
-    """只读中央调度器最近一次成功的今日快照，未就绪时沿用空统计展示。"""
-    since = menu_cache.today_start_ts()
-    period = menu_cache.PERIOD_STATS.peek(("period", int(since))).value or {}
-    summary = period.get("summary") if isinstance(period.get("summary"), dict) else {}
-    families = period.get("families") if isinstance(period.get("families"), dict) else {}
+    """今日请求按家族分组的快照；每次打开均查询当前统计。"""
+    from datetime import datetime, timedelta, timezone
 
-    def _family_metrics(family: str) -> dict:
-        row = families.get(family) if isinstance(families.get(family), dict) else {}
-        return _status_metrics(row.get("overall") or {})
+    bjt = timezone(timedelta(hours=8))
+    today = datetime.now(bjt).replace(hour=0, minute=0, second=0, microsecond=0)
+    since = today.timestamp()
+
+    def _snap(family: str | None) -> dict:
+        try:
+            result = _CONTROL.stats_summary(_CONTEXT, since_ts=since, family=family)
+            return _status_metrics(result.get("overall") or {})
+        except Exception:
+            return _status_metrics({})
 
     return {
-        "anthropic": _family_metrics("anthropic"),
-        "openai": _family_metrics("openai"),
-        "total_all": _status_metrics(summary.get("overall") or {})["total"],
+        "anthropic": _snap("anthropic"),
+        "openai": _snap("openai"),
+        "total_all": _snap(None)["total"],
     }
 
 
 def _month_tps_by_channel_model() -> dict:
-    """只读中央调度器最近一次成功的本月渠道模型 TPS 快照。"""
-    return menu_cache.STATUS_TPS.peek("month").value or {}
+    """本月按渠道和模型查询当前平均 TPS；失败时与原版一致返回空映射。"""
+    from datetime import datetime, timedelta, timezone
+
+    bjt = timezone(timedelta(hours=8))
+    month_start = datetime.now(bjt).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    try:
+        return _CONTROL.tps_by_channel_model(_CONTEXT, since_ts=month_start.timestamp())
+    except Exception:
+        return {}
 
 
 # ─── 渲染 ─────────────────────────────────────────────────────────
@@ -453,7 +471,7 @@ def _compose() -> tuple[str, dict]:
     quota_warn = _quota_warnings(80.0, cfg=cfg)
     concurrency_snapshot = _CONTROL.concurrency_snapshot(_CONTEXT)
 
-    # 月度 TPS 映射（只读一次缓存）
+    # 月度 TPS 映射（只查一次）
     any_fastest = bool(fastest_by_fam.get("anthropic")) or bool(fastest_by_fam.get("openai"))
     tps_map = _month_tps_by_channel_model() if any_fastest else {}
 

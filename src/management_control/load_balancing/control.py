@@ -72,7 +72,7 @@ class LoadBalancingControl(DomainControl):
                 model = str(raw or "").strip()
                 if model:
                     models.add(str(mapping.get(model) or model).strip())
-        return sorted(models, key=str.casefold)
+        return sorted(models, key=lambda value: value.lower())
 
     @classmethod
     def _channels_for_model(cls, model_id: str):

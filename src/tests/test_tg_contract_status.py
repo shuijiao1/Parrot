@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from src.telegram import bot, menu_cache, states, ui
+from src.telegram import bot, states, ui
 from src.telegram.menus import status_menu
 from src.tests.tg_contract import TraceCapture, assert_strict_equal, load_jsonl
 
@@ -45,12 +45,10 @@ def _actual(
 @pytest.fixture(autouse=True)
 def _reset_globals():
     states.clear_all()
-    menu_cache.reset_for_tests()
     ui.configure("fake-main-status-token", [42])
     ui._session = None
     yield
     states.clear_all()
-    menu_cache.reset_for_tests()
     ui._session = None
 
 
@@ -98,39 +96,44 @@ def _patch_status(case: dict[str, Any], monkeypatch) -> tuple[dict[str, Any], li
     )
 
     today = deepcopy(runtime.get("today") or {})
-    bjt = datetime_module.timezone(datetime_module.timedelta(hours=8))
-    now = datetime_module.datetime.fromtimestamp(runtime["clock"], bjt)
-    today_since = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-    monkeypatch.setattr(menu_cache, "today_start_ts", lambda: today_since)
-    if not runtime.get("statsFailure"):
-        menu_cache.PERIOD_STATS.store(("period", int(today_since)), {
-            "summary": {"overall": deepcopy(today.get("total") or {})},
-            "families": {
-                family: {"overall": deepcopy(today.get(family) or {})}
-                for family in ("anthropic", "openai")
-            },
+
+    def stats_summary(*, since_ts, family, summary_top_limit, include_cost):
+        events.append({
+            "event": "stats_summary",
+            "sinceTs": since_ts,
+            "family": family,
+            "summaryTopLimit": summary_top_limit,
+            "includeCost": include_cost,
         })
-    if not runtime.get("tpsFailure"):
-        menu_cache.STATUS_TPS.store("month", {
-            (item["channelKey"], item["model"]): item["tps"]
-            for item in runtime.get("monthTps", [])
-        })
+        if runtime.get("statsFailure"):
+            raise RuntimeError("fake stats unavailable")
+        return {"overall": deepcopy(today.get("total" if family is None else family) or {})}
+
+    monkeypatch.setattr(status_menu.log_db, "stats_summary", stats_summary)
+    tps_map = {
+        (item["channelKey"], item["model"]): item["tps"]
+        for item in runtime.get("monthTps", [])
+    }
+
+    def month_tps(*, since_ts):
+        events.append({"event": "month_tps_by_channel_model", "sinceTs": since_ts})
+        if runtime.get("tpsFailure"):
+            raise RuntimeError("fake monthly TPS unavailable")
+        return deepcopy(tps_map)
+
+    monkeypatch.setattr(status_menu.log_db, "tps_by_channel_model", month_tps)
 
     accounts = deepcopy(cfg.get("oauthAccounts") or [])
     monkeypatch.setattr(status_menu.oauth_manager, "list_accounts", lambda: deepcopy(accounts))
     quota_rows = deepcopy(runtime.get("quotaRows") or {})
+    monkeypatch.setattr(status_menu.state_db, "quota_load", lambda key: deepcopy(quota_rows.get(key)))
 
-    def quota_load(key):
+    def ensure_quota(keys):
+        events.append({"event": "ensure_quota_fresh_sync", "accountKeys": list(keys)})
         if runtime.get("quotaRefreshFailure"):
             raise RuntimeError("fake quota refresh failed")
-        return deepcopy(quota_rows.get(key))
 
-    monkeypatch.setattr(status_menu.state_db, "quota_load", quota_load)
-    monkeypatch.setattr(
-        status_menu.oauth_manager,
-        "ensure_quota_fresh_sync",
-        lambda _keys: pytest.fail("status compose must not refresh provider quota"),
-    )
+    monkeypatch.setattr(status_menu.oauth_manager, "ensure_quota_fresh_sync", ensure_quota)
     monkeypatch.setattr(
         status_menu.oauth_manager,
         "fable_display_from_quota_row",
@@ -217,77 +220,18 @@ def _run_status(case: dict[str, Any], monkeypatch) -> dict[str, Any]:
 
 @pytest.mark.parametrize("case", STATUS_CASES, ids=lambda case: case["caseId"])
 def test_status_trace(case, monkeypatch):
-    # The v0.31.13 fixture records implementation-only synchronous query events.
-    # Keep its Telegram bytes/state immutable while replacing those events with
-    # cache reads, which are covered by the bounded-call regression below.
-    expected = deepcopy(case)
-    expected["finalBusinessState"]["runtimeEvents"] = []
-    assert_strict_equal(expected, _run_status(case, monkeypatch))
+    assert_strict_equal(case, _run_status(case, monkeypatch))
 
 
-def test_compose_only_reads_caches_and_one_concurrency_snapshot(monkeypatch):
+def test_status_queries_fresh_sources_on_every_compose(monkeypatch):
     case = next(case for case in STATUS_CASES if case["caseId"].endswith("command-rich"))
-    _patch_status(case, monkeypatch)
-    counts = {
-        "providerWait": 0,
-        "statsSummary": 0,
-        "monthTps": 0,
-        "periodCacheRead": 0,
-        "tpsCacheRead": 0,
-        "concurrencySnapshot": 0,
-    }
+    _cfg, events = _patch_status(case, monkeypatch)
+    expected_payload = case["tgApi"][0]["payload"]
+    expected_events = case["finalBusinessState"]["runtimeEvents"]
 
-    def forbidden(name):
-        def call(*_args, **_kwargs):
-            import time
-            counts[name] += 1
-            time.sleep(0.2)
-            raise AssertionError(f"synchronous {name} call from compose")
-        return call
+    for _ in range(2):
+        text, keyboard = status_menu._compose()
+        assert text == expected_payload["text"]
+        assert keyboard == expected_payload["reply_markup"]
 
-    monkeypatch.setattr(
-        status_menu.oauth_manager, "ensure_quota_fresh_sync", forbidden("providerWait"),
-    )
-    monkeypatch.setattr(
-        status_menu._CONTROL, "refresh_telegram_quota", forbidden("providerWait"),
-    )
-    monkeypatch.setattr(status_menu._CONTROL, "stats_summary", forbidden("statsSummary"))
-    monkeypatch.setattr(status_menu._CONTROL, "tps_by_channel_model", forbidden("monthTps"))
-
-    period_peek = menu_cache.PERIOD_STATS.peek
-    tps_peek = menu_cache.STATUS_TPS.peek
-    concurrency_snapshot = status_menu._CONTROL.concurrency_snapshot
-
-    def counted_period_peek(key):
-        counts["periodCacheRead"] += 1
-        return period_peek(key)
-
-    def counted_tps_peek(key):
-        counts["tpsCacheRead"] += 1
-        return tps_peek(key)
-
-    def counted_concurrency_snapshot(context):
-        counts["concurrencySnapshot"] += 1
-        return concurrency_snapshot(context)
-
-    monkeypatch.setattr(menu_cache.PERIOD_STATS, "peek", counted_period_peek)
-    monkeypatch.setattr(menu_cache.STATUS_TPS, "peek", counted_tps_peek)
-    monkeypatch.setattr(status_menu._CONTROL, "concurrency_snapshot", counted_concurrency_snapshot)
-
-    import time
-    started = time.perf_counter()
-    text, keyboard = status_menu._compose()
-    elapsed = time.perf_counter() - started
-
-    expected_call = case["tgApi"][0]["payload"]
-    assert text == expected_call["text"]
-    assert keyboard == expected_call["reply_markup"]
-    assert counts == {
-        "providerWait": 0,
-        "statsSummary": 0,
-        "monthTps": 0,
-        "periodCacheRead": 1,
-        "tpsCacheRead": 1,
-        "concurrencySnapshot": 1,
-    }
-    assert elapsed < 0.1
+    assert events == expected_events + expected_events
