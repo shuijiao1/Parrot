@@ -158,6 +158,65 @@ def test_update_stage_requires_idempotency_and_activation_plan_expires(tmp_path)
         assert expired.json()["error"]["code"] == "STATE_CONFLICT"
 
 
+def test_reaudit3_update_token_cancelled_plan_never_revives_on_same_version_restage(tmp_path):
+    app, _, fixture = build_auxiliary_app(tmp_path)
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+
+        def stage(idempotency_key: str) -> tuple[str, str]:
+            response = client.post(
+                BASE + "/updates/0.32.0/actions/stage",
+                headers={**headers, "Idempotency-Key": idempotency_key},
+            )
+            assert response.status_code == 202, response.text
+            data = response.json()["data"]
+            terminal = _poll(client, headers, data["id"])
+            assert terminal["status"] == "succeeded"
+            return data["activationPlanToken"], terminal["result"]["expectedRevision"]
+
+        old_token, old_revision = stage("stage-same-version-a")
+        cancelled = client.delete(
+            BASE + "/updates/staged",
+            headers={**headers, "If-Match": old_revision},
+        )
+        assert cancelled.status_code == 204, cancelled.text
+        assert fixture.update_gateway.cancel_calls == 1
+
+        new_token, new_revision = stage("stage-same-version-b")
+        assert new_token != old_token
+        # The public state revision is deliberately identical: plan identity, not
+        # a coincidental version/state difference, must make the old token stale.
+        assert new_revision == old_revision
+
+        stale = client.post(
+            BASE + "/updates/staged/actions/restart",
+            json={"planToken": old_token},
+            headers={
+                **headers,
+                "Idempotency-Key": "activate-cancelled-token",
+                "If-Match": new_revision,
+            },
+        )
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["error"]["code"] == "STATE_CONFLICT"
+        assert fixture.update_gateway.activate_calls == 0
+
+        activated = client.post(
+            BASE + "/updates/staged/actions/restart",
+            json={"planToken": new_token},
+            headers={
+                **headers,
+                "Idempotency-Key": "activate-current-token",
+                "If-Match": new_revision,
+            },
+        )
+        assert activated.status_code == 202, activated.text
+        terminal = _poll(client, headers, activated.json()["data"]["id"])
+        assert terminal["status"] == "succeeded"
+        assert terminal["result"] == {"activated": True}
+        assert fixture.update_gateway.activate_calls == 1
+
+
 def test_image_and_xai_all_operations_no_oauth_secret_and_revision_conflict(tmp_path):
     app, _, fixture = build_auxiliary_app(tmp_path)
     with TestClient(app) as client:

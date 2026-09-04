@@ -239,6 +239,7 @@ class UpdateControl:
         self._operation_registry: OperationRegistry | None = None
         self._bound_registries: set[int] = set()
         self._plans: dict[str, _ActivationPlan] = {}
+        self._active_plan_digest: str | None = None
         self._idempotency: OrderedDict[tuple[str, str, str], tuple[str, str]] = OrderedDict()
         self._lock = threading.RLock()
 
@@ -549,13 +550,23 @@ class UpdateControl:
         before_activate: Callable[[], None],
     ) -> tuple[bool, str]:
         require(context, Capability.UPDATE)
-        self._updates.save_state(chat_id=chat_id, notify_msg_id=notify_msg_id)
-        before_activate()
-        return self._updates.activate()
+        with self._lock:
+            active_digest = self._active_plan_digest
+            self._updates.save_state(chat_id=chat_id, notify_msg_id=notify_msg_id)
+            before_activate()
+            result = self._updates.activate()
+            if result[0]:
+                self._retire_plan(active_digest)
+            return result
 
     def cancel_direct(self, context: ManagementContext) -> tuple[bool, str]:
         require(context, Capability.UPDATE)
-        return self._updates.cancel()
+        with self._lock:
+            active_digest = self._active_plan_digest
+            result = self._updates.cancel()
+            if result[0]:
+                self._retire_plan(active_digest)
+            return result
 
     def _idempotent_existing(
         self,
@@ -641,6 +652,16 @@ class UpdateControl:
         )
         return token, digest
 
+    def _retire_plan(self, digest: str | None) -> None:
+        """Make one stage identity permanently unusable without removing history."""
+        if digest is None:
+            return
+        plan = self._plans.get(digest)
+        if plan is not None:
+            plan.consumed = True
+        if self._active_plan_digest == digest:
+            self._active_plan_digest = None
+
     def _start_stage(self, operation_id: str, context: ManagementContext, payload: Any) -> None:
         store = self._operation_store
         if store is None:
@@ -648,7 +669,10 @@ class UpdateControl:
 
         def fail() -> None:
             with self._lock:
-                self._plans.pop(str(payload["planDigest"]), None)
+                digest = str(payload["planDigest"])
+                self._plans.pop(digest, None)
+                if self._active_plan_digest == digest:
+                    self._active_plan_digest = None
             store.fail(
                 operation_id,
                 code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
@@ -685,13 +709,18 @@ class UpdateControl:
                 fail()
                 return
             try:
-                state = self._state_without_auth()
                 with self._lock:
-                    plan = self._plans.get(str(payload["planDigest"]))
+                    state = self._state_without_auth()
+                    digest = str(payload["planDigest"])
+                    plan = self._plans.get(digest)
                     if plan is None or plan.actor_key != str(payload["actorKey"]):
                         raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+                    if state.stage != STAGE_STAGED:
+                        raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+                    self._retire_plan(self._active_plan_digest)
                     plan.revision = state.revision
                     plan.ready = True
+                    self._active_plan_digest = digest
                     expires_at = rfc3339_utc(plan.expires_at)
                 store.succeed(
                     operation_id,
@@ -759,6 +788,9 @@ class UpdateControl:
                 raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
             if not plan.ready or plan.revision is None:
                 raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            if self._active_plan_digest != digest:
+                plan.consumed = True
+                raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
             current = self._state_without_auth()
             if current.stage != STAGE_STAGED:
                 raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
@@ -775,6 +807,7 @@ class UpdateControl:
             except Exception:
                 plan.consumed = False
                 raise
+            self._active_plan_digest = None
             self._idempotency[idempotency_key] = (digest, operation.id)
             self._idempotency.move_to_end(idempotency_key)
             while len(self._idempotency) > 500:
@@ -831,11 +864,14 @@ class UpdateControl:
         expected_revision: str | None = None,
     ) -> None:
         require(context, Capability.UPDATE)
-        current = self._state_without_auth()
-        ensure_revision(expected_revision, current.revision)
-        if current.stage != STAGE_STAGED:
-            raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
-        ok, _detail = self._updates.cancel()
-        if not ok:
-            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True)
+        with self._lock:
+            current = self._state_without_auth()
+            ensure_revision(expected_revision, current.revision)
+            if current.stage != STAGE_STAGED:
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            active_digest = self._active_plan_digest
+            ok, _detail = self._updates.cancel()
+            if not ok:
+                raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True)
+            self._retire_plan(active_digest)
         audit(self._audit_sink, context, action="updates.staged.cancel", target="staged-update")
