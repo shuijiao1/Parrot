@@ -7,7 +7,7 @@ import copy
 import secrets
 import time
 from collections import OrderedDict
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, wait
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -17,6 +17,7 @@ from typing import Any, Callable, Coroutine, Mapping
 from src.management_auth.policy import CapabilityDenied, authorize
 from src.management_auth.principal import Capability
 
+from ._daemon_executor import DaemonBoundedExecutor
 from .context import AuditSink, ManagementContext, audit_record
 from .errors import ManagementError, ManagementErrorCode
 from .public_safety import redact_known_fields
@@ -121,8 +122,9 @@ class OperationStore:
         self._audit_sink = audit_sink
         self._items: OrderedDict[str, ManagementOperation] = OrderedDict()
         self._lock = RLock()
-        self._executor = ThreadPoolExecutor(
+        self._executor = DaemonBoundedExecutor(
             max_workers=max_workers,
+            max_queue_size=max_operations,
             thread_name_prefix="management-operation",
         )
         self._shutdown_timeout_seconds = float(shutdown_timeout_seconds)
@@ -510,9 +512,9 @@ class OperationStore:
                 if not task.done():
                     task.cancel()
         interrupted = self.interrupt_active()
-        # If every native task observed the grace period, join idle workers now.
-        # A timed-out running Python thread cannot be force-stopped, so only that
-        # case uses non-blocking executor shutdown.
+        # If every native task observed the grace period, join the fixed workers
+        # now. A timed-out Python function cannot be force-stopped; its daemon
+        # worker instead exits naturally later or with interpreter shutdown.
         self._executor.shutdown(wait=not futures, cancel_futures=True)
         with self._lock:
             self._closed = True

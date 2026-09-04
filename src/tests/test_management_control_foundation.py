@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -262,7 +266,8 @@ def _wait_until(predicate, timeout: float = 2.0) -> None:
     assert predicate()
 
 
-def test_owned_executor_bounds_burst_and_preserves_results():
+@pytest.mark.parametrize("burst_size", (18, 24))
+def test_owned_executor_bounds_burst_and_preserves_results(burst_size):
     store = OperationStore(max_workers=3)
     owner = context()
     release = threading.Event()
@@ -283,7 +288,7 @@ def test_owned_executor_bounds_burst_and_preserves_results():
 
     operations = []
     try:
-        for index in range(18):
+        for index in range(burst_size):
             operation = store.create(
                 owner, kind=f"burst.{index}", cancellable=True,
             )
@@ -297,12 +302,12 @@ def test_owned_executor_bounds_burst_and_preserves_results():
         )
         statuses = [store.get(owner, item.id).status for item in operations]
         assert statuses.count(OperationStatus.RUNNING) == 3
-        assert statuses.count(OperationStatus.QUEUED) == 15
+        assert statuses.count(OperationStatus.QUEUED) == burst_size - 3
         assert peak == 3
         assert sum(
             thread.name.startswith("management-operation")
             for thread in threading.enumerate()
-        ) <= 3
+        ) == 3
     finally:
         release.set()
     _wait_until(
@@ -387,6 +392,56 @@ def test_close_waits_for_running_then_rejects_and_is_idempotent():
     assert rejected.value.retryable is True
 
 
+def test_close_allows_process_exit_with_permanently_blocked_worker():
+    script = """
+import threading
+from datetime import datetime, timezone
+
+from src.management_auth import AuthMethod, ManagementPrincipal
+from src.management_control import ManagementContext, OperationStatus, OperationStore
+
+actor = ManagementPrincipal.administrator(
+    subject_id="shutdown-probe",
+    auth_method=AuthMethod.MANAGEMENT_KEY,
+    issued_at=datetime.now(timezone.utc),
+    session_id="shutdown-probe-session",
+)
+context = ManagementContext(request_id="shutdown-probe", actor=actor)
+store = OperationStore(max_workers=1, shutdown_timeout_seconds=0)
+operation = store.create(context, kind="shutdown.blocked", cancellable=False)
+started = threading.Event()
+
+
+def worker():
+    store.mark_running(operation.id)
+    started.set()
+    threading.Event().wait()
+
+
+store.submit(operation.id, worker)
+assert started.wait(0.5)
+store.close()
+assert store.get(context, operation.id).status is OperationStatus.FAILED
+print("close-returned", flush=True)
+"""
+    environment = os.environ.copy()
+    environment.pop("PARROT_NO_REFRESH", None)
+    began = time.monotonic()
+    completed = subprocess.run(
+        [sys.executable, "-u", "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=1.0,
+        check=False,
+    )
+    elapsed = time.monotonic() - began
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "close-returned\n"
+    assert elapsed < 1.0
+
+
 def test_close_cancels_queue_and_interrupts_unstoppable_running_worker():
     store = OperationStore(max_workers=1, shutdown_timeout_seconds=0.05)
     owner = context()
@@ -431,6 +486,11 @@ def test_close_cancels_queue_and_interrupts_unstoppable_running_worker():
             for thread in threading.enumerate()
         )
     )
+    terminal = store.get(owner, running.id)
+    assert terminal.status is OperationStatus.FAILED
+    assert terminal.result is None
+    assert terminal.error is not None
+    assert terminal.error.code is ManagementErrorCode.DEPENDENCY_UNAVAILABLE
 
 
 def test_submit_close_race_leaves_no_active_or_unowned_operation():
