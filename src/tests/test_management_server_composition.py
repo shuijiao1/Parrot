@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import server
-from src.management_api import ManagementRuntime
+from src.management_api import ManagementRuntime, install_management_routers
 
 
 EXPECTED_OPERATIONS = frozenset(
@@ -31,6 +31,33 @@ def settings(tmp_path):
         "maxOperations": 100,
         "maxAuditRecords": 100,
     }
+
+
+def test_management_routes_are_cloned_directly_into_the_application(monkeypatch):
+    app = FastAPI()
+    included = []
+    include_router = app.include_router
+
+    def record_direct_mount(router, *args, **kwargs):
+        included.append((router, kwargs.get("prefix")))
+        return include_router(router, *args, **kwargs)
+
+    monkeypatch.setattr(app, "include_router", record_direct_mount)
+    install_management_routers(app)
+
+    # Foundation plus the 20 ordered domain routers are each mounted on the app;
+    # there is no intermediate aggregate router to clone a second time.
+    assert len(included) == 21
+    assert all(prefix == "/api/management/v1" for _router, prefix in included)
+    assert sum(len(router.routes) for router, _prefix in included) == 203
+    assert len([
+        route for route in app.routes
+        if route.path.startswith("/api/management/v1")
+    ]) == 203
+
+    source = Path("server.py").read_text()
+    assert "install_management_routers(app)" in source
+    assert "app.include_router(create_management_router())" not in source
 
 
 def test_server_mounts_all_domain_routers_and_preserves_lifecycle_order():

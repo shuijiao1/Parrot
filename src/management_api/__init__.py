@@ -7,7 +7,11 @@ from .error_mapping import (
     management_error_responses,
 )
 from .origin import ManagementOriginMiddleware
-from .router import create_management_router, register_management_router
+from .router import (
+    create_management_router,
+    install_management_routers,
+    register_management_router,
+)
 
 __all__ = [
     "MANAGEMENT_ERROR_STATUS",
@@ -15,6 +19,7 @@ __all__ = [
     "ManagementRuntime",
     "create_management_router",
     "install_management_error_handlers",
+    "install_management_routers",
     "management_error_responses",
     "register_management_router",
 ]

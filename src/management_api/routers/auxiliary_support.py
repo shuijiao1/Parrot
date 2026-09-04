@@ -15,11 +15,10 @@ from src.management_control.auxiliary import (
     XaiMediaControl,
 )
 from src.management_control import ErrorField, ManagementError, ManagementErrorCode
-from src.management_control.operations import ManagementOperation
 
 from ..dependencies import ManagementRuntime, get_management_runtime, management_request_id
 from ..schemas.base import ResponseMeta
-from ..schemas.operations import ManagementOperationData, OperationErrorData, OperationProgressData
+from ._operations import operation_data
 
 
 def get_bound_auxiliary_controls(
@@ -71,35 +70,6 @@ def reject_unknown_query(*allowed: str) -> Callable[[Request], None]:
 
 def response_meta(request: Request) -> ResponseMeta:
     return ResponseMeta(requestId=management_request_id(request))
-
-
-def operation_data(operation: ManagementOperation) -> ManagementOperationData:
-    progress = None
-    if operation.progress is not None:
-        progress = OperationProgressData(
-            current=operation.progress.current,
-            total=operation.progress.total,
-            messageCode=operation.progress.message_code,
-        )
-    error = None
-    if operation.error is not None:
-        error = OperationErrorData(
-            code=operation.error.code,
-            message=operation.error.message,
-            retryable=operation.error.retryable,
-        )
-    return ManagementOperationData(
-        id=operation.id,
-        kind=operation.kind,
-        status=operation.status,
-        progress=progress,
-        createdAt=operation.created_at,
-        startedAt=operation.started_at,
-        finishedAt=operation.finished_at,
-        result=operation.result,
-        error=error,
-        cancellable=operation.cancellable,
-    )
 
 
 def success_response(status_code: int, example: dict) -> dict[int, dict]:

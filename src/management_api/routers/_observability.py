@@ -21,12 +21,9 @@ from src.management_control.observability import (
     StatsControl,
     StatusControl,
 )
-from src.management_control.operations import ManagementOperation
-
 from ..dependencies import ManagementRuntime, management_request_id
-from ..schemas import ManagementOperationData
 from ..schemas.observability import LogBodyPagedResponseMeta, PagedResponseMeta
-from ..schemas.operations import OperationErrorData, OperationProgressData
+from ._operations import operation_data
 
 
 _binding_lock = RLock()
@@ -108,32 +105,3 @@ def reject_unknown_query(request: Request, allowed: Iterable[str]) -> None:
                 for field in unknown
             ),
         )
-
-
-def operation_data(operation: ManagementOperation) -> ManagementOperationData:
-    progress = None
-    if operation.progress is not None:
-        progress = OperationProgressData(
-            current=operation.progress.current,
-            total=operation.progress.total,
-            messageCode=operation.progress.message_code,
-        )
-    error = None
-    if operation.error is not None:
-        error = OperationErrorData(
-            code=operation.error.code,
-            message=operation.error.message,
-            retryable=operation.error.retryable,
-        )
-    return ManagementOperationData(
-        id=operation.id,
-        kind=operation.kind,
-        status=operation.status,
-        progress=progress,
-        createdAt=operation.created_at,
-        startedAt=operation.started_at,
-        finishedAt=operation.finished_at,
-        result=operation.result,
-        error=error,
-        cancellable=operation.cancellable,
-    )

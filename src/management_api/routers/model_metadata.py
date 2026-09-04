@@ -14,7 +14,6 @@ from src.management_control.mapping import (
     MappingControl,
     MetadataRecord,
 )
-from src.management_control.operations import ManagementOperation
 
 from ..dependencies import (
     ManagementRuntime,
@@ -24,7 +23,8 @@ from ..dependencies import (
 )
 from ..error_mapping import management_error_responses
 from ..schemas.base import ResponseMeta
-from ._p5_query import reject_unknown_query_parameters
+from ._operations import operation_data as _operation
+from ._strict_query import reject_unknown_query_parameters
 from ..schemas.mapping import MappingListMeta
 from ..schemas.model_metadata import (
     CatalogData,
@@ -43,11 +43,6 @@ from ..schemas.model_metadata import (
     MetadataPricing,
     MetadataValues,
     PutMetadataBindingRequest,
-)
-from ..schemas.operations import (
-    ManagementOperationData,
-    OperationErrorData,
-    OperationProgressData,
 )
 
 
@@ -155,35 +150,6 @@ def _catalog(item: CatalogRecord) -> CatalogData:
         providerName=item.provider_name,
         metadata=_values(item.metadata),
         revision=item.revision,
-    )
-
-
-def _operation(operation: ManagementOperation) -> ManagementOperationData:
-    progress = None
-    if operation.progress is not None:
-        progress = OperationProgressData(
-            current=operation.progress.current,
-            total=operation.progress.total,
-            messageCode=operation.progress.message_code,
-        )
-    error = None
-    if operation.error is not None:
-        error = OperationErrorData(
-            code=operation.error.code,
-            message=operation.error.message,
-            retryable=operation.error.retryable,
-        )
-    return ManagementOperationData(
-        id=operation.id,
-        kind=operation.kind,
-        status=operation.status,
-        progress=progress,
-        createdAt=operation.created_at,
-        startedAt=operation.started_at,
-        finishedAt=operation.finished_at,
-        result=operation.result,
-        error=error,
-        cancellable=operation.cancellable,
     )
 
 

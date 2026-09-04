@@ -18,7 +18,7 @@ from ..dependencies import (
 )
 from ..error_mapping import management_error_responses
 from ..schemas.base import ResponseMeta
-from ._p5_query import reject_unknown_query_parameters
+from ._strict_query import reject_unknown_query_parameters
 from ..schemas.mapping import (
     CompressionModelData,
     CompressionModelEnvelope,

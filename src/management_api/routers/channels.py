@@ -28,7 +28,6 @@ from src.management_control.channels import (
     DraftProbeCommand,
     SortDirection,
 )
-from src.management_control.operations import ManagementOperation
 
 from ..channels_security import redact_credential_text, strip_url_userinfo
 from ..dependencies import (
@@ -75,11 +74,7 @@ from ..schemas.channels import (
     ProviderUsageMetricData,
     ProviderUsageSnapshotData,
 )
-from ..schemas.operations import (
-    ManagementOperationData,
-    OperationErrorData,
-    OperationProgressData,
-)
+from ._operations import operation_data as _operation_data
 
 
 _LIST_QUERY_PARAMETERS = frozenset({
@@ -512,31 +507,6 @@ def _update_command(body: ChannelUpdateRequest) -> ChannelUpdateCommand:
     if "providerPresetId" in fields:
         kwargs["provider_preset_id"] = body.providerPresetId
     return ChannelUpdateCommand(**kwargs)
-
-
-def _operation_data(operation: ManagementOperation) -> ManagementOperationData:
-    progress = None if operation.progress is None else OperationProgressData(
-        current=operation.progress.current,
-        total=operation.progress.total,
-        messageCode=operation.progress.message_code,
-    )
-    error = None if operation.error is None else OperationErrorData(
-        code=operation.error.code,
-        message=operation.error.message,
-        retryable=operation.error.retryable,
-    )
-    return ManagementOperationData(
-        id=operation.id,
-        kind=operation.kind,
-        status=operation.status,
-        progress=progress,
-        createdAt=operation.created_at,
-        startedAt=operation.started_at,
-        finishedAt=operation.finished_at,
-        result=operation.result,
-        error=error,
-        cancellable=operation.cancellable,
-    )
 
 
 @router.get(

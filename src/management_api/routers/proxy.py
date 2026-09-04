@@ -8,7 +8,6 @@ from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response, 
 
 from src.management_auth import Capability
 from src.management_control import ManagementContext, ManagementErrorCode
-from src.management_control.operations import ManagementOperation
 from src.management_control.proxy import (
     ProxyControl,
     ProxyGroupRecord,
@@ -24,9 +23,9 @@ from ..dependencies import (
 )
 from ..error_mapping import management_error_responses
 from ..schemas.base import ResponseMeta
-from ._p5_query import reject_unknown_query_parameters
+from ._operations import operation_data as _operation
+from ._strict_query import reject_unknown_query_parameters
 from ..schemas.mapping import MappingListMeta
-from ..schemas.operations import ManagementOperationData, OperationErrorData, OperationProgressData
 from ..schemas.proxy import (
     CreateProxyGroupRequest,
     CreateProxyRequest,
@@ -138,23 +137,6 @@ def _routing(item: ProxyRoutingRecord) -> ProxyRoutingData:
         default=item.default, directFallback=item.direct_fallback,
         functions=dict(item.functions), accounts=dict(item.accounts),
         channels=dict(item.channels), models=dict(item.models), revision=item.revision,
-    )
-
-
-def _operation(operation: ManagementOperation) -> ManagementOperationData:
-    progress = None if operation.progress is None else OperationProgressData(
-        current=operation.progress.current, total=operation.progress.total,
-        messageCode=operation.progress.message_code,
-    )
-    error = None if operation.error is None else OperationErrorData(
-        code=operation.error.code, message=operation.error.message,
-        retryable=operation.error.retryable,
-    )
-    return ManagementOperationData(
-        id=operation.id, kind=operation.kind, status=operation.status,
-        progress=progress, createdAt=operation.created_at, startedAt=operation.started_at,
-        finishedAt=operation.finished_at, result=operation.result,
-        error=error, cancellable=operation.cancellable,
     )
 
 

@@ -10,12 +10,11 @@ from fastapi import Request
 
 from src.management_control import ErrorField, ManagementError, ManagementErrorCode
 from src.management_control.network import NetworkControl
-from src.management_control.operations import ManagementOperation
 from src.management_control.system import ContentBlacklistControl, SettingsControl
 
 from ..dependencies import ManagementRuntime, management_request_id
 from ..schemas.base import ResponseMeta
-from ..schemas.operations import ManagementOperationData, OperationErrorData, OperationProgressData
+from ._operations import operation_data
 
 
 @dataclass(slots=True)
@@ -67,31 +66,6 @@ def reject_unknown_query(*allowed: str):
 
 def response_meta(request: Request) -> ResponseMeta:
     return ResponseMeta(requestId=management_request_id(request))
-
-
-def operation_data(operation: ManagementOperation) -> ManagementOperationData:
-    progress = None if operation.progress is None else OperationProgressData(
-        current=operation.progress.current,
-        total=operation.progress.total,
-        messageCode=operation.progress.message_code,
-    )
-    error = None if operation.error is None else OperationErrorData(
-        code=operation.error.code,
-        message=operation.error.message,
-        retryable=operation.error.retryable,
-    )
-    return ManagementOperationData(
-        id=operation.id,
-        kind=operation.kind,
-        status=operation.status,
-        progress=progress,
-        createdAt=operation.created_at,
-        startedAt=operation.started_at,
-        finishedAt=operation.finished_at,
-        result=operation.result,
-        error=error,
-        cancellable=operation.cancellable,
-    )
 
 
 def success_response(status_code: int, data: dict) -> dict[int, dict]:

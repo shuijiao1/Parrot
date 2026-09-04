@@ -14,8 +14,8 @@ from src.management_auth import (
     SessionAuthenticationError,
 )
 from src.management_control import ManagementContext, ManagementError, ManagementErrorCode
-from src.management_control.operations import ManagementOperation
 
+from ._operations import operation_data as _operation_data
 from ._strict_query import reject_unknown_query_parameters
 from ..dependencies import (
     AuthenticatedSession,
@@ -42,7 +42,6 @@ from ..schemas import (
     TelegramApprovalStatusData,
 )
 from ..schemas.metadata import CapabilityDomain, EnumDescriptor
-from ..schemas.operations import OperationErrorData, OperationProgressData
 
 
 router = APIRouter()
@@ -189,35 +188,6 @@ def _session_summary(issued_or_verified) -> SessionSummary:
         issuedAt=principal.issued_at,
         expiresAt=issued_or_verified.expires_at,
         idleExpiresAt=issued_or_verified.idle_expires_at,
-    )
-
-
-def _operation_data(operation: ManagementOperation) -> ManagementOperationData:
-    progress = None
-    if operation.progress is not None:
-        progress = OperationProgressData(
-            current=operation.progress.current,
-            total=operation.progress.total,
-            messageCode=operation.progress.message_code,
-        )
-    error = None
-    if operation.error is not None:
-        error = OperationErrorData(
-            code=operation.error.code,
-            message=operation.error.message,
-            retryable=operation.error.retryable,
-        )
-    return ManagementOperationData(
-        id=operation.id,
-        kind=operation.kind,
-        status=operation.status,
-        progress=progress,
-        createdAt=operation.created_at,
-        startedAt=operation.started_at,
-        finishedAt=operation.finished_at,
-        result=operation.result,
-        error=error,
-        cancellable=operation.cancellable,
     )
 
 

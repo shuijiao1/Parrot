@@ -5,7 +5,7 @@ from __future__ import annotations
 from threading import RLock
 from typing import Iterable
 
-from fastapi import APIRouter
+from fastapi import APIRouter, FastAPI
 
 from .routers import (
     apikey,
@@ -71,12 +71,9 @@ def register_management_router(router: APIRouter) -> None:
         _registered.append(router)
 
 
-def create_management_router(
-    extra_routers: Iterable[APIRouter] | None = None,
-) -> APIRouter:
-    """Compose the production router, or an explicit bounded subset for tests."""
-    aggregate = APIRouter(prefix=_PREFIX)
-    aggregate.include_router(foundation_router)
+def _selected_routers(
+    extra_routers: Iterable[APIRouter] | None,
+) -> tuple[APIRouter, ...]:
     selected = (
         _BUILTIN_DOMAIN_ROUTERS
         if extra_routers is None
@@ -84,6 +81,23 @@ def create_management_router(
     )
     with _lock:
         registered = tuple(_registered)
-    for domain_router in (*registered, *selected):
+    return (foundation_router, *registered, *selected)
+
+
+def install_management_routers(
+    app: FastAPI,
+    extra_routers: Iterable[APIRouter] | None = None,
+) -> None:
+    """Mount each domain router directly so production routes are cloned once."""
+    for domain_router in _selected_routers(extra_routers):
+        app.include_router(domain_router, prefix=_PREFIX)
+
+
+def create_management_router(
+    extra_routers: Iterable[APIRouter] | None = None,
+) -> APIRouter:
+    """Compose a standalone aggregate router for bounded test applications."""
+    aggregate = APIRouter(prefix=_PREFIX)
+    for domain_router in _selected_routers(extra_routers):
         aggregate.include_router(domain_router)
     return aggregate

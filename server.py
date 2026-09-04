@@ -46,8 +46,8 @@ from src.telegram import bot as tgbot
 from src.management_api import (
     ManagementOriginMiddleware,
     ManagementRuntime,
-    create_management_router,
     install_management_error_handlers,
+    install_management_routers,
 )
 from src.management_auth import (
     ApprovalError,
@@ -488,7 +488,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.state.management_runtime = None
-app.include_router(create_management_router())
+install_management_routers(app)
 install_management_error_handlers(app)
 
 app.add_middleware(
