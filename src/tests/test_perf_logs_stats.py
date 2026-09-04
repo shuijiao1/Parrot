@@ -142,6 +142,20 @@ class _ConnectionProbe:
         return self._conn.create_collation(*args)
 
 
+def test_log_detail_without_detail_row_preserves_response_body_none(monkeypatch):
+    conn = _memory_log_db()
+    _insert_request(conn, "missing-detail", 1.0)
+    conn.commit()
+    monkeypatch.setattr(log_db, "_get_conn", lambda: conn)
+
+    detail = log_db.log_detail("missing-detail")
+
+    assert detail["detail"] is None
+    assert "response_body" in detail["log"]
+    assert detail["log"]["response_body"] is None
+    conn.close()
+
+
 def test_management_text_search_is_one_bounded_stream_after_sql_filters(monkeypatch):
     conn = _memory_log_db()
     for index in range(1000):
@@ -268,6 +282,79 @@ def test_page_costs_match_single_row_reference_and_remove_n_plus_one(monkeypatch
     assert after_attempt_selects == 1
     assert before == 300
     assert after == 6
+
+
+def test_cost_overflow_is_exact_for_batch_stats_groups_and_lifetime(
+    monkeypatch, tmp_path,
+):
+    max_int64 = (1 << 63) - 1
+    expected_ticks = 18_446_744_073_709_551_614
+    current_month = datetime.now(log_db._BJT).strftime("%Y-%m")
+    conn = _file_log_db(tmp_path / f"{current_month}.db")
+    now = datetime.now(log_db._BJT).timestamp()
+    _insert_request(
+        conn, "overflow-cost", now, requested_model="priced",
+        final_model="priced", channel="api:a", protocol="chat",
+    )
+    for retry_id in (1, 2):
+        conn.execute(
+            """INSERT INTO upstream_attempt_usage(
+                   retry_attempt_id, root_request_id, call_request_id, attempt_order,
+                   channel_key, channel_type, model, outcome, usage_observed,
+                   service_tier, upstream_protocol, cost_source, cost_ticks, settled_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                retry_id, "overflow-cost", "overflow-cost", retry_id,
+                "api:a", "api", "priced", "success", 1,
+                "standard", "openai-chat", "actual", max_int64, now,
+            ),
+        )
+    conn.commit()
+    request_row = dict(conn.execute(
+        "SELECT * FROM request_log WHERE request_id='overflow-cost'"
+    ).fetchone())
+
+    monkeypatch.setattr(log_db, "_log_dir", str(tmp_path))
+    monkeypatch.setattr(log_db, "_get_conn", lambda: conn)
+    monkeypatch.setattr(
+        log_db, "_iter_month_conns", lambda _since: [(conn, lambda: None)],
+    )
+    monkeypatch.setattr(
+        log_db, "_iter_month_conns_all", lambda _since: [(conn, lambda: None)],
+    )
+    monkeypatch.setattr(
+        log_db.model_pricing, "settings",
+        lambda *args, **kwargs: type("Settings", (), {"enabled": True})(),
+    )
+    monkeypatch.setattr(log_db, "_lifetime_pricing_signature", lambda: "stable")
+
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        single = log_db.cost_for_log(request_row)
+        batch = log_db.costs_for_logs([request_row])["overflow-cost"]
+        grouped_summary = log_db.stats_summary(0)["overall"]
+        overall_only_summary = log_db.stats_summary(
+            0, summary_top_limit=0,
+        )["overall"]
+        model_stats = log_db.channel_model_stats("api:a", 0)[0]
+        lifetime = log_db.stats_lifetime()
+    finally:
+        conn.set_trace_callback(None)
+        conn.close()
+
+    for result in (
+        single, batch, grouped_summary, overall_only_summary, model_stats, lifetime,
+    ):
+        assert result["cost_ticks"] == expected_ticks
+        assert result["actual_cost_ticks"] == expected_ticks
+        assert result["costed_success"] == 2
+        assert result["unpriced_success"] == 0
+    assert any(
+        "SUM(CASE WHEN" in sql.upper() and "COST_TICKS" in sql.upper()
+        for sql in statements
+    )
+    assert any(log_db._EXACT_COST_TICKS_SUM_FUNCTION in sql for sql in statements)
 
 
 def test_batch_cost_preserves_missing_dispatch_and_legacy_fallback(monkeypatch, tmp_path):
@@ -419,6 +506,13 @@ def test_lifetime_attempt_costs_are_sql_grouped_to_three_result_rows(monkeypatch
         if "FROM upstream_attempt_usage a" in sql and "GROUP BY a.cost_source" in sql
     ]
     assert attempt_cost_loads == [3]
+    attempt_cost_sql = [
+        sql for sql, _count in loaded
+        if "FROM upstream_attempt_usage a" in sql and "GROUP BY a.cost_source" in sql
+    ]
+    assert len(attempt_cost_sql) == 1
+    assert "SUM(CASE WHEN a.cost_ticks>0" in attempt_cost_sql[0]
+    assert log_db._EXACT_COST_TICKS_SUM_FUNCTION not in attempt_cost_sql[0]
     assert result["costed_success"] == 400
     assert result["unpriced_success"] == 200
     assert all("SELECT a.*" not in sql for sql, _count in loaded)

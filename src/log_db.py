@@ -380,13 +380,21 @@ def _row_handle(
     value: int | RowLogHandle,
     *,
     table: Literal["retry_chain", "proxy_chain", "local_web_log"],
+    request: RequestLogHandle | None = None,
 ) -> RowLogHandle:
     if isinstance(value, RowLogHandle):
         if value.table != table:
             raise ValueError(f"row handle table mismatch: {value.table!r} != {table!r}")
         return value
-    # Legacy compatibility; production callers are migrated to RowLogHandle.
-    return RowLogHandle(table=table, row_id=int(value), request_id="", db=_db_ref_for_timestamp())
+    # A legacy integer carries no monthly identity. When the caller also has a
+    # concrete request handle, bind the row to that request's DB rather than the
+    # wall-clock month; standalone legacy updates retain their current-month rule.
+    return RowLogHandle(
+        table=table,
+        row_id=int(value),
+        request_id=request.request_id if request is not None else "",
+        db=request.db if request is not None else _db_ref_for_timestamp(),
+    )
 
 
 def retain_request_handle(
@@ -2232,8 +2240,10 @@ def record_proxy_attempt(
     request = _request_handle(request_id)
     retry_id: int | None = None
     if retry_attempt_id is not None:
-        retry = _row_handle(retry_attempt_id, table="retry_chain")
-        if isinstance(retry_attempt_id, RowLogHandle) and retry.db != request.db:
+        retry = _row_handle(
+            retry_attempt_id, table="retry_chain", request=request,
+        )
+        if retry.db != request.db:
             raise ValueError("retry and route round must belong to the same monthly DB")
         retry_id = retry.row_id
     with _write_lock:
@@ -2904,6 +2914,55 @@ def _attempt_rows_exist(conn: sqlite3.Connection) -> bool:
         return False
 
 
+_COST_TICKS_SUM_TOKEN = "__parrot_cost_ticks_sum__"
+_EXACT_COST_TICKS_SUM_FUNCTION = "_parrot_exact_int_sum"
+
+
+class _ExactIntSum:
+    """SQLite aggregate that returns arbitrary-precision integers as text."""
+
+    def __init__(self) -> None:
+        self.total = 0
+
+    def step(self, value: Any) -> None:
+        self.total += int(value or 0)
+
+    def finalize(self) -> str:
+        # sqlite3 cannot marshal Python integers outside signed int64. Decimal
+        # text preserves the exact total for the caller's subsequent int().
+        return str(self.total)
+
+
+def _cost_aggregate_rows(
+    conn,
+    sql_template: str,
+    args,
+    *,
+    cost_ticks_expr: str,
+) -> list[sqlite3.Row]:
+    """Use native SUM normally; retry a query only after exact overflow.
+
+    The fallback remains SQL-grouped and materializes only aggregate result rows.
+    It is registered and executed only after SQLite reports signed-int64 overflow.
+    """
+
+    clamped = (
+        f"CASE WHEN {cost_ticks_expr}>0 THEN {cost_ticks_expr} ELSE 0 END"
+    )
+    sql = sql_template.replace(_COST_TICKS_SUM_TOKEN, f"SUM({clamped})")
+    try:
+        return conn.execute(sql, args).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "integer overflow" not in str(exc).casefold():
+            raise
+    conn.create_aggregate(_EXACT_COST_TICKS_SUM_FUNCTION, 1, _ExactIntSum)
+    exact_sql = sql_template.replace(
+        _COST_TICKS_SUM_TOKEN,
+        f"{_EXACT_COST_TICKS_SUM_FUNCTION}({clamped})",
+    )
+    return conn.execute(exact_sql, args).fetchall()
+
+
 def _accumulate_filtered_costs(
     conn,
     since_ts: float,
@@ -2926,16 +2985,18 @@ def _accumulate_filtered_costs(
         )
         # Settlement rows already contain their immutable actual/estimated result;
         # aggregate the ledger in SQLite instead of materializing every attempt.
-        rows = conn.execute(
+        rows = _cost_aggregate_rows(
+            conn,
             f"""SELECT a.cost_source, COUNT(*) AS row_count,
-                       SUM(CASE WHEN a.cost_ticks>0 THEN a.cost_ticks ELSE 0 END) AS cost_ticks
+                       {_COST_TICKS_SUM_TOKEN} AS cost_ticks
                   FROM upstream_attempt_usage a
                   JOIN request_log ON request_log.request_id=a.root_request_id
                  WHERE ({attempt_where}) AND request_log.created_at >= ?
                  {_attempt_family_where(conn, family)}
                  GROUP BY a.cost_source""",
             where_args + (since_ts, *_family_params(family)),
-        ).fetchall()
+            cost_ticks_expr="a.cost_ticks",
+        )
         for row in rows:
             count = int(row["row_count"] or 0)
             source = str(row["cost_source"] or "unpriced")
@@ -3083,16 +3144,18 @@ def _accumulate_grouped_costs(
     channel_attempts = where.strip() == "final_channel_key=?"
     if _attempt_rows_exist(conn):
         attempt_where = "a.channel_key=?" if channel_attempts else where
-        rows = conn.execute(
+        rows = _cost_aggregate_rows(
+            conn,
             f"""SELECT {attempt_group_expr} AS grp_key, a.cost_source,
                        COUNT(*) AS row_count,
-                       SUM(CASE WHEN a.cost_ticks>0 THEN a.cost_ticks ELSE 0 END) AS cost_ticks
+                       {_COST_TICKS_SUM_TOKEN} AS cost_ticks
                   FROM upstream_attempt_usage a
                   JOIN request_log ON request_log.request_id=a.root_request_id
                  WHERE ({attempt_where}) AND request_log.created_at >= ?
                  GROUP BY grp_key, a.cost_source""",
             where_args + (since_ts,),
-        ).fetchall()
+            cost_ticks_expr="a.cost_ticks",
+        )
         for row in rows:
             key = row["grp_key"] or "?"
             bucket = buckets.setdefault(key, _new_token_stats_agg())
@@ -3363,14 +3426,16 @@ def _batch_attempt_costs(
     placeholders = ",".join("?" for _ in request_ids)
     costs: dict[str, dict] = {}
     if _attempt_table_ready(conn):
-        rows = conn.execute(
+        rows = _cost_aggregate_rows(
+            conn,
             f"""SELECT root_request_id, cost_source, COUNT(*) AS row_count,
-                       SUM(CASE WHEN cost_ticks>0 THEN cost_ticks ELSE 0 END) AS cost_ticks
+                       {_COST_TICKS_SUM_TOKEN} AS cost_ticks
                   FROM upstream_attempt_usage
                  WHERE root_request_id IN ({placeholders})
                  GROUP BY root_request_id, cost_source""",
             request_ids,
-        ).fetchall()
+            cost_ticks_expr="cost_ticks",
+        )
         for row in rows:
             request_id = str(row["root_request_id"] or "")
             bucket = costs.setdefault(request_id, _new_cost_agg())
@@ -5539,10 +5604,12 @@ def log_detail(request_id: str) -> dict:
     effective_billing = [_effective_attempt_row(row) for row in billing_rows]
     rendered_log = _sanitize_request_timing(log_row) if log_row else None
     rendered_detail = dict(detail_row) if detail_row else None
-    if rendered_log is not None and rendered_detail is not None:
-        # Preserve the historical response contract without selecting the large
-        # body twice: both views share the object materialized by the detail row.
-        rendered_log["response_body"] = rendered_detail["response_body"]
+    if rendered_log is not None:
+        # Preserve the historical LEFT JOIN response contract without selecting
+        # the large body twice: when present, both views share one materialization.
+        rendered_log["response_body"] = (
+            rendered_detail["response_body"] if rendered_detail is not None else None
+        )
     return {
         "log": rendered_log,
         "detail": rendered_detail,
@@ -5638,21 +5705,23 @@ def _accumulate_usage_costs(
 
     if _attempt_rows_exist(conn):
         attempt_protocol_expr = _attempt_protocol_expr(conn)
-        attempt_rows = conn.execute(
+        attempt_rows = _cost_aggregate_rows(
+            conn,
             f"""SELECT
                        COALESCE(a.channel_key, request_log.final_channel_key, '?') AS channel_key,
                        COALESCE(request_log.requested_model, '?') AS model_key,
                        COALESCE(request_log.api_key_name, '?') AS apikey_key,
                        {attempt_protocol_expr} AS family_protocol,
                        a.service_tier, a.cost_source, COUNT(*) AS row_count,
-                       SUM(CASE WHEN a.cost_ticks>0 THEN a.cost_ticks ELSE 0 END) AS cost_ticks
+                       {_COST_TICKS_SUM_TOKEN} AS cost_ticks
                   FROM upstream_attempt_usage a
                   JOIN request_log ON request_log.request_id=a.root_request_id
                  WHERE request_log.created_at >= ?{_attempt_family_where(conn, family)}
                  GROUP BY channel_key, model_key, apikey_key, family_protocol,
                           a.service_tier, a.cost_source""",
             (since_ts, *_family_params(family)),
-        ).fetchall()
+            cost_ticks_expr="a.cost_ticks",
+        )
         for row in attempt_rows:
             count = int(row["row_count"] or 0)
             source = str(row["cost_source"] or "unpriced")
@@ -6578,14 +6647,10 @@ def record_upstream_dispatch(
 
     request = _request_handle(request_id)
     retry = (
-        _row_handle(attempt_id, table="retry_chain")
+        _row_handle(attempt_id, table="retry_chain", request=request)
         if attempt_id is not None else None
     )
-    different_db = bool(
-        retry is not None
-        and isinstance(attempt_id, RowLogHandle)
-        and retry.db != request.db
-    )
+    different_db = bool(retry is not None and retry.db != request.db)
 
     payload: dict[str, Any] | None = None
     if dispatch_metadata is not None:

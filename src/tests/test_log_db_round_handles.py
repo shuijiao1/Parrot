@@ -127,6 +127,48 @@ def test_request_retry_and_round_handles_survive_month_rollover_and_id_collision
     assert _row(feb.db.path, "proxy_chain", 1)["round_id"] == "round-feb"
 
 
+def test_legacy_int_dispatch_binds_to_request_month_despite_current_id_collision(
+    isolated_log_db, monkeypatch,
+):
+    old_ts = datetime(2000, 1, 15, tzinfo=_BJT).timestamp()
+    current_ts = datetime.now(_BJT).timestamp()
+    old_request = _insert("legacy-old-request", old_ts)
+    current_request = _insert("legacy-current-request", current_ts)
+    old_retry = log_db.record_retry_attempt(
+        old_request, 1, "api:old", "api", "old-model", old_ts,
+        upstream_protocol="openai-chat",
+    )
+    current_retry = log_db.record_retry_attempt(
+        current_request, 1, "api:current", "api", "current-model", current_ts,
+        upstream_protocol="openai-chat",
+    )
+    assert old_retry.row_id == current_retry.row_id == 1
+    assert old_retry.db != current_retry.db
+
+    routed_handles: list[log_db.RowLogHandle] = []
+    original_mark = log_db._mark_retry_attempt_dispatch_locked
+
+    def track_route(conn, handle, request_body, metadata, dispatched_at):
+        routed_handles.append(handle)
+        return original_mark(
+            conn, handle, request_body, metadata, dispatched_at,
+        )
+
+    monkeypatch.setattr(log_db, "_mark_retry_attempt_dispatch_locked", track_route)
+    log_db.record_upstream_dispatch(
+        old_request,
+        int(old_retry),
+        {"model": "old-wire-model"},
+        dispatched_at=old_ts + 1,
+    )
+
+    assert len(routed_handles) == 1
+    assert routed_handles[0].db == old_request.db
+    assert routed_handles[0].request_id == old_request.request_id
+    assert _row(old_request.db.path, "retry_chain", 1)["dispatched_at"] == old_ts + 1
+    assert _row(current_request.db.path, "retry_chain", 1)["dispatched_at"] is None
+
+
 def test_intermediate_local_tool_success_rebinds_followup_round_to_original_month(
     isolated_log_db,
 ):
