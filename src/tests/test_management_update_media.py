@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -375,6 +376,141 @@ def test_reaudit4_failed_cancel_that_clears_stage_retires_plan_before_direct_res
         assert stale.status_code == 409, stale.text
         assert stale.json()["error"]["code"] == "STATE_CONFLICT"
         assert fixture.update_gateway.activate_calls == 0
+
+
+@pytest.mark.parametrize("cancel_surface", ["direct", "api"])
+def test_failed_cancel_serializes_direct_restage_before_post_state_read(tmp_path, cancel_surface):
+    app, runtime, fixture = build_auxiliary_app(tmp_path)
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        staged = client.post(
+            BASE + "/updates/0.32.0/actions/stage",
+            headers={**headers, "Idempotency-Key": f"stage-before-racing-{cancel_surface}-cancel"},
+        )
+        assert staged.status_code == 202, staged.text
+        old_token = staged.json()["data"]["activationPlanToken"]
+        terminal = _poll(client, headers, staged.json()["data"]["id"])
+        assert terminal["status"] == "succeeded"
+        old_revision = terminal["result"]["expectedRevision"]
+        control = fixture.controls.updates
+        old_digest = control._active_plan_digest
+        assert old_digest is not None
+
+        direct_session = runtime.sessions.issue_for_principal(
+            subject_id="telegram:update-admin",
+            auth_method=AuthMethod.TELEGRAM_APPROVAL,
+            roles=(),
+            capabilities=(Capability.READ, Capability.UPDATE),
+        )
+        direct_context = ManagementContext(
+            request_id=f"racing-{cancel_surface}-cancel",
+            actor=direct_session.principal,
+        )
+        cancel_detail = "source rollback failed after state reset"
+
+        def failed_cancel_after_reset():
+            fixture.update_gateway.cancel_calls += 1
+            fixture.update_gateway.update_state = {"stage": "idle", "mode": "docker"}
+            return False, cancel_detail
+
+        fixture.update_gateway.cancel = failed_cancel_after_reset
+        original_retire_after_cancel = control._retire_plan_after_cancel
+        helper_waiting = threading.Event()
+        allow_post_state_read = threading.Event()
+        stage_attempted = threading.Event()
+        stage_done = threading.Event()
+        results = {}
+
+        def pause_after_cancel_return(digest, *, ok):
+            # Both cancel wrappers call this only after their real gateway cancel
+            # invocation has returned.  Keep the helper's real state read gated.
+            assert ok is False
+            helper_waiting.set()
+            assert allow_post_state_read.wait(timeout=5), "post-state read was never released"
+            original_retire_after_cancel(digest, ok=ok)
+
+        control._retire_plan_after_cancel = pause_after_cancel_return
+
+        def run_cancel():
+            try:
+                if cancel_surface == "direct":
+                    results["cancel"] = control.cancel_direct(direct_context)
+                else:
+                    results["cancel"] = client.delete(
+                        BASE + "/updates/staged",
+                        headers={**headers, "If-Match": old_revision},
+                    )
+            except BaseException as exc:  # surfaced in the main test thread below
+                results["cancel_error"] = exc
+
+        def run_direct_restage():
+            stage_attempted.set()
+            try:
+                results["restage"] = control.stage_direct(
+                    direct_context,
+                    "0.32.0",
+                    progress=lambda _stage, _message: None,
+                    chat_id=123,
+                    notify_msg_id=456,
+                )
+            except BaseException as exc:  # surfaced in the main test thread below
+                results["restage_error"] = exc
+            finally:
+                stage_done.set()
+
+        cancel_thread = threading.Thread(target=run_cancel, name=f"{cancel_surface}-cancel")
+        stage_thread = threading.Thread(target=run_direct_restage, name="direct-restage")
+        stage_thread_started = False
+        try:
+            cancel_thread.start()
+            assert helper_waiting.wait(timeout=5), "cancel did not reach its post-state helper"
+            assert fixture.update_gateway.cancel_calls == 1
+            assert fixture.update_gateway.update_state["stage"] == "idle"
+
+            stage_thread.start()
+            stage_thread_started = True
+            assert stage_attempted.wait(timeout=5), "direct restage thread did not start"
+            stage_completed_before_post_read = stage_done.wait(timeout=1)
+        finally:
+            allow_post_state_read.set()
+            cancel_thread.join(timeout=5)
+            if stage_thread_started:
+                stage_thread.join(timeout=5)
+            control._retire_plan_after_cancel = original_retire_after_cancel
+
+        assert not cancel_thread.is_alive()
+        assert not stage_thread.is_alive()
+        assert "cancel_error" not in results
+        assert "restage_error" not in results
+        if cancel_surface == "direct":
+            assert results["cancel"] == (False, cancel_detail)
+        else:
+            cancelled = results["cancel"]
+            assert cancelled.status_code == 503, cancelled.text
+            assert cancelled.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+            assert cancelled.json()["error"]["message"] == "A required dependency is unavailable"
+            assert cancelled.json()["error"]["retryable"] is True
+            assert cancel_detail not in cancelled.text
+        assert results["restage"] == (True, "ready")
+        assert fixture.update_gateway.stage_calls == ["0.32.0", "0.32.0"]
+
+        new_revision = control.state(direct_context).revision
+        assert new_revision == old_revision
+        stale = client.post(
+            BASE + "/updates/staged/actions/restart",
+            json={"planToken": old_token},
+            headers={
+                **headers,
+                "Idempotency-Key": f"activate-after-racing-{cancel_surface}-cancel",
+                "If-Match": new_revision,
+            },
+        )
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["error"]["code"] == "STATE_CONFLICT"
+        assert fixture.update_gateway.activate_calls == 0
+        assert control._plans[old_digest].consumed is True
+        assert control._active_plan_digest is None
+        assert stage_completed_before_post_read is False
 
 
 def test_reaudit4_failed_cancel_while_still_staged_keeps_plan_retryable(tmp_path):

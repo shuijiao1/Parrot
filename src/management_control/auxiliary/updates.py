@@ -535,11 +535,12 @@ class UpdateControl:
         notify_msg_id: int,
     ) -> tuple[bool, str]:
         require(context, Capability.UPDATE)
-        self._updates.set_progress(progress)
-        try:
-            return self._updates.stage(version, chat_id=chat_id, notify_msg_id=notify_msg_id)
-        finally:
-            self._updates.set_progress(None)
+        with self._lock:
+            self._updates.set_progress(progress)
+            try:
+                return self._updates.stage(version, chat_id=chat_id, notify_msg_id=notify_msg_id)
+            finally:
+                self._updates.set_progress(None)
 
     def activate_direct(
         self,
