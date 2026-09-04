@@ -32,6 +32,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from .. import network
+from ._jwt_payload import decode_jwt_payload as _decode_jwt_payload
 
 
 # ─── OAuth 常量（Codex CLI 授权协议）──────────────────────────────
@@ -1019,29 +1020,9 @@ def decode_id_token(id_token: str, *, verify_exp: bool = False,
     仅在 verify_exp=True 时校验 exp（允许 120s 时钟偏差）。默认不校验——
     OAuth 流程里我们立即使用它抽取 email 等字段，对 exp 不敏感。
     """
-    if not id_token or id_token.count(".") < 2:
-        raise IDTokenError(f"invalid JWT: got {id_token!r}")
-    parts = id_token.split(".")
-    if len(parts) != 3:
-        raise IDTokenError(f"invalid JWT: expected 3 parts, got {len(parts)}")
-    payload_b64 = parts[1]
-    # 补 padding
-    padding = (-len(payload_b64)) % 4
-    if padding:
-        payload_b64 += "=" * padding
-    try:
-        raw = base64.urlsafe_b64decode(payload_b64)
-    except Exception as exc:
-        raise IDTokenError(f"decode base64: {exc}") from exc
-    try:
-        claims = json.loads(raw.decode("utf-8"))
-    except Exception as exc:
-        raise IDTokenError(f"parse JSON: {exc}") from exc
-    if verify_exp:
-        exp = claims.get("exp")
-        if isinstance(exp, int) and exp > 0 and time.time() > exp + skew_seconds:
-            raise IDTokenError(f"id_token expired (exp={exp})")
-    return claims
+    return _decode_jwt_payload(
+        id_token, verify_exp, skew_seconds, IDTokenError, base64, json, time,
+    )
 
 
 def extract_user_info(id_token_claims: dict) -> dict:
