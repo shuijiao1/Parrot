@@ -86,7 +86,7 @@ def _is_secret_key(key: str) -> bool:
 def sanitize_public_network(
     value: Any, *, public_identifier_keys: frozenset[str] = frozenset(),
 ) -> Any:
-    """Recursively sanitize a public network value without changing its shape."""
+    """Sanitize recursively; identifier exceptions apply only to this level."""
     if isinstance(value, Mapping):
         clean: dict[str, Any] = {}
         for raw_key, item in value.items():
@@ -94,20 +94,12 @@ def sanitize_public_network(
             if key not in public_identifier_keys and _is_secret_key(key):
                 clean[key] = "<redacted>"
             else:
-                clean[key] = sanitize_public_network(
-                    item, public_identifier_keys=public_identifier_keys,
-                )
+                clean[key] = sanitize_public_network(item)
         return clean
     if isinstance(value, list):
-        return [
-            sanitize_public_network(item, public_identifier_keys=public_identifier_keys)
-            for item in value
-        ]
+        return [sanitize_public_network(item) for item in value]
     if isinstance(value, tuple):
-        return tuple(
-            sanitize_public_network(item, public_identifier_keys=public_identifier_keys)
-            for item in value
-        )
+        return tuple(sanitize_public_network(item) for item in value)
     if isinstance(value, str):
         return sanitize_public_network_text(value)
     return copy.deepcopy(value)

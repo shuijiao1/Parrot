@@ -392,10 +392,11 @@ def test_monitor_operation_preserves_identifiers_and_sanitizes_nested_values(tmp
     monkeypatch.setattr(fixture.gateway, "run_monitor", monitor_result)
     with TestClient(app) as client:
         headers = bearer(create_session(client))
-        result = operation(
+        completed = operation(
             client, headers,
             client.post(PREFIX + "/network/monitor/actions/run", headers=headers),
-        )["result"]["checks"][0]
+        )
+        result = completed["result"]["checks"][0]
 
     assert result["key"] == "dns-route-key"
     assert result["category"] == "dns"
@@ -404,8 +405,8 @@ def test_monitor_operation_preserves_identifiers_and_sanitizes_nested_values(tmp
     assert result["keyCount"] == 2
     assert result["label"] == "Bearer routing-mode"
     assert result["detail"] == "Basic request-routing"
-    assert result["nested"]["key"] == "nested-public-key"
-    assert result["nested"]["channelKey"] == "nested-channel-key"
+    assert result["nested"]["key"] == "[REDACTED]"
+    assert result["nested"]["channelKey"] == "<redacted>"
     assert result["nested"]["values"] == [
         "Bearer ordinary.word", ["Basic routing mode"],
     ]
@@ -415,9 +416,11 @@ def test_monitor_operation_preserves_identifiers_and_sanitizes_nested_values(tmp
     encoded = json.dumps(result)
     for marker in (
         "monitor-token-marker", "monitor-cookie-marker", "monitor-user-marker",
-        "monitor-password-marker", "abcdefghijklmno-p",
+        "monitor-password-marker", "abcdefghijklmno-p", "nested-public-key",
+        "nested-channel-key",
     ):
         assert marker not in encoded
+        assert marker not in repr(completed)
 
 
 def test_secret_only_concurrent_change_invalidates_plan_without_changing_public_revision(tmp_path):

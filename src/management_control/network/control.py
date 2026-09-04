@@ -52,18 +52,33 @@ from .security import (
 _MONITOR_CATEGORIES = frozenset({"dns", "socks5", "channel", "core"})
 
 
-def _mark_monitor_operation_identifiers(value: Any) -> Any:
+def _mark_monitor_operation_identifiers(
+    value: Any, *, top_level: bool = True,
+) -> Any:
+    """Expose the check key only; protect every descendant generic key."""
     if isinstance(value, Mapping):
-        return {
-            str(key): PublicIdentifier(str(item or ""))
-            if str(key) == "key"
-            else _mark_monitor_operation_identifiers(item)
-            for key, item in value.items()
-        }
+        marked: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            if top_level and key == "key":
+                marked[key] = PublicIdentifier(str(item or ""))
+            elif key == "key":
+                marked[key] = "[REDACTED]"
+            else:
+                marked[key] = _mark_monitor_operation_identifiers(
+                    item, top_level=False,
+                )
+        return marked
     if isinstance(value, list):
-        return [_mark_monitor_operation_identifiers(item) for item in value]
+        return [
+            _mark_monitor_operation_identifiers(item, top_level=False)
+            for item in value
+        ]
     if isinstance(value, tuple):
-        return tuple(_mark_monitor_operation_identifiers(item) for item in value)
+        return tuple(
+            _mark_monitor_operation_identifiers(item, top_level=False)
+            for item in value
+        )
     return value
 
 
