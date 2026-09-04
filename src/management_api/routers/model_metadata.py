@@ -216,14 +216,14 @@ def list_model_metadata(
 
 
 @router.get(
-    "/model-metadata/{model_id}",
+    "/model-metadata/{modelId}",
     operation_id="getModelMetadata",
     tags=["management-model-metadata"],
     response_model=ModelMetadataEnvelope,
     responses={**_success(200, _METADATA_EXAMPLE), **management_error_responses(*_RESOURCE_ERRORS)},
 )
 def get_model_metadata(
-    model_id: Annotated[str, Path(max_length=500)],
+    model_id: Annotated[str, Path(alias="modelId", max_length=500)],
     request: Request,
     context: ReadContext,
     control: Annotated[MappingControl, Depends(get_metadata_control)],
@@ -237,14 +237,14 @@ def get_model_metadata(
 
 
 @router.put(
-    "/model-metadata/{model_id}/binding",
+    "/model-metadata/{modelId}/binding",
     operation_id="putModelMetadataBinding",
     tags=["management-model-metadata"],
     response_model=ModelMetadataEnvelope,
     responses={**_success(200, _METADATA_EXAMPLE), **management_error_responses(*_MUTATION_ERRORS)},
 )
 def put_model_metadata_binding(
-    model_id: Annotated[str, Path(max_length=500)],
+    model_id: Annotated[str, Path(alias="modelId", max_length=500)],
     body: PutMetadataBindingRequest,
     request: Request,
     context: WriteContext,
@@ -266,14 +266,14 @@ def put_model_metadata_binding(
 
 
 @router.delete(
-    "/model-metadata/{model_id}/binding",
+    "/model-metadata/{modelId}/binding",
     operation_id="deleteModelMetadataBinding",
     tags=["management-model-metadata"],
     status_code=204,
     responses={204: {"description": "Binding deleted"}, **management_error_responses(*_MUTATION_ERRORS)},
 )
 def delete_model_metadata_binding(
-    model_id: Annotated[str, Path(max_length=500)],
+    model_id: Annotated[str, Path(alias="modelId", max_length=500)],
     request: Request,
     context: DestroyContext,
     control: Annotated[MappingControl, Depends(get_metadata_control)],

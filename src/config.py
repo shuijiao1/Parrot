@@ -911,7 +911,8 @@ def _load_from_disk() -> dict:
     changed = merged != raw
     if changed:
         print("[config] backfilled missing config defaults")
-    if _normalize_management_config(merged, raw):
+    management_changed = _normalize_management_config(merged, raw)
+    if management_changed:
         changed = True
         print("[config] generated missing management credential")
     if _normalize_api_keys(merged):
@@ -927,7 +928,29 @@ def _load_from_disk() -> dict:
         changed = True
         print("[config] backfilled default-on Codex device installation identities")
     if changed:
-        _write_atomic(merged)
+        if not management_changed:
+            _write_atomic(merged)
+            return merged
+
+        # Keep pre-management migrations on their original failure boundary,
+        # then isolate only persistence of the newly generated credential.  A
+        # key that was never durably written must not become a usable,
+        # process-local management credential.
+        inference_config = copy.deepcopy(merged)
+        if "management" in raw:
+            inference_config["management"] = copy.deepcopy(raw["management"])
+        else:
+            inference_config.pop("management", None)
+        if inference_config != raw:
+            _write_atomic(inference_config)
+        try:
+            _write_atomic(merged)
+        except OSError as exc:
+            print(
+                "[config] management credential persistence failed; "
+                f"management disabled ({type(exc).__name__})"
+            )
+            return inference_config
     return merged
 
 

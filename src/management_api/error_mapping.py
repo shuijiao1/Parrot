@@ -17,6 +17,13 @@ from .dependencies import management_request_id
 from .schemas import ErrorEnvelope
 
 
+_MANAGEMENT_PREFIX = "/api/management/v1"
+
+
+def is_management_path(path: str) -> bool:
+    return path == _MANAGEMENT_PREFIX or path.startswith(f"{_MANAGEMENT_PREFIX}/")
+
+
 MANAGEMENT_ERROR_STATUS: Mapping[ManagementErrorCode, int] = MappingProxyType({
     ManagementErrorCode.INVALID_REQUEST: 400,
     ManagementErrorCode.CONFIRMATION_REQUIRED: 400,
@@ -135,7 +142,7 @@ def _field_path(location: tuple | list) -> str:
 
 
 async def _validation_error_handler(request: Request, exc: RequestValidationError):
-    if not request.url.path.startswith("/api/management/v1"):
+    if not is_management_path(request.url.path):
         return await request_validation_exception_handler(request, exc)
     fields = tuple(
         ErrorField(

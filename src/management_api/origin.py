@@ -9,10 +9,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from src.management_control import ManagementError, ManagementErrorCode
 
-from .error_mapping import error_response
-
-
-_PREFIX = "/api/management/v1"
+from .error_mapping import error_response, is_management_path
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _ALLOWED_METHODS = {"GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"}
 _ALLOWED_HEADERS = {
@@ -48,7 +45,7 @@ class ManagementOriginMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or not str(scope.get("path") or "").startswith(_PREFIX):
+        if scope["type"] != "http" or not is_management_path(str(scope.get("path") or "")):
             await self.app(scope, receive, send)
             return
         request_id = _request_id(scope)

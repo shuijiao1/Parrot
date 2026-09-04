@@ -186,12 +186,12 @@ def create_proxies(
 
 
 @router.get(
-    "/proxies/{proxy_id}", operation_id="getProxy", tags=["management-proxy"],
+    "/proxies/{proxyId}", operation_id="getProxy", tags=["management-proxy"],
     response_model=ProxyEnvelope,
     responses={**_success(200, _PROXY_EXAMPLE), **management_error_responses(*_RESOURCE_ERRORS)},
 )
 def get_proxy(
-    proxy_id: Annotated[str, Path(max_length=100)], request: Request,
+    proxy_id: Annotated[str, Path(alias="proxyId", max_length=100)], request: Request,
     context: ReadContext, control: Annotated[ProxyControl, Depends(get_proxy_control)],
 ) -> ProxyEnvelope:
     reject_unknown_query_parameters(request)
@@ -199,12 +199,12 @@ def get_proxy(
 
 
 @router.patch(
-    "/proxies/{proxy_id}", operation_id="updateProxy", tags=["management-proxy"],
+    "/proxies/{proxyId}", operation_id="updateProxy", tags=["management-proxy"],
     response_model=ProxyEnvelope,
     responses={**_success(200, _PROXY_EXAMPLE), **management_error_responses(*_MUTATION_ERRORS)},
 )
 def update_proxy(
-    proxy_id: Annotated[str, Path(max_length=100)], body: UpdateProxyRequest,
+    proxy_id: Annotated[str, Path(alias="proxyId", max_length=100)], body: UpdateProxyRequest,
     request: Request, context: WriteContext,
     control: Annotated[ProxyControl, Depends(get_proxy_control)], if_match: IfMatch = None,
 ) -> ProxyEnvelope:
@@ -218,12 +218,12 @@ def update_proxy(
 
 
 @router.delete(
-    "/proxies/{proxy_id}", operation_id="deleteProxy", tags=["management-proxy"],
+    "/proxies/{proxyId}", operation_id="deleteProxy", tags=["management-proxy"],
     status_code=204,
     responses={204: {"description": "Unreferenced proxy deleted"}, **management_error_responses(*_MUTATION_ERRORS)},
 )
 def delete_proxy(
-    proxy_id: Annotated[str, Path(max_length=100)], request: Request,
+    proxy_id: Annotated[str, Path(alias="proxyId", max_length=100)], request: Request,
     context: DestroyContext,
     control: Annotated[ProxyControl, Depends(get_proxy_control)], if_match: IfMatch = None,
 ) -> Response:
@@ -233,12 +233,12 @@ def delete_proxy(
 
 
 @router.post(
-    "/proxies/{proxy_id}/actions/test", operation_id="testProxy", tags=["management-proxy"],
+    "/proxies/{proxyId}/actions/test", operation_id="testProxy", tags=["management-proxy"],
     status_code=202, response_model=ProxyOperationEnvelope,
     responses={**_success(202, _OPERATION_EXAMPLE), **management_error_responses(*_PROBE_ERRORS)},
 )
 def test_proxy(
-    proxy_id: Annotated[str, Path(max_length=100)], request: Request,
+    proxy_id: Annotated[str, Path(alias="proxyId", max_length=100)], request: Request,
     context: WriteContext, control: Annotated[ProxyControl, Depends(get_proxy_control)],
 ) -> ProxyOperationEnvelope:
     reject_unknown_query_parameters(request)
@@ -286,12 +286,12 @@ def create_proxy_groups(
 
 
 @router.get(
-    "/proxy-groups/{group_id}", operation_id="getProxyGroup", tags=["management-proxy"],
+    "/proxy-groups/{groupId}", operation_id="getProxyGroup", tags=["management-proxy"],
     response_model=ProxyGroupEnvelope,
     responses={**_success(200, _GROUP_EXAMPLE), **management_error_responses(*_RESOURCE_ERRORS)},
 )
 def get_proxy_group(
-    group_id: Annotated[str, Path(max_length=100)], request: Request,
+    group_id: Annotated[str, Path(alias="groupId", max_length=100)], request: Request,
     context: ReadContext, control: Annotated[ProxyControl, Depends(get_proxy_control)],
 ) -> ProxyGroupEnvelope:
     reject_unknown_query_parameters(request)
@@ -301,12 +301,12 @@ def get_proxy_group(
 
 
 @router.patch(
-    "/proxy-groups/{group_id}", operation_id="updateProxyGroup", tags=["management-proxy"],
+    "/proxy-groups/{groupId}", operation_id="updateProxyGroup", tags=["management-proxy"],
     response_model=ProxyGroupEnvelope,
     responses={**_success(200, _GROUP_EXAMPLE), **management_error_responses(*_MUTATION_ERRORS)},
 )
 def update_proxy_group(
-    group_id: Annotated[str, Path(max_length=100)], body: UpdateProxyGroupRequest,
+    group_id: Annotated[str, Path(alias="groupId", max_length=100)], body: UpdateProxyGroupRequest,
     request: Request, context: WriteContext,
     control: Annotated[ProxyControl, Depends(get_proxy_control)], if_match: IfMatch = None,
 ) -> ProxyGroupEnvelope:
@@ -319,12 +319,12 @@ def update_proxy_group(
 
 
 @router.delete(
-    "/proxy-groups/{group_id}", operation_id="deleteProxyGroup", tags=["management-proxy"],
+    "/proxy-groups/{groupId}", operation_id="deleteProxyGroup", tags=["management-proxy"],
     status_code=204,
     responses={204: {"description": "Unreferenced proxy group deleted"}, **management_error_responses(*_MUTATION_ERRORS)},
 )
 def delete_proxy_group(
-    group_id: Annotated[str, Path(max_length=100)], request: Request,
+    group_id: Annotated[str, Path(alias="groupId", max_length=100)], request: Request,
     context: DestroyContext,
     control: Annotated[ProxyControl, Depends(get_proxy_control)], if_match: IfMatch = None,
 ) -> Response:
@@ -334,12 +334,12 @@ def delete_proxy_group(
 
 
 @router.post(
-    "/proxy-groups/{group_id}/actions/test", operation_id="testProxyGroup", tags=["management-proxy"],
+    "/proxy-groups/{groupId}/actions/test", operation_id="testProxyGroup", tags=["management-proxy"],
     status_code=202, response_model=ProxyOperationEnvelope,
     responses={**_success(202, {**_OPERATION_EXAMPLE, "kind": "proxy_group.test"}), **management_error_responses(*_PROBE_ERRORS)},
 )
 def test_proxy_group(
-    group_id: Annotated[str, Path(max_length=100)], request: Request,
+    group_id: Annotated[str, Path(alias="groupId", max_length=100)], request: Request,
     context: WriteContext, control: Annotated[ProxyControl, Depends(get_proxy_control)],
 ) -> ProxyOperationEnvelope:
     reject_unknown_query_parameters(request)

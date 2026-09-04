@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Header, Path, Query, Request, Response, status
@@ -76,6 +77,9 @@ from ..schemas.channels import (
     ProviderUsageSnapshotData,
 )
 from ._operations import operation_data as _operation_data
+
+
+_BIND_LOCK = RLock()
 
 
 _LIST_QUERY_PARAMETERS = frozenset({
@@ -228,14 +232,19 @@ def get_channel_control(
     # created here are replaced whenever the app's runtime owner changes.
     if isinstance(current, ChannelControl) and (owner is None or owner is runtime):
         return current
-    current = ChannelControl(
-        operation_registry=runtime.operation_registry,
-        operation_store=runtime.operations,
-        audit_sink=runtime.audit_sink,
-    )
-    request.app.state.management_channel_control = current
-    request.app.state.management_channel_control_runtime = runtime
-    return current
+    with _BIND_LOCK:
+        current = getattr(request.app.state, "management_channel_control", None)
+        owner = getattr(request.app.state, "management_channel_control_runtime", None)
+        if isinstance(current, ChannelControl) and (owner is None or owner is runtime):
+            return current
+        current = ChannelControl(
+            operation_registry=runtime.operation_registry,
+            operation_store=runtime.operations,
+            audit_sink=runtime.audit_sink,
+        )
+        request.app.state.management_channel_control = current
+        request.app.state.management_channel_control_runtime = runtime
+        return current
 
 
 def _feature_data(feature, revision: str) -> CompatibilityFeatureData:

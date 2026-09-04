@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from threading import RLock
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Header, Path, Query, Request, Response, status
@@ -58,6 +59,7 @@ from ..schemas.apikey import (
 
 
 router = APIRouter(tags=["api-keys"])
+_BIND_LOCK = RLock()
 
 _API_KEY_LIST_QUERY_PARAMETERS = frozenset(
     {"page", "pageSize", "enabled", "source", "name", "sort"}
@@ -144,10 +146,15 @@ def get_api_key_control(
     # and test seam. Automatically-created controls are replaced with runtime.
     if isinstance(current, ApiKeyControl) and (owner is None or owner is runtime):
         return current
-    current = ApiKeyControl(audit_sink=runtime.audit_sink)
-    request.app.state.management_apikey_control = current
-    request.app.state.management_apikey_control_runtime = runtime
-    return current
+    with _BIND_LOCK:
+        current = getattr(request.app.state, "management_apikey_control", None)
+        owner = getattr(request.app.state, "management_apikey_control_runtime", None)
+        if isinstance(current, ApiKeyControl) and (owner is None or owner is runtime):
+            return current
+        current = ApiKeyControl(audit_sink=runtime.audit_sink)
+        request.app.state.management_apikey_control = current
+        request.app.state.management_apikey_control_runtime = runtime
+        return current
 
 
 def _usage(value: ApiKeyUsage) -> ApiKeyUsageData:

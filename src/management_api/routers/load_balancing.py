@@ -178,14 +178,14 @@ def replace_channel_order(
 
 
 @router.get(
-    "/load-balancing/model-orders/{model_id}",
+    "/load-balancing/model-orders/{modelId}",
     operation_id="getModelChannelOrder",
     tags=["management-load-balancing"],
     response_model=OrderEnvelope,
     responses={**_success(200, _MODEL_ORDER_EXAMPLE), **management_error_responses(*_RESOURCE_ERRORS)},
 )
 def get_model_channel_order(
-    model_id: Annotated[str, Path(max_length=500)],
+    model_id: Annotated[str, Path(alias="modelId", max_length=500)],
     request: Request,
     context: ReadContext,
     control: Annotated[LoadBalancingControl, Depends(get_load_balancing_control)],
@@ -197,14 +197,14 @@ def get_model_channel_order(
 
 
 @router.put(
-    "/load-balancing/model-orders/{model_id}",
+    "/load-balancing/model-orders/{modelId}",
     operation_id="replaceModelChannelOrder",
     tags=["management-load-balancing"],
     response_model=OrderEnvelope,
     responses={**_success(200, _MODEL_ORDER_EXAMPLE), **management_error_responses(*_REORDER_ERRORS)},
 )
 def replace_model_channel_order(
-    model_id: Annotated[str, Path(max_length=500)],
+    model_id: Annotated[str, Path(alias="modelId", max_length=500)],
     body: ReplaceOrderRequest,
     request: Request,
     context: WriteContext,
@@ -219,14 +219,14 @@ def replace_model_channel_order(
 
 
 @router.delete(
-    "/load-balancing/model-orders/{model_id}",
+    "/load-balancing/model-orders/{modelId}",
     operation_id="deleteModelChannelOrder",
     tags=["management-load-balancing"],
     status_code=204,
     responses={204: {"description": "Model order deleted"}, **management_error_responses(*_REORDER_ERRORS)},
 )
 def delete_model_channel_order(
-    model_id: Annotated[str, Path(max_length=500)],
+    model_id: Annotated[str, Path(alias="modelId", max_length=500)],
     request: Request,
     context: DestroyContext,
     control: Annotated[LoadBalancingControl, Depends(get_load_balancing_control)],

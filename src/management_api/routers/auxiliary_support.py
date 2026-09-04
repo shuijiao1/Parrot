@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from threading import RLock
 from typing import Annotated, Callable
 
 from fastapi import Depends, Request
@@ -21,6 +22,9 @@ from ..response_helpers import response_meta
 from ._operations import operation_data
 
 
+_BIND_LOCK = RLock()
+
+
 def get_bound_auxiliary_controls(
     request: Request,
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
@@ -32,17 +36,23 @@ def get_bound_auxiliary_controls(
     if isinstance(current, AuxiliaryControls) and (owner is None or owner is runtime):
         current.bind_operations(runtime.operations, runtime.operation_registry)
         return current
-    current = AuxiliaryControls(
-        translation=TranslationControl(audit_sink=runtime.audit_sink),
-        status_alerts=StatusAlertControl(audit_sink=runtime.audit_sink),
-        updates=UpdateControl(audit_sink=runtime.audit_sink),
-        images=ImageControl(audit_sink=runtime.audit_sink),
-        xai_media=XaiMediaControl(audit_sink=runtime.audit_sink),
-    )
-    current.bind_operations(runtime.operations, runtime.operation_registry)
-    request.app.state.management_auxiliary_controls = current
-    request.app.state.management_auxiliary_controls_runtime = runtime
-    return current
+    with _BIND_LOCK:
+        current = getattr(request.app.state, "management_auxiliary_controls", None)
+        owner = getattr(request.app.state, "management_auxiliary_controls_runtime", None)
+        if isinstance(current, AuxiliaryControls) and (owner is None or owner is runtime):
+            current.bind_operations(runtime.operations, runtime.operation_registry)
+            return current
+        current = AuxiliaryControls(
+            translation=TranslationControl(audit_sink=runtime.audit_sink),
+            status_alerts=StatusAlertControl(audit_sink=runtime.audit_sink),
+            updates=UpdateControl(audit_sink=runtime.audit_sink),
+            images=ImageControl(audit_sink=runtime.audit_sink),
+            xai_media=XaiMediaControl(audit_sink=runtime.audit_sink),
+        )
+        current.bind_operations(runtime.operations, runtime.operation_registry)
+        request.app.state.management_auxiliary_controls = current
+        request.app.state.management_auxiliary_controls_runtime = runtime
+        return current
 
 
 def reject_unknown_query(*allowed: str) -> Callable[[Request], None]:

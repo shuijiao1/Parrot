@@ -300,190 +300,197 @@ async def lifespan(app: FastAPI):
     # Management state is isolated from inference state; failure leaves the
     # mounted management router in explicit SERVICE_NOT_READY mode.
     _initialize_management_runtime(app)
-    await asyncio.to_thread(log_db.cleanup_stale_pending, 1800)
-    # 手工编辑 config 后重启的按天留存策略也应尽快收敛；默认永久保留时只做
-    # 一个轻量判断，不会触碰任何日志数据。
+    management_close_started = False
     try:
-        retention = await asyncio.to_thread(log_db.maybe_cleanup_retention)
-        if retention.get("ok") and not retention.get("skipped"):
-            removed = int(retention.get("deleted_requests") or 0)
-            freed = int(retention.get("actual_free_bytes") or 0)
-            if removed or freed:
-                print(f"[log_db] startup retention cleanup removed {removed} requests, freed {freed} bytes")
-        elif not retention.get("ok"):
-            print(f"[log_db] startup retention cleanup failed: {retention.get('reason') or retention.get('errors')}")
-    except Exception as exc:
-        print(f"[log_db] startup retention cleanup failed: {exc}")
+        await asyncio.to_thread(log_db.cleanup_stale_pending, 1800)
+        # 手工编辑 config 后重启的按天留存策略也应尽快收敛；默认永久保留时只做
+        # 一个轻量判断，不会触碰任何日志数据。
+        try:
+            retention = await asyncio.to_thread(log_db.maybe_cleanup_retention)
+            if retention.get("ok") and not retention.get("skipped"):
+                removed = int(retention.get("deleted_requests") or 0)
+                freed = int(retention.get("actual_free_bytes") or 0)
+                if removed or freed:
+                    print(f"[log_db] startup retention cleanup removed {removed} requests, freed {freed} bytes")
+            elif not retention.get("ok"):
+                print(f"[log_db] startup retention cleanup failed: {retention.get('reason') or retention.get('errors')}")
+        except Exception as exc:
+            print(f"[log_db] startup retention cleanup failed: {exc}")
 
-    # 老数据 provider 字段回填（无 provider 字段的账户默认 claude；幂等）
-    try:
-        migrated = oauth_manager.migrate_provider_field()
-        if migrated:
-            print(f"[oauth] migrated provider='claude' for {migrated} legacy account(s)")
-    except Exception as exc:
-        print(f"[oauth] provider field migration failed: {exc}")
+        # 老数据 provider 字段回填（无 provider 字段的账户默认 claude；幂等）
+        try:
+            migrated = oauth_manager.migrate_provider_field()
+            if migrated:
+                print(f"[oauth] migrated provider='claude' for {migrated} legacy account(s)")
+        except Exception as exc:
+            print(f"[oauth] provider field migration failed: {exc}")
 
-    # 联合主键迁移：email → account_key (=f"{provider}:{email}")。幂等，已迁移过直接跳过。
-    try:
-        _ck_result = oauth_manager.bootstrap_composite_key_migration()
-        if _ck_result.get("skipped"):
-            print(f"[oauth] composite-key migration: skipped ({_ck_result.get('reason')})")
-        else:
+        # 联合主键迁移：email → account_key (=f"{provider}:{email}")。幂等，已迁移过直接跳过。
+        try:
+            _ck_result = oauth_manager.bootstrap_composite_key_migration()
+            if _ck_result.get("skipped"):
+                print(f"[oauth] composite-key migration: skipped ({_ck_result.get('reason')})")
+            else:
+                print(
+                    f"[oauth] composite-key migration: quota_rows={_ck_result['migrated_quota_rows']},"
+                    f" channel_rows={_ck_result['migrated_channel_rows']}"
+                )
+        except Exception as _exc:
+            print(f"[oauth] composite-key migration FAILED: {_exc}")
+            raise
+
+        # OpenAI OAuth workspace identity migration：openai:<email> → openai:<workspace_id>
+        # Only unique email→workspace mappings are migrated; ambiguous same-email
+        # workspaces remain unresolved so old keys cannot silently hit the wrong team.
+        try:
+            _ow_result = oauth_manager.bootstrap_openai_workspace_key_migration()
+            _state = _ow_result.get("state") or {}
+            if _state.get("skipped"):
+                print(f"[oauth] openai workspace-key migration: skipped ({_state.get('reason')})")
+            else:
+                print(
+                    f"[oauth] openai workspace-key migration: mappings={_ow_result.get('mapping_count', 0)},"
+                    f" state_quota={_state.get('quota_rows', 0)},"
+                    f" state_channels={_state.get('channel_rows', 0)},"
+                    f" log_rows={(_ow_result.get('logs') or {}).get('request_log_rows', 0)}"
+                    f"+{(_ow_result.get('logs') or {}).get('retry_chain_rows', 0)},"
+                    f" image_rows={(_ow_result.get('images') or {}).get('call_rows', 0)}"
+                    f"+{(_ow_result.get('images') or {}).get('attempt_rows', 0)}"
+                )
+        except Exception as _exc:
+            print(f"[oauth] openai workspace-key migration FAILED: {_exc}")
+            raise
+
+        # Domain mirrors restore from the authoritative in-memory StateStore
+        affinity.init()
+        affinity.client_init()
+        cooldown.init()
+        scorer.init()
+
+        # OpenAI 家族 factory 注入（必须在 rebuild_from_config 之前，否则带 protocol=openai-*
+        # 的 channel entry 会回落到 ApiChannel 并被 assert 拒绝）
+        from src.openai.channel.registration import register_factories as _openai_register_factories
+        _openai_register_factories()
+
+        # OpenAI previous_response_id Store（independent SQLite）
+        from src.openai import store as openai_store
+        openai_store.init()
+
+        # Cursor OAuth channels reuse the normal HTTP/SSE failover path through a
+        # process-private loopback bridge. It must exist before registry construction.
+        from src.cursor_bridge import runtime as cursor_bridge_runtime
+        cursor_bridge_runtime.ensure_started()
+
+        # 渠道注册表 + priority 统一顺序迁移 + 热加载钩子。
+        registry.rebuild_from_config()
+        _lb_cfg = config.get()
+        if (
+            str(_lb_cfg.get("channelSelection") or "smart").lower() == "priority"
+            and not ((_lb_cfg.get("loadBalancing") or {}).get("channelPriorityOrder") or [])
+        ):
+            migrated_order = load_balancing.initialize_priority_orders()
             print(
-                f"[oauth] composite-key migration: quota_rows={_ck_result['migrated_quota_rows']},"
-                f" channel_rows={_ck_result['migrated_channel_rows']}"
+                f"[load-balancing] migrated legacy family priorities to "
+                f"{len(migrated_order)} unified channel entries"
             )
-    except Exception as _exc:
-        print(f"[oauth] composite-key migration FAILED: {_exc}")
-        raise
+        registry.install_config_reload_hook()
 
-    # OpenAI OAuth workspace identity migration：openai:<email> → openai:<workspace_id>
-    # Only unique email→workspace mappings are migrated; ambiguous same-email
-    # workspaces remain unresolved so old keys cannot silently hit the wrong team.
-    try:
-        _ow_result = oauth_manager.bootstrap_openai_workspace_key_migration()
-        _state = _ow_result.get("state") or {}
-        if _state.get("skipped"):
-            print(f"[oauth] openai workspace-key migration: skipped ({_state.get('reason')})")
-        else:
+        # API Provider 用量在 Telegram 启动前启动唯一 coordinator 并预热一次。
+        # 预热只进入共享队列，不等待网络；禁用语义与 OAuth 主动刷新一致。
+        if provider_usage.is_enabled():
+            await provider_usage.start()
+            _provider_usage_startup = provider_usage.schedule_startup_refresh()
             print(
-                f"[oauth] openai workspace-key migration: mappings={_ow_result.get('mapping_count', 0)},"
-                f" state_quota={_state.get('quota_rows', 0)},"
-                f" state_channels={_state.get('channel_rows', 0)},"
-                f" log_rows={(_ow_result.get('logs') or {}).get('request_log_rows', 0)}"
-                f"+{(_ow_result.get('logs') or {}).get('retry_chain_rows', 0)},"
-                f" image_rows={(_ow_result.get('images') or {}).get('call_rows', 0)}"
-                f"+{(_ow_result.get('images') or {}).get('attempt_rows', 0)}"
+                "[provider_usage] startup refresh: "
+                f"channels={_provider_usage_startup['supported_channels']} "
+                f"accounts={_provider_usage_startup['supported_accounts']} "
+                f"scheduled={_provider_usage_startup['scheduled_accounts']}"
             )
-    except Exception as _exc:
-        print(f"[oauth] openai workspace-key migration FAILED: {_exc}")
-        raise
 
-    # Domain mirrors restore from the authoritative in-memory StateStore
-    affinity.init()
-    affinity.client_init()
-    cooldown.init()
-    scorer.init()
+        # httpx 客户端
+        upstream.create_client()
+        try:
+            model_pricing.initialize()
+            migrated = model_metadata.migrate_legacy_config()
+            if migrated["bindings"] or migrated["compression"]:
+                print(
+                    "[Metadata] migrated legacy config: "
+                    f"bindings={migrated['bindings']} compression={migrated['compression']}"
+                )
+        except Exception as exc:
+            # 金额统计是旁路能力，价格表异常不能阻断代理启动；后台刷新仍会继续尝试恢复。
+            print(f"[Pricing] local catalog load failed: {exc}")
 
-    # OpenAI 家族 factory 注入（必须在 rebuild_from_config 之前，否则带 protocol=openai-*
-    # 的 channel entry 会回落到 ApiChannel 并被 assert 拒绝）
-    from src.openai.channel.registration import register_factories as _openai_register_factories
-    _openai_register_factories()
+        # 后台获取公网 IPv4（用于主菜单显示外网 BaseURL，失败则不显示）
+        public_ip.fetch_async()
 
-    # OpenAI previous_response_id Store（independent SQLite）
-    from src.openai import store as openai_store
-    openai_store.init()
+        cfg = config.get()
+        # Telegram Bot（M6）
+        tg_token = cfg.get("telegram", {}).get("botToken") or ""
+        tg_admins = cfg.get("telegram", {}).get("adminIds") or []
+        if tg_token:
+            tgbot.init(tg_token, tg_admins)
+            tgbot.start()
 
-    # Cursor OAuth channels reuse the normal HTTP/SSE failover path through a
-    # process-private loopback bridge. It must exist before registry construction.
-    from src.cursor_bridge import runtime as cursor_bridge_runtime
-    cursor_bridge_runtime.ensure_started()
+        print(f"Parrot 🦜 v{__version__} (multi-family AI protocol proxy) ready")
+        print(f"  device_id: {DEVICE_ID[:16]}...")
+        print(f"  listen: http://{cfg['listen']['host']}:{cfg['listen']['port']}/v1/messages")
+        print(f"  api_keys: {len(cfg.get('apiKeys', {}))}")
+        print(f"  oauth_accounts: {len(cfg.get('oauthAccounts', []))}")
+        print(f"  api_channels: {len(cfg.get('channels', []))}")
+        print(f"  registry: {registry.channel_count()} channels")
+        print(f"  codex_cli_version: {codex_cli_version()}")
+        print(f"  cch_mode: {cfg.get('cchMode')}")
+        print(f"  oauth_mock: {cfg.get('oauth', {}).get('mockMode', False)}")
+        print(f"  timeouts: {cfg.get('timeouts')}")
+        print(f"  telegram: {'enabled' if tg_token else 'disabled'} ({len(tg_admins)} admin(s))")
 
-    # 渠道注册表 + priority 统一顺序迁移 + 热加载钩子。
-    registry.rebuild_from_config()
-    _lb_cfg = config.get()
-    if (
-        str(_lb_cfg.get("channelSelection") or "smart").lower() == "priority"
-        and not ((_lb_cfg.get("loadBalancing") or {}).get("channelPriorityOrder") or [])
-    ):
-        migrated_order = load_balancing.initialize_priority_orders()
-        print(
-            f"[load-balancing] migrated legacy family priorities to "
-            f"{len(migrated_order)} unified channel entries"
-        )
-    registry.install_config_reload_hook()
+        _background_tasks.append(asyncio.create_task(_wal_checkpoint_loop()))
+        _background_tasks.append(asyncio.create_task(_stale_pending_loop()))
+        _background_tasks.append(asyncio.create_task(_affinity_cleanup_loop()))
+        # ⛔ 双实例重构期：关掉后台主动刷新（每 60s 自动刷将过期 token，最危险）
+        # 和 quota_monitor（周期拉 usage，对共享账号的多余访问）。PARROT_NO_REFRESH=1 时跳过。
+        if os.environ.get("PARROT_NO_REFRESH") != "1":
+            _background_tasks.append(asyncio.create_task(oauth_manager.proactive_refresh_loop()))
+            _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
+            _background_tasks.append(asyncio.create_task(oauth_manager.oauth_model_sync_loop()))
+        _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
+        _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
+        _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
+        _background_tasks.append(asyncio.create_task(update_checker.update_loop()))
+        _background_tasks.append(asyncio.create_task(model_pricing.refresh_loop()))
+        # 自更新：若进程是被自更新重启拉起的，恢复流程做健康检查/回滚
+        try:
+            updater.resume_after_restart()
+        except Exception as _exc:
+            print(f"[updater] resume_after_restart failed: {_exc}")
+        _background_tasks.append(asyncio.create_task(openai_store.cleanup_loop()))
+        _background_tasks.append(asyncio.create_task(translation.cleanup_loop()))
 
-    # API Provider 用量在 Telegram 启动前启动唯一 coordinator 并预热一次。
-    # 预热只进入共享队列，不等待网络；禁用语义与 OAuth 主动刷新一致。
-    if provider_usage.is_enabled():
-        await provider_usage.start()
-        _provider_usage_startup = provider_usage.schedule_startup_refresh()
-        print(
-            "[provider_usage] startup refresh: "
-            f"channels={_provider_usage_startup['supported_channels']} "
-            f"accounts={_provider_usage_startup['supported_accounts']} "
-            f"scheduled={_provider_usage_startup['scheduled_accounts']}"
-        )
-
-    # httpx 客户端
-    upstream.create_client()
-    try:
-        model_pricing.initialize()
-        migrated = model_metadata.migrate_legacy_config()
-        if migrated["bindings"] or migrated["compression"]:
-            print(
-                "[Metadata] migrated legacy config: "
-                f"bindings={migrated['bindings']} compression={migrated['compression']}"
-            )
-    except Exception as exc:
-        # 金额统计是旁路能力，价格表异常不能阻断代理启动；后台刷新仍会继续尝试恢复。
-        print(f"[Pricing] local catalog load failed: {exc}")
-
-    # 后台获取公网 IPv4（用于主菜单显示外网 BaseURL，失败则不显示）
-    public_ip.fetch_async()
-
-    cfg = config.get()
-    # Telegram Bot（M6）
-    tg_token = cfg.get("telegram", {}).get("botToken") or ""
-    tg_admins = cfg.get("telegram", {}).get("adminIds") or []
-    if tg_token:
-        tgbot.init(tg_token, tg_admins)
-        tgbot.start()
-
-    print(f"Parrot 🦜 v{__version__} (multi-family AI protocol proxy) ready")
-    print(f"  device_id: {DEVICE_ID[:16]}...")
-    print(f"  listen: http://{cfg['listen']['host']}:{cfg['listen']['port']}/v1/messages")
-    print(f"  api_keys: {len(cfg.get('apiKeys', {}))}")
-    print(f"  oauth_accounts: {len(cfg.get('oauthAccounts', []))}")
-    print(f"  api_channels: {len(cfg.get('channels', []))}")
-    print(f"  registry: {registry.channel_count()} channels")
-    print(f"  codex_cli_version: {codex_cli_version()}")
-    print(f"  cch_mode: {cfg.get('cchMode')}")
-    print(f"  oauth_mock: {cfg.get('oauth', {}).get('mockMode', False)}")
-    print(f"  timeouts: {cfg.get('timeouts')}")
-    print(f"  telegram: {'enabled' if tg_token else 'disabled'} ({len(tg_admins)} admin(s))")
-
-    _background_tasks.append(asyncio.create_task(_wal_checkpoint_loop()))
-    _background_tasks.append(asyncio.create_task(_stale_pending_loop()))
-    _background_tasks.append(asyncio.create_task(_affinity_cleanup_loop()))
-    # ⛔ 双实例重构期：关掉后台主动刷新（每 60s 自动刷将过期 token，最危险）
-    # 和 quota_monitor（周期拉 usage，对共享账号的多余访问）。PARROT_NO_REFRESH=1 时跳过。
-    if os.environ.get("PARROT_NO_REFRESH") != "1":
-        _background_tasks.append(asyncio.create_task(oauth_manager.proactive_refresh_loop()))
-        _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
-        _background_tasks.append(asyncio.create_task(oauth_manager.oauth_model_sync_loop()))
-    _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
-    _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
-    _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
-    _background_tasks.append(asyncio.create_task(update_checker.update_loop()))
-    _background_tasks.append(asyncio.create_task(model_pricing.refresh_loop()))
-    # 自更新：若进程是被自更新重启拉起的，恢复流程做健康检查/回滚
-    try:
-        updater.resume_after_restart()
-    except Exception as _exc:
-        print(f"[updater] resume_after_restart failed: {_exc}")
-    _background_tasks.append(asyncio.create_task(openai_store.cleanup_loop()))
-    _background_tasks.append(asyncio.create_task(translation.cleanup_loop()))
-
-    try:
-        yield
+        try:
+            yield
+        finally:
+            drain.begin("lifespan_shutdown")
+            timeout = drain.shutdown_timeout_seconds()
+            drained = await drain.wait_for_zero(timeout)
+            if not drained:
+                print(f"[drain] lifespan shutdown timeout active={drain.active_count()} timeout={timeout}s")
+            for t in _background_tasks:
+                t.cancel()
+            await asyncio.gather(*_background_tasks, return_exceptions=True)
+            await apikey_limiter.shutdown_spooling()
+            tgbot.stop()
+            management_close_started = True
+            await _close_management_runtime(app)
+            # Provider workers may mutate state; stop them before the final snapshot.
+            await provider_usage.stop()
+            await upstream.close_client()
+            cursor_bridge_runtime.stop()
+            _finalize_state_store()
     finally:
-        drain.begin("lifespan_shutdown")
-        timeout = drain.shutdown_timeout_seconds()
-        drained = await drain.wait_for_zero(timeout)
-        if not drained:
-            print(f"[drain] lifespan shutdown timeout active={drain.active_count()} timeout={timeout}s")
-        for t in _background_tasks:
-            t.cancel()
-        await asyncio.gather(*_background_tasks, return_exceptions=True)
-        await apikey_limiter.shutdown_spooling()
-        tgbot.stop()
-        await _close_management_runtime(app)
-        # Provider workers may mutate state; stop them before the final snapshot.
-        await provider_usage.stop()
-        await upstream.close_client()
-        cursor_bridge_runtime.stop()
-        _finalize_state_store()
+        if not management_close_started:
+            management_close_started = True
+            await _close_management_runtime(app)
 
 
 app = FastAPI(lifespan=lifespan)
