@@ -9,18 +9,11 @@ import server
 from src.management_api import ManagementRuntime
 
 
-EXPECTED_OPERATIONS = {
-    "createManagementSession",
-    "getCurrentManagementSession",
-    "revokeCurrentManagementSession",
-    "createTelegramApproval",
-    "getTelegramApproval",
-    "getManagementMetadata",
-    "getManagementCapabilities",
-    "getManagementOperation",
-    "getTelegramApproval",
-    "cancelManagementOperation",
-}
+EXPECTED_OPERATIONS = frozenset(
+    (Path(__file__).parent / "fixtures/management_api/production-operation-ids.txt")
+    .read_text(encoding="utf-8")
+    .splitlines()
+)
 
 
 def settings(tmp_path):
@@ -40,16 +33,22 @@ def settings(tmp_path):
     }
 
 
-def test_server_mounts_the_exact_p0_router_and_preserves_lifecycle_order():
+def test_server_mounts_all_domain_routers_and_preserves_lifecycle_order():
     document = server.app.openapi()
-    actual = {
-        operation["operationId"]
+    operations = [
+        (method.upper(), path, operation["operationId"])
         for path, path_item in document["paths"].items()
         if path.startswith("/api/management/v1")
         for method, operation in path_item.items()
         if method in {"get", "post", "delete", "put", "patch"}
-    }
-    assert actual == EXPECTED_OPERATIONS
+    ]
+    operation_ids = [operation_id for _method, _path, operation_id in operations]
+    method_paths = [(method, path) for method, path, _operation_id in operations]
+    assert len(operations) == 203
+    assert len(set(operation_ids)) == 203
+    assert len(set(method_paths)) == 203
+    assert len({path for _method, path in method_paths}) == 147
+    assert set(operation_ids) == EXPECTED_OPERATIONS
 
     source = Path("server.py").read_text()
     assert source.index("state_db.init()") < source.index("network.init()")

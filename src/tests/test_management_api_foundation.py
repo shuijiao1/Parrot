@@ -172,7 +172,7 @@ def build_app(tmp_path, *, allowed_origins=("https://admin.example.test",)):
     )
     app = FastAPI()
     app.state.management_runtime = runtime
-    app.include_router(create_management_router())
+    app.include_router(create_management_router(()))
     install_management_error_handlers(app)
     # Deliberately reproduce the inference API's broad CORS, then wrap it with
     # the path-scoped management policy.
