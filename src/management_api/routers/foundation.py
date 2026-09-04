@@ -27,13 +27,13 @@ from ..dependencies import (
     require_capability,
 )
 from ..error_mapping import management_error_responses
+from ..response_helpers import response_meta as _meta
 from ..schemas import (
     DataEnvelope,
     ManagementCapabilitiesData,
     ManagementKeyGrant,
     ManagementMetadataData,
     ManagementOperationData,
-    ResponseMeta,
     SessionCredentialData,
     SessionGrant,
     SessionSummary,
@@ -171,10 +171,6 @@ def _no_content_response(description: str) -> dict[int, dict]:
             },
         }
     }
-
-
-def _meta(request: Request) -> ResponseMeta:
-    return ResponseMeta(requestId=management_request_id(request))
 
 
 def _session_summary(issued_or_verified) -> SessionSummary:

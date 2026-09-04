@@ -9,6 +9,7 @@ from typing import Any, Callable, Mapping
 from src import config as config_module
 from src.management_auth import AuthMethod, Capability
 from src.management_control.context import AuditSink, ManagementContext
+from src.management_control.dependency_mapping import dependency_result
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
 from src.management_control.models.common import DomainControl, stable_revision
 
@@ -94,19 +95,7 @@ class SettingsControl(DomainControl):
         super().__init__(audit_sink=audit_sink)
         self.config = config
 
-    @staticmethod
-    def _dependency(callable_):
-        """Return a dependency result without retaining a raw failure chain."""
-        failed = False
-        try:
-            value = callable_()
-        except Exception:
-            failed = True
-        if failed:
-            raise ManagementError(
-                ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
-            )
-        return value
+    _dependency = staticmethod(dependency_result)
 
     @staticmethod
     def _mapping(value: Any) -> Mapping[str, Any]:

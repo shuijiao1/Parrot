@@ -9,6 +9,7 @@ from src import config as config_module
 from src.channel import registry as registry_module
 from src.management_auth import Capability
 from src.management_control.context import AuditSink, ManagementContext
+from src.management_control.dependency_mapping import dependency_result
 from src.management_control.errors import ManagementError, ManagementErrorCode
 from src.management_control.models.common import DomainControl, stable_revision
 
@@ -27,19 +28,7 @@ class ContentBlacklistControl(DomainControl):
         self.config = config
         self.registry = registry
 
-    @staticmethod
-    def _dependency(callable_):
-        """Return a dependency result without retaining a raw failure chain."""
-        failed = False
-        try:
-            value = callable_()
-        except Exception:
-            failed = True
-        if failed:
-            raise ManagementError(
-                ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
-            )
-        return value
+    _dependency = staticmethod(dependency_result)
 
     def _channels(self) -> tuple[Any, ...]:
         return self._dependency(lambda: tuple(self.registry.all_channels()))

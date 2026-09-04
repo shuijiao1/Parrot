@@ -37,7 +37,8 @@ from ..dependencies import (
     management_request_id,
 )
 from ..error_mapping import management_error_responses
-from ..schemas.base import DataEnvelope, ResponseMeta
+from ..response_helpers import response_meta as _meta
+from ..schemas.base import DataEnvelope
 from ..schemas.channels import (
     ActionResultData,
     CatalogProtocolEndpointData,
@@ -235,10 +236,6 @@ def get_channel_control(
     request.app.state.management_channel_control = current
     request.app.state.management_channel_control_runtime = runtime
     return current
-
-
-def _meta(request: Request) -> ResponseMeta:
-    return ResponseMeta(requestId=management_request_id(request))
 
 
 def _feature_data(feature, revision: str) -> CompatibilityFeatureData:

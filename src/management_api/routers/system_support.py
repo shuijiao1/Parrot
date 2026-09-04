@@ -12,8 +12,8 @@ from src.management_control import ErrorField, ManagementError, ManagementErrorC
 from src.management_control.network import NetworkControl
 from src.management_control.system import ContentBlacklistControl, SettingsControl
 
-from ..dependencies import ManagementRuntime, management_request_id
-from ..schemas.base import ResponseMeta
+from ..dependencies import ManagementRuntime
+from ..response_helpers import response_meta
 from ._operations import operation_data
 
 
@@ -62,10 +62,6 @@ def reject_unknown_query(*allowed: str):
             )
 
     return dependency
-
-
-def response_meta(request: Request) -> ResponseMeta:
-    return ResponseMeta(requestId=management_request_id(request))
 
 
 def success_response(status_code: int, data: dict) -> dict[int, dict]:

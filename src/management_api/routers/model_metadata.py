@@ -22,7 +22,7 @@ from ..dependencies import (
     require_capability,
 )
 from ..error_mapping import management_error_responses
-from ..schemas.base import ResponseMeta
+from ..response_helpers import response_meta as _meta, success_response as _success
 from ._operations import operation_data as _operation
 from ._strict_query import reject_unknown_query_parameters
 from ..schemas.mapping import MappingListMeta
@@ -68,10 +68,6 @@ def get_metadata_control(
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
 ) -> MappingControl:
     return MappingControl(audit_sink=runtime.audit_sink, operation_store=runtime.operations)
-
-
-def _meta(request: Request) -> ResponseMeta:
-    return ResponseMeta(requestId=management_request_id(request))
 
 
 def _page_meta(request: Request, result) -> MappingListMeta:
@@ -151,24 +147,6 @@ def _catalog(item: CatalogRecord) -> CatalogData:
         metadata=_values(item.metadata),
         revision=item.revision,
     )
-
-
-def _success(code: int, data: dict | list) -> dict[int, dict]:
-    meta: dict[str, object] = {"requestId": "request-example"}
-    if isinstance(data, list):
-        meta.update({
-            "page": 1,
-            "pageSize": 50,
-            "total": len(data),
-            "hasNext": False,
-            "revision": "rev_example",
-        })
-    return {
-        code: {
-            "description": "Successful Response",
-            "content": {"application/json": {"example": {"data": data, "meta": meta}}},
-        }
-    }
 
 
 _INVENTORY_EXAMPLE = {"modelId": "claude-sonnet-4-5", "family": "anthropic", "provider": "claude", "channelId": "oauth:example", "accountId": "oauth:example", "outboundModel": "claude-sonnet-4-5", "revision": "rev_example"}

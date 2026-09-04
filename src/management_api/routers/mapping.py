@@ -17,7 +17,7 @@ from ..dependencies import (
     require_capability,
 )
 from ..error_mapping import management_error_responses
-from ..schemas.base import ResponseMeta
+from ..response_helpers import response_meta as _meta, success_response as _success
 from ._strict_query import reject_unknown_query_parameters
 from ..schemas.mapping import (
     CompressionModelData,
@@ -64,10 +64,6 @@ def get_mapping_control(
     return MappingControl(audit_sink=runtime.audit_sink, operation_store=runtime.operations)
 
 
-def _meta(request: Request) -> ResponseMeta:
-    return ResponseMeta(requestId=management_request_id(request))
-
-
 def _mapping(item: MappingRecord) -> MappingData:
     return MappingData(
         alias=item.alias,
@@ -75,24 +71,6 @@ def _mapping(item: MappingRecord) -> MappingData:
         sourceLine=item.source_line,
         revision=item.revision,
     )
-
-
-def _success(code: int, data: dict | list) -> dict[int, dict]:
-    meta: dict[str, object] = {"requestId": "request-example"}
-    if isinstance(data, list):
-        meta.update({
-            "page": 1,
-            "pageSize": 50,
-            "total": len(data),
-            "hasNext": False,
-            "revision": "rev_example",
-        })
-    return {
-        code: {
-            "description": "Successful Response",
-            "content": {"application/json": {"example": {"data": data, "meta": meta}}},
-        }
-    }
 
 
 _MAPPING_EXAMPLE = {

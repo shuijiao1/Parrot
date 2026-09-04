@@ -27,7 +27,7 @@ from ..dependencies import (
     require_capability,
 )
 from ..error_mapping import management_error_responses
-from ..schemas.base import ResponseMeta
+from ..response_helpers import response_meta as _meta
 from ..schemas.apikey import (
     ApiKeyCreateRequest,
     ApiKeyData,
@@ -127,10 +127,6 @@ def _success(http_status: int, data: object, *, meta: dict | None = None) -> dic
 
 def _errors(*codes: ManagementErrorCode) -> dict[int, dict]:
     return management_error_responses(*codes)
-
-
-def _meta(request: Request) -> ResponseMeta:
-    return ResponseMeta(requestId=management_request_id(request))
 
 
 def _mark_sensitive(response: Response) -> None:

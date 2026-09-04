@@ -18,11 +18,10 @@ from src.management_control.load_balancing import (
 from ..dependencies import (
     ManagementRuntime,
     get_management_runtime,
-    management_request_id,
     require_capability,
 )
 from ..error_mapping import management_error_responses
-from ..schemas.base import ResponseMeta
+from ..response_helpers import response_meta as _meta
 from ._strict_query import reject_unknown_query_parameters
 from ..schemas.load_balancing import (
     AffinityClearData,
@@ -66,10 +65,6 @@ def get_load_balancing_control(
     runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
 ) -> LoadBalancingControl:
     return LoadBalancingControl(audit_sink=runtime.audit_sink)
-
-
-def _meta(request: Request) -> ResponseMeta:
-    return ResponseMeta(requestId=management_request_id(request))
 
 
 def _load_balancing(item: LoadBalancingRecord) -> LoadBalancingData:

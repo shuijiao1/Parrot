@@ -16,8 +16,8 @@ from src.management_control.auxiliary import (
 )
 from src.management_control import ErrorField, ManagementError, ManagementErrorCode
 
-from ..dependencies import ManagementRuntime, get_management_runtime, management_request_id
-from ..schemas.base import ResponseMeta
+from ..dependencies import ManagementRuntime, get_management_runtime
+from ..response_helpers import response_meta
 from ._operations import operation_data
 
 
@@ -66,10 +66,6 @@ def reject_unknown_query(*allowed: str) -> Callable[[Request], None]:
         )
 
     return guard
-
-
-def response_meta(request: Request) -> ResponseMeta:
-    return ResponseMeta(requestId=management_request_id(request))
 
 
 def success_response(status_code: int, example: dict) -> dict[int, dict]:

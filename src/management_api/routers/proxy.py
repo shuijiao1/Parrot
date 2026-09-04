@@ -22,7 +22,7 @@ from ..dependencies import (
     require_capability,
 )
 from ..error_mapping import management_error_responses
-from ..schemas.base import ResponseMeta
+from ..response_helpers import response_meta as _meta, success_response as _success
 from ._operations import operation_data as _operation
 from ._strict_query import reject_unknown_query_parameters
 from ..schemas.mapping import MappingListMeta
@@ -85,10 +85,6 @@ def get_proxy_control(
     return ProxyControl(audit_sink=runtime.audit_sink, operation_store=runtime.operations)
 
 
-def _meta(request: Request) -> ResponseMeta:
-    return ResponseMeta(requestId=management_request_id(request))
-
-
 def _page_meta(request: Request, result) -> MappingListMeta:
     return MappingListMeta(
         requestId=management_request_id(request), page=result.page,
@@ -138,24 +134,6 @@ def _routing(item: ProxyRoutingRecord) -> ProxyRoutingData:
         functions=dict(item.functions), accounts=dict(item.accounts),
         channels=dict(item.channels), models=dict(item.models), revision=item.revision,
     )
-
-
-def _success(code: int, data: dict | list) -> dict[int, dict]:
-    meta: dict[str, object] = {"requestId": "request-example"}
-    if isinstance(data, list):
-        meta.update({
-            "page": 1,
-            "pageSize": 50,
-            "total": len(data),
-            "hasNext": False,
-            "revision": "rev_example",
-        })
-    return {
-        code: {
-            "description": "Successful Response",
-            "content": {"application/json": {"example": {"data": data, "meta": meta}}},
-        }
-    }
 
 
 _STATS_EXAMPLE = {"requests": 2, "successes": 2, "failures": 0, "inputTokens": 0, "outputTokens": 0, "cacheCreationTokens": 0, "cacheReadTokens": 0, "totalTokens": 0, "bytesUp": 100, "bytesDown": 200, "totalBytes": 300, "avgConnectMilliseconds": 20, "avgFirstByteMilliseconds": 40, "avgIdleMilliseconds": 0, "avgTotalMilliseconds": 60}
