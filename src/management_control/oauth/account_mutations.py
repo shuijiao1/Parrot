@@ -97,6 +97,7 @@ class OAuthAccountMutationControlMixin:
                 if not hmac.compare_digest(supplied, payload["flow_secret_verifier"]):
                     raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
         bound_entry = payload["entry"]
+        self._ensure_legacy_identity_safe(bound_entry)
         if candidate is not None and (
             self.backend.account_id(candidate) != payload["candidate_identity"]
             or candidate_revision(candidate) != payload["candidate_revision"]
@@ -116,7 +117,11 @@ class OAuthAccountMutationControlMixin:
         self._raise_conditional_status(result)
         if result.get("status") != "replaced":
             raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
-        saved = result.get("account") or self._account(account_id)
+        self._post_save_account_effects(account_id, bound_entry)
+        # Usage/quota evaluation may synchronously change enabled state, so the
+        # response revision must describe the post-effect account, not the
+        # replacement helper's pre-effect snapshot.
+        saved = self._account(account_id)
         return OAuthMutationResult(account_id, revision(saved), "replaced")
 
     def _create_entry(
@@ -136,6 +141,7 @@ class OAuthAccountMutationControlMixin:
                 ManagementErrorCode.VALIDATION_FAILED,
                 fields=[ErrorField(field, "REQUIRED", "Field is required") for field in required],
             )
+        self._ensure_legacy_identity_safe(entry)
         if replace_plan_token:
             return self._commit_replace_plan(context, replace_plan_token, entry)
         existing = self.backend.find_exact_identity(entry)
@@ -162,6 +168,7 @@ class OAuthAccountMutationControlMixin:
                 )
             raise ManagementError(ManagementErrorCode.IDENTITY_CONFLICT)
         account_id = str(result.get("account_key") or self.backend.account_id(entry))
+        self._post_save_account_effects(account_id, entry)
         return OAuthMutationResult(
             account_id=account_id,
             revision=revision(self._account(account_id)),

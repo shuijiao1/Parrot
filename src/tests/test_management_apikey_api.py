@@ -265,11 +265,18 @@ def test_all_operations_happy_path_call_control_once_with_authenticated_actor(tm
         created = client.post(
             "/api/management/v1/api-keys",
             headers=headers,
-            json={"mode": "custom", "name": "client.new", "customSecret": "client-secret+/="},
+            json={"mode": "custom", "name": "client.new", "customSecret": "ccp-client-custom-secret"},
         )
         assert created.status_code == 201, created.text
         assert created.headers["cache-control"] == "no-store"
-        assert created.json()["data"]["secret"] == "client-secret+/="
+        assert created.json()["data"]["secret"] == "ccp-client-custom-secret"
+        assert created.json()["data"]["apiKey"]["source"] == "custom"
+        assert store.value["apiKeys"]["client.new"]["source"] == "custom"
+        custom_items = client.get(
+            "/api/management/v1/api-keys?source=custom&pageSize=200",
+            headers=headers,
+        ).json()["data"]["items"]
+        assert "client.new" in [item["keyId"] for item in custom_items]
         client_revision = created.json()["data"]["apiKey"]["revision"]
 
         updated = client.patch(
@@ -293,7 +300,7 @@ def test_all_operations_happy_path_call_control_once_with_authenticated_actor(tm
         assert plan.status_code == 200, plan.text
         assert plan.headers["cache-control"] == "no-store"
         plan_data = plan.json()["data"]
-        assert "client-secret+/=" not in plan.text
+        assert "ccp-client-custom-secret" not in plan.text
 
         regenerated = client.post(
             "/api/management/v1/api-keys/client.new/actions/generate-replacement",
@@ -303,6 +310,7 @@ def test_all_operations_happy_path_call_control_once_with_authenticated_actor(tm
         assert regenerated.status_code == 200, regenerated.text
         assert regenerated.headers["cache-control"] == "no-store"
         assert regenerated.json()["data"]["secret"] == "ccp-" + "r" * 48
+        assert regenerated.json()["data"]["apiKey"]["source"] == "generated"
         regenerated_revision = regenerated.json()["data"]["apiKey"]["revision"]
 
         replay = client.post(
@@ -322,6 +330,7 @@ def test_all_operations_happy_path_call_control_once_with_authenticated_actor(tm
         assert replaced.status_code == 200, replaced.text
         assert replaced.headers["cache-control"] == "no-store"
         assert replaced.json()["data"]["secret"] == "alpha-replacement"
+        assert replaced.json()["data"]["apiKey"]["source"] == "custom"
 
         reset = client.post(
             "/api/management/v1/api-keys/busy/actions/reset-limiter",
@@ -355,7 +364,7 @@ def test_all_operations_happy_path_call_control_once_with_authenticated_actor(tm
         assert limiter.forgot == ["client.new", "alpha", "busy", "client.new"]
 
         expected_once = {
-            "list_api_keys": 2,
+            "list_api_keys": 3,
             "get_api_key": 2,
             "get_api_key_stats": 1,
             "create_api_key": 1,

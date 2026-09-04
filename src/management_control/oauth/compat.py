@@ -120,15 +120,12 @@ class OAuthCompatibilityControlMixin:
         self._require(context, Capability.SECRETS_WRITE)
         existing = self.backend.find_exact_identity(entry)
         if existing is None:
-            result = self.backend.add_account_if_absent(entry)
+            result = self.add_account_entry(context, entry)
             if result.get("status") != "added":
                 raise RuntimeError("OAuth identity appeared concurrently")
-            account_id = str(result.get("account_key") or self.backend.account_id(entry))
-            self._audit(context, "oauth.account.create", account_id)
             return False
         account_id, _snapshot = existing
-        result = self.backend.replace_exact_identity(account_id, entry)
+        result = self.replace_account_entry(context, account_id, entry)
         if result.get("status") != "replaced":
             raise RuntimeError("OAuth identity changed concurrently")
-        self._audit(context, "oauth.account.replace", account_id)
         return True

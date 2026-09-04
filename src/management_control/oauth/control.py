@@ -16,6 +16,7 @@ from src.management_control.errors import ErrorField, ManagementError, Managemen
 from src.management_control.operations import ManagementOperation, OperationStore
 
 from .account_mutations import OAuthAccountMutationControlMixin
+from .account_orchestration import OAuthAccountOrchestrationControlMixin
 from .backend import OAuthBackend
 from .compat import OAuthCompatibilityControlMixin
 from .contracts import (
@@ -75,6 +76,7 @@ def _page(items: list, spec: PageSpec) -> tuple[list, PageMeta]:
 
 
 class OAuthControl(
+    OAuthAccountOrchestrationControlMixin,
     OAuthAccountMutationControlMixin,
     OAuthCompatibilityControlMixin,
     OAuthDefaultModelsControlMixin,
@@ -101,13 +103,13 @@ class OAuthControl(
         self._replace_plans: OneShotPlanStore[dict] = OneShotPlanStore(
             prefix="oreplace", clock=self._clock,
         )
-        self._delete_plans: OneShotPlanStore[tuple[str, ...]] = OneShotPlanStore(
+        self._delete_plans: OneShotPlanStore[dict] = OneShotPlanStore(
             prefix="odelete", clock=self._clock,
         )
         self._quota_plans: OneShotPlanStore[dict] = OneShotPlanStore(
             prefix="oquota", clock=self._clock,
         )
-        self._import_plans: OneShotPlanStore[tuple[dict, ...]] = OneShotPlanStore(
+        self._import_plans: OneShotPlanStore[dict] = OneShotPlanStore(
             prefix="oimport", clock=self._clock,
         )
 
@@ -154,15 +156,20 @@ class OAuthControl(
         self,
         context: ManagementContext,
         entry: dict,
+        *,
+        usage: dict | None = None,
+        defer_post_save: bool = False,
     ) -> dict:
         self._require(context, Capability.SECRETS_WRITE)
+        self._ensure_legacy_identity_safe(entry)
         result = self.backend.add_account_if_absent(copy.deepcopy(entry))
         if result.get("status") == "added":
-            self._audit(
-                context,
-                "oauth.account.create",
-                str(result.get("account_key") or self.backend.account_id(entry)),
-            )
+            account_id = str(result.get("account_key") or self.backend.account_id(entry))
+            if not defer_post_save:
+                result["_post_save"] = self._post_save_account_effects(
+                    account_id, entry, usage=usage,
+                )
+            self._audit(context, "oauth.account.create", account_id)
         return result
 
     def replace_account_entry(
@@ -170,10 +177,18 @@ class OAuthControl(
         context: ManagementContext,
         account_id: str,
         entry: dict,
+        *,
+        usage: dict | None = None,
+        defer_post_save: bool = False,
     ) -> dict:
         self._require(context, Capability.SECRETS_WRITE)
+        self._ensure_legacy_identity_safe(entry)
         result = self.backend.replace_exact_identity(account_id, copy.deepcopy(entry))
         if result.get("status") == "replaced":
+            if not defer_post_save:
+                result["_post_save"] = self._post_save_account_effects(
+                    account_id, entry, usage=usage,
+                )
             self._audit(context, "oauth.account.replace", account_id)
         return result
 
@@ -398,11 +413,15 @@ class OAuthControl(
                     conflict_account_id=existing[0] if existing else None,
                 )
             )
+        expected_accounts = copy.deepcopy(self.backend.list_accounts())
         import_id, import_secret, plan = self._import_plans.create_split(
             actor_subject_id=context.actor.subject_id,
             kind="import",
-            revision=_revision(self.backend.list_accounts()),
-            payload=tuple(safe_entries),
+            revision=_revision(expected_accounts),
+            payload={
+                "candidates": tuple(safe_entries),
+                "expected_accounts": expected_accounts,
+            },
         )
         return OAuthImportPreview(
             import_id=import_id,
@@ -421,41 +440,48 @@ class OAuthControl(
         decisions: Iterable[OAuthImportDecision],
     ) -> OAuthImportCommitResult:
         self._require(context, Capability.SECRETS_WRITE)
-        plan = self._import_plans.consume_parts(
+        plan = self._import_plans.inspect_parts(
             import_id,
             import_secret,
             actor_subject_id=context.actor.subject_id,
             kind="import",
         )
-        current_revision = _revision(self.backend.list_accounts())
-        if current_revision != plan.revision:
-            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+        candidates = tuple(plan.payload["candidates"])
         choices = {decision.candidate_id: decision.action for decision in decisions}
-        valid_ids = {item["candidate_id"] for item in plan.payload}
-        if set(choices) != valid_ids or any(action not in {"keep", "overwrite"} for action in choices.values()):
+        valid_ids = {item["candidate_id"] for item in candidates}
+        if set(choices) != valid_ids or any(
+            action not in {"keep", "overwrite"} for action in choices.values()
+        ):
             raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
-        added: list[str] = []
-        replaced: list[str] = []
-        skipped: list[str] = []
-        for item in plan.payload:
-            entry = item["entry"]
-            candidate_id = item["candidate_id"]
-            existing = self.backend.find_exact_identity(entry)
-            if existing:
-                if choices[candidate_id] == "keep":
-                    skipped.append(existing[0])
-                    continue
-                result = self.backend.replace_exact_identity(existing[0], entry)
-                if result.get("status") != "replaced":
-                    raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
-                replaced.append(existing[0])
-            else:
-                result = self.backend.add_account_if_absent(entry)
-                if result.get("status") != "added":
-                    raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
-                added.append(str(result.get("account_key") or self.backend.account_id(entry)))
+        for item in candidates:
+            self._ensure_legacy_identity_safe(item["entry"])
+        self._import_plans.consume_parts(
+            import_id,
+            import_secret,
+            actor_subject_id=context.actor.subject_id,
+            kind="import",
+        )
+        outcome = self.backend.commit_import_conditional(
+            copy.deepcopy(plan.payload["expected_accounts"]), candidates, choices,
+        )
+        if outcome.get("status") == "revision_conflict":
+            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+        if outcome.get("status") != "committed":
+            raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+        added = tuple(str(item) for item in outcome.get("added") or ())
+        replaced = tuple(str(item) for item in outcome.get("replaced") or ())
+        skipped = tuple(str(item) for item in outcome.get("skipped") or ())
+        affected = set(added) | set(replaced)
+        started: set[str] = set()
+        for item in candidates:
+            account_id = self.backend.account_id(item["entry"])
+            if account_id in affected and account_id not in started:
+                # Frozen import commits start model discovery, but do not run the
+                # interactive login usage/quota follow-up for every imported row.
+                self._start_post_save_model_sync(account_id)
+                started.add(account_id)
         self._audit(context, "oauth.import.commit", import_id)
-        return OAuthImportCommitResult(tuple(added), tuple(replaced), tuple(skipped))
+        return OAuthImportCommitResult(added, replaced, skipped)
 
     def list_invalid_accounts(self, context: ManagementContext, *, page: PageSpec) -> OAuthAccountPage:
         return self.list_accounts(context, account_filter=OAuthAccountFilter.INVALID, page=page)
@@ -473,12 +499,18 @@ class OAuthControl(
         selected = invalid if account_ids is None else list(account_ids)
         if not selected or len(selected) != len(set(selected)) or not set(selected).issubset(invalid):
             raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
-        revision = _revision([(item, self._account(item)) for item in selected])
+        expected_accounts = tuple(
+            (item, copy.deepcopy(self._account(item))) for item in selected
+        )
+        revision = _revision(expected_accounts)
         token, plan = self._delete_plans.create(
             actor_subject_id=context.actor.subject_id,
             kind="invalid-delete",
             revision=revision,
-            payload=tuple(selected),
+            payload={
+                "account_ids": tuple(selected),
+                "expected_accounts": expected_accounts,
+            },
         )
         return OAuthDeletionPlan(token, tuple(selected), plan.expires_at, revision)
 
@@ -488,18 +520,18 @@ class OAuthControl(
         plan = self._delete_plans.consume(
             plan_token, actor_subject_id=context.actor.subject_id, kind="invalid-delete",
         )
-        current = []
-        for account_id in plan.payload:
-            account = self._account(account_id)
-            if account.get("disabled_reason") != "auth_error":
-                raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
-            current.append((account_id, account))
-        if _revision(current) != plan.revision:
+        expected_accounts = tuple(plan.payload["expected_accounts"])
+        outcome = self.backend.delete_invalid_accounts_conditional(expected_accounts)
+        status = outcome.get("status")
+        if status == "revision_conflict":
             raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
-        for account_id in plan.payload:
-            self.backend.delete_account(account_id)
-        self._audit(context, "oauth.invalid.delete", str(len(plan.payload)))
-        return len(plan.payload)
+        if status == "missing":
+            raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+        if status != "deleted":
+            raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+        count = int(outcome.get("count") or 0)
+        self._audit(context, "oauth.invalid.delete", str(count))
+        return count
 
     @audit_failures("oauth.token.refresh", target_arg="account_id")
     def refresh_token(self, context: ManagementContext, account_id: str) -> OAuthMutationResult:
@@ -547,24 +579,6 @@ class OAuthControl(
         self._audit(context, kind, operation.id, "queued")
         return operation
 
-    def _refresh_usage_worker(self, account_ids: list[str]) -> dict:
-        results = []
-        for account_id in account_ids:
-            usage = asyncio.run(self.backend.fetch_usage_snapshot(account_id, force=True))
-            provider = self.backend.provider_of(account_id)
-            if provider == "antigravity":
-                usage = self.backend.preserve_antigravity_summary(account_id, usage)
-            if provider == "openai":
-                usage = self.backend.preserve_openai_reset_details(account_id, usage)
-            self.backend.quota_save(
-                account_id,
-                self.backend.flatten_usage(usage),
-                email=self.backend.account_email(account_id),
-            )
-            self.backend.evaluate_quota(account_id, usage)
-            results.append({"accountId": account_id, "status": "refreshed"})
-        return {"accounts": results, "total": len(results)}
-
     @audit_failures("oauth.usage.refresh", target_arg="account_id")
     def refresh_usage(
         self, context: ManagementContext, account_id: str, store: OperationStore,
@@ -580,7 +594,10 @@ class OAuthControl(
         self._require(context, Capability.WRITE)
         account_ids = [self.backend.account_id(account) for account in self.backend.list_accounts()]
         return self._start_operation(
-            context, store, kind="oauth.usage.refresh-all", worker=lambda: self._refresh_usage_worker(account_ids),
+            context,
+            store,
+            kind="oauth.usage.refresh-all",
+            worker=lambda: self._refresh_usage_worker(account_ids, continue_on_error=True),
         )
 
     @audit_failures("oauth.quota.reset-plan", target_arg="account_id")

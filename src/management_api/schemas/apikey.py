@@ -7,7 +7,12 @@ from typing import Annotated, Literal
 
 from pydantic import Field, SecretStr, StringConstraints, model_validator
 
-from src.management_control.apikey import ApiKeyEnabledFilter, ApiKeySort, ApiKeySource
+from src.management_control.apikey import (
+    ApiKeyEnabledFilter,
+    ApiKeyProvenance,
+    ApiKeySort,
+    ApiKeySource,
+)
 
 from .base import ResponseMeta, StrictSchema
 
@@ -68,7 +73,7 @@ class ApiKeyData(StrictSchema):
     name: str
     order: int = Field(ge=1)
     enabled: bool
-    source: ApiKeySource
+    source: ApiKeyProvenance
     maskedHint: str
     allowImages: bool
     allowVideos: bool

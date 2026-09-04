@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+from concurrent.futures import Future
 from dataclasses import dataclass
 from threading import RLock
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -90,6 +91,10 @@ class InMemoryOAuthBackend(OAuthBackend):
         self.last_reset_idempotency_key = None
         self.sync_result = {"action": "updated", "models": 2}
         self.provider_exchange_count = 0
+        self.model_sync_started: list[str] = []
+        self.usage_fetches: list[str] = []
+        self.usage_failures: set[str] = set()
+        self.quota_evaluations: list[str] = []
         self.default_references = {
             "openai": {"apiKeys": [], "mappings": [], "defaults": [], "would_empty_keys": []}
         }
@@ -164,6 +169,41 @@ class InMemoryOAuthBackend(OAuthBackend):
         self.accounts.append(saved)
         return {"status": "added", "account_key": account_id}
 
+    def commit_import_conditional(self, expected_accounts, candidates, choices):
+        with self._lock:
+            self._interleave()
+            if self.accounts != expected_accounts:
+                return {
+                    "status": "revision_conflict",
+                    "added": [],
+                    "replaced": [],
+                    "skipped": [],
+                }
+            outcome = {
+                "status": "committed",
+                "added": [],
+                "replaced": [],
+                "skipped": [],
+            }
+            for item in candidates:
+                entry = item["entry"]
+                candidate_id = item["candidate_id"]
+                existing = self.find_exact_identity(entry)
+                if existing:
+                    if choices[candidate_id] == "keep":
+                        outcome["skipped"].append(existing[0])
+                        continue
+                    result = self.replace_exact_identity(existing[0], entry)
+                    if result.get("status") != "replaced":
+                        raise RuntimeError("conditional import replace failed")
+                    outcome["replaced"].append(existing[0])
+                else:
+                    result = self.add_account_if_absent(entry)
+                    if result.get("status") != "added":
+                        raise RuntimeError("conditional import add failed")
+                    outcome["added"].append(result["account_key"])
+            return outcome
+
     def replace_exact_identity(self, account_id, entry):
         current = self._find_exact(account_id)
         if current is None or self.account_id(entry) != account_id:
@@ -198,6 +238,21 @@ class InMemoryOAuthBackend(OAuthBackend):
                 return {"status": "revision_conflict"}
             self.delete_account(account_id)
             return {"status": "deleted"}
+
+    def delete_invalid_accounts_conditional(self, expected_accounts):
+        with self._lock:
+            self._interleave()
+            for account_id, expected in expected_accounts:
+                current = self._find_exact(account_id)
+                if current is None:
+                    return {"status": "missing"}
+                if current != expected:
+                    return {"status": "revision_conflict"}
+                if current.get("disabled_reason") != "auth_error":
+                    return {"status": "state_conflict"}
+            for account_id, _expected in expected_accounts:
+                self.delete_account(account_id)
+            return {"status": "deleted", "count": len(expected_accounts)}
 
     def update_account_conditional(
         self, account_id, expected_account, *, display_name=None,
@@ -270,8 +325,17 @@ class InMemoryOAuthBackend(OAuthBackend):
         self._find(account_id)["access_token"] = "rotated-access-secret"
         return "rotated-access-secret"
 
-    async def fetch_usage_snapshot(self, account_id, *, force=True):
+    async def fetch_usage(self, account_id):
+        return await self.fetch_usage_snapshot(account_id)
+
+    async def fetch_usage_snapshot(self, account_id):
+        self.usage_fetches.append(account_id)
+        if account_id in self.usage_failures:
+            raise RuntimeError("fake usage failure")
         return {"five_hour": {"utilization": 10.0}}
+
+    async def enrich_openai_reset_credit_details(self, account_id, usage):
+        return usage
 
     def flatten_usage(self, usage):
         return {"five_hour_util": 10.0}
@@ -283,6 +347,7 @@ class InMemoryOAuthBackend(OAuthBackend):
         return usage
 
     def evaluate_quota(self, account_id, usage):
+        self.quota_evaluations.append(account_id)
         return {"action": "kept_enabled"}
 
     def quota_load(self, account_id):
@@ -387,6 +452,12 @@ class InMemoryOAuthBackend(OAuthBackend):
         if result.get("action") == "updated":
             self._find(account_id)["last_model_sync"] = "2026-01-01T00:00:00Z"
         return result
+
+    def start_account_model_refresh(self, account_id):
+        self.model_sync_started.append(account_id)
+        future = Future()
+        future.set_result(copy.deepcopy(self.sync_result))
+        return future
 
     def reset_quota(self, account_id):
         self.quota.pop(account_id, None)

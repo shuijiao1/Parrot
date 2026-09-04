@@ -13,6 +13,7 @@ from src.management_control.apikey import (
     ApiKeyEnabledFilter,
     ApiKeyLimiterSnapshot,
     ApiKeyModelUsage,
+    ApiKeyProvenance,
     ApiKeySort,
     ApiKeySource,
     ApiKeyUsage,
@@ -256,7 +257,7 @@ def list_api_keys(
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 50,
     enabled: ApiKeyEnabledFilter = ApiKeyEnabledFilter.ALL,
-    source: ApiKeySource | None = None,
+    source: ApiKeyProvenance | None = None,
     name: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
     sort: ApiKeySort = ApiKeySort.ORDER_ASC,
 ) -> ApiKeyListEnvelope:

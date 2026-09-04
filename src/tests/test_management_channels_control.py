@@ -151,6 +151,48 @@ def test_control_crud_filter_sort_revision_reorder_and_secret_boundary():
     assert [row["name"] for row in config.get()["channels"]] == ["Beta"]
 
 
+def test_create_and_update_validate_and_persist_the_same_trimmed_values():
+    control = ChannelControl()
+    created = control.create_channel(
+        ADMIN_CONTEXT,
+        ChannelCreateCommand(
+            name="  Canonical  ",
+            base_url="  https://provider.example.test  ",
+            api_path="  /v1/messages  ",
+            api_key="  sk-canonical-secret  ",
+            protocol=ChannelProtocol.ANTHROPIC,
+            models=(ChannelModel(real="  model-real  ", alias="  model-alias  "),),
+        ),
+    ).channel
+    stored = config.get()["channels"][0]
+    assert created.id == "api:Canonical"
+    assert stored["name"] == "Canonical"
+    assert stored["apiKey"] == "sk-canonical-secret"
+    assert stored["baseUrl"] == "https://provider.example.test"
+    assert stored["apiPath"] == "/v1/messages"
+    assert stored["models"] == [{"real": "model-real", "alias": "model-alias"}]
+
+    updated = control.update_channel(
+        ADMIN_CONTEXT,
+        created.id,
+        ChannelUpdateCommand(
+            name="  Renamed  ",
+            base_url="  https://second.example.test  ",
+            api_path="  /v1/messages  ",
+            api_key="  sk-updated-secret  ",
+            models=(ChannelModel(real="  second-real  ", alias="  second-alias  "),),
+        ),
+        expected_revision=created.revision,
+    ).channel
+    stored = config.get()["channels"][0]
+    assert updated.id == "api:Renamed"
+    assert stored["name"] == "Renamed"
+    assert stored["apiKey"] == "sk-updated-secret"
+    assert stored["baseUrl"] == "https://second.example.test"
+    assert stored["apiPath"] == "/v1/messages"
+    assert stored["models"] == [{"real": "second-real", "alias": "second-alias"}]
+
+
 def test_control_authorizes_read_write_secret_and_destructive_capabilities():
     control = ChannelControl()
     with pytest.raises(ManagementError) as caught:

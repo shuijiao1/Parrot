@@ -8,8 +8,18 @@ from enum import Enum
 
 
 class ApiKeySource(str, Enum):
+    """Creation/replacement mode for newly observed secret material."""
+
     GENERATED = "generated"
     CUSTOM = "custom"
+
+
+class ApiKeyProvenance(str, Enum):
+    """Persisted source; old entries without evidence remain explicitly unknown."""
+
+    GENERATED = "generated"
+    CUSTOM = "custom"
+    UNKNOWN = "unknown"
 
 
 class ApiKeySort(str, Enum):
@@ -81,7 +91,7 @@ class ApiKeyView:
     name: str
     order: int
     enabled: bool
-    source: ApiKeySource
+    source: ApiKeyProvenance
     masked_hint: str
     allow_images: bool
     allow_videos: bool

@@ -78,6 +78,51 @@ class OAuthBackend:
     def add_account_if_absent(self, entry: dict) -> dict:
         return oauth_manager.add_account_if_identity_absent(entry)
 
+    def commit_import_conditional(
+        self,
+        expected_accounts: list[dict],
+        candidates: tuple[dict, ...],
+        choices: dict[str, str],
+    ) -> dict:
+        """Apply an import under one serialized revision/mutation boundary.
+
+        The domain add/replace functions retain ownership of normalization and
+        runtime side effects.  Holding the re-entrant config lifecycle lock
+        across the revision check and the complete batch prevents another
+        writer from turning a validated import into a partial concurrency
+        commit.
+        """
+        outcome = {
+            "status": "revision_conflict",
+            "added": [],
+            "replaced": [],
+            "skipped": [],
+        }
+        with config.serialized_updates():
+            if oauth_manager.list_accounts() != expected_accounts:
+                return outcome
+            outcome["status"] = "committed"
+            for item in candidates:
+                entry = copy.deepcopy(item["entry"])
+                candidate_id = str(item["candidate_id"])
+                existing = oauth_manager.find_exact_identity(entry)
+                if existing is not None:
+                    if choices[candidate_id] == "keep":
+                        outcome["skipped"].append(existing[0])
+                        continue
+                    result = oauth_manager.replace_exact_identity(existing[0], entry)
+                    if result.get("status") != "replaced":
+                        raise RuntimeError("conditional OAuth import replace failed")
+                    outcome["replaced"].append(existing[0])
+                    continue
+                result = oauth_manager.add_account_if_identity_absent(entry)
+                if result.get("status") != "added":
+                    raise RuntimeError("conditional OAuth import add failed")
+                outcome["added"].append(
+                    str(result.get("account_key") or oauth_manager.get_account_key(entry))
+                )
+        return outcome
+
     def replace_exact_identity(self, account_id: str, entry: dict) -> dict:
         return oauth_manager.replace_exact_identity(account_id, entry)
 
@@ -93,6 +138,26 @@ class OAuthBackend:
 
     def delete_account_conditional(self, account_id: str, expected_account: dict) -> dict:
         return oauth_manager.delete_account_if_unchanged(account_id, expected_account)
+
+    def delete_invalid_accounts_conditional(
+        self,
+        expected_accounts: tuple[tuple[str, dict], ...],
+    ) -> dict:
+        """Delete a validated invalid-account set without a check/use gap."""
+        with config.serialized_updates():
+            for account_id, expected in expected_accounts:
+                current = oauth_manager.get_account(account_id)
+                if current is None:
+                    return {"status": "missing"}
+                if current != expected:
+                    return {"status": "revision_conflict"}
+                if current.get("disabled_reason") != "auth_error":
+                    return {"status": "state_conflict"}
+            for account_id, expected in expected_accounts:
+                result = oauth_manager.delete_account_if_unchanged(account_id, expected)
+                if result.get("status") != "deleted":
+                    raise RuntimeError("conditional OAuth invalid-account delete failed")
+        return {"status": "deleted", "count": len(expected_accounts)}
 
     def update_account_conditional(
         self,
@@ -181,8 +246,11 @@ class OAuthBackend:
     async def fetch_usage(self, account_id: str) -> dict:
         return await oauth_manager.fetch_usage(account_id)
 
-    async def fetch_usage_snapshot(self, account_id: str, *, force: bool = True) -> dict:
-        return await oauth_manager.fetch_usage_snapshot(account_id, force=force)
+    async def fetch_usage_snapshot(self, account_id: str) -> dict:
+        # The authoritative domain function always performs a real refresh and
+        # accepts only timeout keywords.  Keep this wrapper signature strict so
+        # tests cannot hide a production-only unexpected ``force`` TypeError.
+        return await oauth_manager.fetch_usage_snapshot(account_id)
 
     def flatten_usage(self, usage: dict) -> dict:
         return oauth_manager.flatten_usage(usage)

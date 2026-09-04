@@ -10,6 +10,7 @@ from src.management_control import BoundedAuditSink, ManagementContext, Manageme
 from src.management_control.apikey import (
     ApiKeyControl,
     ApiKeyEnabledFilter,
+    ApiKeyProvenance,
     ApiKeySort,
     ApiKeySource,
 )
@@ -120,6 +121,7 @@ def make_control(value=None, *, clock=None, generated=None, tokens=None):
         "apiKeys": {
             "alpha": {
                 "key": "alpha-secret",
+                "source": "custom",
                 "enabled": True,
                 "allowedModels": [],
                 "allowImages": False,
@@ -127,6 +129,7 @@ def make_control(value=None, *, clock=None, generated=None, tokens=None):
             },
             "busy": {
                 "key": "ccp-busy-secret",
+                "source": "generated",
                 "enabled": False,
                 "allowedModels": ["model-a"],
                 "allowImages": True,
@@ -275,6 +278,57 @@ def test_create_update_replace_delete_revision_conflicts_and_side_effects():
     assert [row.action for row in audit.snapshot()] == [
         "apikey.create", "apikey.update", "apikey.secret.replace", "apikey.delete",
     ]
+
+
+def test_source_uses_persisted_provenance_not_ccp_secret_prefix():
+    control, store, _, _ = make_control({
+        "apiKeys": {
+            "legacy-custom": {
+                "key": "ccp-user-chosen",
+                "enabled": True,
+                "allowedModels": [],
+                "allowImages": False,
+                "allowVideos": False,
+            },
+        },
+    })
+    read = context(Capability.READ)
+    secrets_write = context(Capability.SECRETS_WRITE)
+
+    legacy = control.get_api_key(read, "legacy-custom")
+    assert legacy.source is ApiKeyProvenance.UNKNOWN
+    assert [item.key_id for item in control.list_api_keys(
+        read, source=ApiKeyProvenance.CUSTOM, include_stats=False,
+    ).items] == []
+    assert [item.key_id for item in control.list_api_keys(
+        read, source=ApiKeyProvenance.UNKNOWN, include_stats=False,
+    ).items] == ["legacy-custom"]
+
+    custom = control.create_api_key(
+        secrets_write,
+        name="custom-prefix",
+        mode=ApiKeySource.CUSTOM,
+        custom_secret="ccp-custom-secret",
+    )
+    assert custom.api_key.source is ApiKeyProvenance.CUSTOM
+    assert store.value["apiKeys"]["custom-prefix"]["source"] == "custom"
+
+    generated = control.create_api_key(
+        secrets_write, name="generated", mode=ApiKeySource.GENERATED,
+    )
+    assert generated.api_key.source is ApiKeyProvenance.GENERATED
+    replaced = control.replace_api_key_secret(
+        secrets_write,
+        "generated",
+        custom_secret="ccp-still-custom",
+        if_match=generated.api_key.revision,
+    )
+    assert replaced.api_key.source is ApiKeyProvenance.CUSTOM
+    assert store.value["apiKeys"]["generated"]["source"] == "custom"
+
+    assert [item.key_id for item in control.list_api_keys(
+        read, source=ApiKeyProvenance.CUSTOM, include_stats=False,
+    ).items] == ["custom-prefix", "generated"]
 
 
 def test_regeneration_plan_is_actor_bound_expiring_one_shot_and_resets_runtime():

@@ -15,7 +15,7 @@ from typing import Any, Mapping
 
 from src import apikey_limiter, config, log_db
 from src.channel import registry
-from src.management_auth import Capability, CapabilityDenied, authorize
+from src.management_auth import AuthMethod, Capability, CapabilityDenied, authorize
 from src.management_control.context import AuditSink, ManagementContext, audit_record
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
 
@@ -25,6 +25,7 @@ from .models import (
     ApiKeyLimiterSnapshot,
     ApiKeyModelUsage,
     ApiKeyPage,
+    ApiKeyProvenance,
     ApiKeyReplacementPlan,
     ApiKeySecretResult,
     ApiKeySort,
@@ -94,7 +95,7 @@ class ApiKeyControl:
         page: int = 1,
         page_size: int = 50,
         enabled: ApiKeyEnabledFilter = ApiKeyEnabledFilter.ALL,
-        source: ApiKeySource | None = None,
+        source: ApiKeyProvenance | None = None,
         name_contains: str | None = None,
         sort: ApiKeySort = ApiKeySort.ORDER_ASC,
         include_secret: bool = False,
@@ -114,7 +115,7 @@ class ApiKeyControl:
         elif enabled is ApiKeyEnabledFilter.DISABLED:
             rows = [item for item in rows if not item.enabled]
         if source is not None:
-            rows = [item for item in rows if item.source is source]
+            rows = [item for item in rows if item.source.value == source.value]
         if name_contains:
             needle = name_contains.casefold()
             rows = [item for item in rows if needle in item.name.casefold()]
@@ -285,6 +286,11 @@ class ApiKeyControl:
                     raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT, "API key secret is already in use")
             keys[name] = {
                 "key": secret,
+                **(
+                    {"source": mode.value}
+                    if context.actor.auth_method is not AuthMethod.TELEGRAM_ADMIN
+                    else {}
+                ),
                 "enabled": True,
                 "allowedModels": [],
                 "allowImages": False,
@@ -441,7 +447,13 @@ class ApiKeyControl:
             plan = self._validated_plan(context, key_id, plan_id, plan_token)
         secret = str(self._generated_secret_factory())
         self.validate_custom_secret(secret)
-        self._replace_secret_atomic(key_id, secret, expected_revision=plan.revision if plan else None)
+        self._replace_secret_atomic(
+            key_id,
+            secret,
+            expected_revision=plan.revision if plan else None,
+            source=ApiKeyProvenance.GENERATED,
+            record_source=context.actor.auth_method is not AuthMethod.TELEGRAM_ADMIN,
+        )
         if plan is not None:
             with self._plan_lock:
                 plan.consumed = True
@@ -465,7 +477,13 @@ class ApiKeyControl:
         self.validate_custom_secret(custom_secret)
         if require_revision and not if_match:
             raise ManagementError(ManagementErrorCode.CONFIRMATION_REQUIRED, "If-Match is required")
-        self._replace_secret_atomic(key_id, custom_secret, expected_revision=if_match)
+        self._replace_secret_atomic(
+            key_id,
+            custom_secret,
+            expected_revision=if_match,
+            source=ApiKeyProvenance.CUSTOM,
+            record_source=context.actor.auth_method is not AuthMethod.TELEGRAM_ADMIN,
+        )
         if reset_runtime:
             self._limiter.forget_key(key_id)
         item = self._current_view(key_id)
@@ -537,7 +555,15 @@ class ApiKeyControl:
 
     # ----- internals ------------------------------------------------------
 
-    def _replace_secret_atomic(self, key_id: str, secret: str, *, expected_revision: str | None) -> None:
+    def _replace_secret_atomic(
+        self,
+        key_id: str,
+        secret: str,
+        *,
+        expected_revision: str | None,
+        source: ApiKeyProvenance,
+        record_source: bool,
+    ) -> None:
         def mutate(cfg: dict) -> None:
             keys = cfg.get("apiKeys") or {}
             raw = keys.get(key_id) if isinstance(keys, dict) else None
@@ -549,6 +575,8 @@ class ApiKeyControl:
                 if name != key_id and self._normalize_entry(other).get("key") == secret:
                     raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT, "API key secret is already in use")
             entry["key"] = secret
+            if record_source or "source" in entry:
+                entry["source"] = source.value
             keys[key_id] = entry
         self._config.update(mutate)
 
@@ -629,7 +657,7 @@ class ApiKeyControl:
             name=name,
             order=order,
             enabled=entry.get("enabled") is not False,
-            source=ApiKeySource.GENERATED if secret.startswith("ccp-") else ApiKeySource.CUSTOM,
+            source=self._provenance(entry),
             masked_hint=self._masked(secret),
             allow_images=bool(entry.get("allowImages")),
             allow_videos=bool(entry.get("allowVideos")),
@@ -697,6 +725,13 @@ class ApiKeyControl:
         if not isinstance(value, dict):
             return {}
         return {str(name): cls._normalize_entry(raw) for name, raw in value.items() if cls._normalize_entry(raw).get("key")}
+
+    @staticmethod
+    def _provenance(entry: Mapping[str, Any]) -> ApiKeyProvenance:
+        try:
+            return ApiKeyProvenance(str(entry.get("source") or "unknown"))
+        except ValueError:
+            return ApiKeyProvenance.UNKNOWN
 
     @staticmethod
     def _normalize_entry(raw: Any) -> dict:

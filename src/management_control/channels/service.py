@@ -400,7 +400,7 @@ class ChannelControl:
 
     @staticmethod
     def parse_url(raw: str) -> ParsedChannelUrl:
-        base, path = split_base_url((raw or "").rstrip("/"))
+        base, path = split_base_url((raw or "").strip().rstrip("/"))
         detected = detect_suffix_protocol(path) if path else None
         return ParsedChannelUrl(
             base_url=base,
@@ -431,6 +431,13 @@ class ChannelControl:
             protocols=tuple(ChannelProtocol),
             compatibility_modes=tuple(CompatibilityMode),
             features=("context1m", "fast", "omitTemperature", "omitThinking", "ccMimicry"),
+        )
+
+    @staticmethod
+    def _canonical_models(models: tuple[ChannelModel, ...]) -> tuple[ChannelModel, ...]:
+        return tuple(
+            ChannelModel(real=model.real.strip(), alias=model.alias.strip())
+            for model in models
         )
 
     @staticmethod
@@ -471,16 +478,18 @@ class ChannelControl:
                 ManagementErrorCode.VALIDATION_FAILED,
                 fields=(ErrorField("name", "invalid_length", "Channel name must be 1 to 64 characters"),),
             )
-        if len(command.api_key.strip()) < 5:
+        api_key = command.api_key.strip()
+        if len(api_key) < 5:
             raise ManagementError(
                 ManagementErrorCode.VALIDATION_FAILED,
                 fields=(ErrorField("apiKey", "too_short", "API key is too short"),),
             )
         if command.max_concurrent < 0:
             raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
-        ChannelControl._validate_models(command.models)
-        base_url = command.base_url
-        api_path = command.api_path
+        models = ChannelControl._canonical_models(command.models)
+        ChannelControl._validate_models(models)
+        base_url = command.base_url.strip() if command.base_url is not None else None
+        api_path = command.api_path.strip() if command.api_path is not None else None
         cc_mimicry = command.cc_mimicry
         if command.provider_id or command.provider_preset_id:
             if not command.provider_id or not command.provider_preset_id:
@@ -501,9 +510,9 @@ class ChannelControl:
             "name": name,
             "baseUrl": base_url,
             "apiPath": api_path,
-            "apiKey": command.api_key,
+            "apiKey": api_key,
             "protocol": command.protocol.value,
-            "models": [dict(model) for model in command.models],
+            "models": [dict(model) for model in models],
             "maxConcurrent": command.max_concurrent,
             "cc_mimicry": bool(
                 command.protocol is ChannelProtocol.ANTHROPIC
@@ -545,9 +554,9 @@ class ChannelControl:
     def _patch_from_update(command: ChannelUpdateCommand) -> dict[str, Any]:
         patch: dict[str, Any] = {}
         values = {
-            "name": command.name,
-            "baseUrl": command.base_url,
-            "apiKey": command.api_key,
+            "name": command.name.strip() if command.name is not None else None,
+            "baseUrl": command.base_url.strip() if command.base_url is not None else None,
+            "apiKey": command.api_key.strip() if command.api_key is not None else None,
             "protocol": command.protocol.value if command.protocol else None,
             "maxConcurrent": command.max_concurrent,
             "cc_mimicry": command.cc_mimicry,
@@ -557,10 +566,13 @@ class ChannelControl:
         }
         patch.update({key: value for key, value in values.items() if value is not None})
         if command.models is not None:
-            ChannelControl._validate_models(command.models)
-            patch["models"] = [dict(model) for model in command.models]
+            models = ChannelControl._canonical_models(command.models)
+            ChannelControl._validate_models(models)
+            patch["models"] = [dict(model) for model in models]
         if command.api_path is not _UNSET:
-            patch["apiPath"] = command.api_path
+            patch["apiPath"] = (
+                command.api_path.strip() if command.api_path is not None else None
+            )
         if command.provider_id is not _UNSET:
             patch["providerId"] = command.provider_id
         if command.provider_preset_id is not _UNSET:
