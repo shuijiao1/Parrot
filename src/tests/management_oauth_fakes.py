@@ -76,7 +76,7 @@ class InMemoryOAuthBackend(OAuthBackend):
                 "channel_key": "oauth:openai:admin@example.test:workspace-1",
                 "model": "gpt-beta",
                 "cooldown_until": -1,
-                "last_error": "fake failure",
+                "last_error_message": "fake failure",
             }
         ]
         self.settings = [False, 60, 95.0, "disabled"]

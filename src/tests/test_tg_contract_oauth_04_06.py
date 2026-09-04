@@ -138,19 +138,87 @@ def _run_oa04(case, monkeypatch):
         action = {"openai": "oa_openai_code", "xai": "oa_xai_code", "antigravity": "oa_antigravity_code"}[provider]
         states.set_state(42, action, {"code_verifier": "fake-verifier", "state": "fake-state", "token_endpoint": "https://fake.invalid/token", "redirect_uri": "http://localhost/fake"})
         _patch_save(env, monkeypatch)
+        provider_calls = []
         if provider == "openai":
-            monkeypatch.setattr(openai_provider, "exchange_code_sync", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fake exchange failure")) if case["entry"].get("failure") else {"id_token": "fake-id", "access_token": "fake-access", "refresh_token": "fake-refresh"})
+            def exchange_openai_code(
+                code: str,
+                code_verifier: str,
+                *,
+                redirect_uri: str | None = None,
+            ) -> dict:
+                provider_calls.append((code, code_verifier, redirect_uri))
+                if case["entry"].get("failure"):
+                    raise RuntimeError("fake exchange failure")
+                return {
+                    "id_token": "fake-id",
+                    "access_token": "fake-access",
+                    "refresh_token": "fake-refresh",
+                }
+
+            monkeypatch.setattr(openai_provider, "exchange_code_sync", exchange_openai_code)
             monkeypatch.setattr(om, "_finish_openai_add", lambda chat, token, source: env.events.append(["finish", "openai", source, sorted(token)]))
             fn = om.on_login_openai_code_input
+            expected_call = ("fake-code", "fake-verifier", None)
         elif provider == "xai":
-            monkeypatch.setattr(xai_provider, "exchange_code_sync", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fake exchange failure")) if case["entry"].get("failure") else {"email": "xai@fake.invalid", "subject": "fake-sub", "access_token": "fake-access", "refresh_token": "fake-refresh"})
+            def exchange_xai_code(
+                code: str,
+                code_verifier: str,
+                *,
+                redirect_uri: str | None = None,
+                token_endpoint: str | None = None,
+            ) -> dict:
+                provider_calls.append((code, code_verifier, redirect_uri, token_endpoint))
+                if case["entry"].get("failure"):
+                    raise RuntimeError("fake exchange failure")
+                return {
+                    "email": "xai@fake.invalid",
+                    "subject": "fake-sub",
+                    "access_token": "fake-access",
+                    "refresh_token": "fake-refresh",
+                }
+
+            monkeypatch.setattr(xai_provider, "exchange_code_sync", exchange_xai_code)
             monkeypatch.setattr(om, "_finish_xai_add", lambda chat, token, source: env.events.append(["finish", "xai", source, sorted(token)]))
             fn = om.on_login_xai_code_input
+            expected_call = (
+                "fake-code",
+                "fake-verifier",
+                "http://localhost/fake",
+                "https://fake.invalid/token",
+            )
         else:
-            monkeypatch.setattr(antigravity_provider, "complete_login_sync", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fake exchange failure")) if case["entry"].get("failure") else {"email": "ag@fake.invalid", "project_id": "fake-project", "access_token": "fake-access", "refresh_token": "fake-refresh"})
+            def complete_antigravity_login(
+                code: str,
+                *,
+                redirect_uri: str | None = None,
+                token_endpoint: str | None = None,
+            ) -> dict:
+                provider_calls.append((code, redirect_uri, token_endpoint))
+                if case["entry"].get("failure"):
+                    raise RuntimeError("fake exchange failure")
+                return {
+                    "email": "ag@fake.invalid",
+                    "project_id": "fake-project",
+                    "access_token": "fake-access",
+                    "refresh_token": "fake-refresh",
+                }
+
+            monkeypatch.setattr(antigravity_provider, "complete_login_sync", complete_antigravity_login)
             monkeypatch.setattr(om, "_finish_antigravity_add", lambda chat, token, source: env.events.append(["finish", "antigravity", source, sorted(token)]))
             fn = om.on_login_antigravity_code_input
-        fn(42, case["entry"].get("text", "http://localhost/fake?code=fake-code&state=fake-state"))
+            expected_call = (
+                "fake-code",
+                "http://localhost/fake",
+                "https://fake.invalid/token",
+            )
+        submitted_text = case["entry"].get(
+            "text", "http://localhost/fake?code=fake-code&state=fake-state",
+        )
+        fn(42, submitted_text)
+        expected_calls = [] if "state=wrong-state" in submitted_text else [expected_call]
+        assert provider_calls == expected_calls, (
+            f"{provider} provider parameters drifted: {provider_calls!r}"
+        )
         return actual(case, env, state_steps=[env.state_snapshot("code")])
     if op == "refresh_token_input":
         provider = case["entry"]["provider"]
@@ -164,23 +232,61 @@ def _run_oa04(case, monkeypatch):
     if op == "cursor_done":
         _start_provider(env, monkeypatch, "cursor")
         status = case["entry"]["status"]
+        poll_calls: list[tuple[str, str]] = []
+        profile_calls: list[tuple[str, str, float]] = []
+        tokens = SimpleNamespace(
+            access_token="fake-cursor-access",
+            refresh_token="fake-cursor-refresh",
+            expires_at_ms=1_800_000_000_000,
+        )
+
+        def poll_cursor_login(login_uuid: str, verifier: str):
+            poll_calls.append((login_uuid, verifier))
+            if status == "pending":
+                raise cursor_provider.CursorAuthPending("fake pending")
+            if status == "failure":
+                raise RuntimeError("fake poll failure")
+            return tokens
+
+        monkeypatch.setattr(cursor_provider, "poll_login_once", poll_cursor_login)
         if status == "expired":
             state = states.get_state(42); state["data"]["created_at"] = FAKE_NOW - 901
         elif status == "missing":
             states.pop_state(42)
-        elif status == "pending":
-            monkeypatch.setattr(cursor_provider, "poll_login_once", lambda *a: (_ for _ in ()).throw(cursor_provider.CursorAuthPending("fake pending")))
-        elif status == "failure":
-            monkeypatch.setattr(cursor_provider, "poll_login_once", lambda *a: (_ for _ in ()).throw(RuntimeError("fake poll failure")))
         elif status == "success":
-            tokens = SimpleNamespace(access_token="fake-cursor-access", refresh_token="fake-cursor-refresh", expires_at_ms=1_800_000_000_000)
-            monkeypatch.setattr(cursor_provider, "poll_login_once", lambda *a: tokens)
             monkeypatch.setattr(cursor_provider, "subject_from_access_token", lambda token: "fake-cursor-subject")
-            monkeypatch.setattr(cursor_provider, "fetch_profile_sync", lambda *a, **k: {"email": "cursor-login@fake.invalid", "name": "Fake Cursor", "id": "fake-profile", "email_verified": True})
+
+            def fetch_cursor_profile(
+                access_token: str,
+                *,
+                account_key: str = "",
+                timeout: float = 20.0,
+            ) -> dict:
+                profile_calls.append((access_token, account_key, timeout))
+                return {
+                    "email": "cursor-login@fake.invalid",
+                    "name": "Fake Cursor",
+                    "id": "fake-profile",
+                    "email_verified": True,
+                }
+
+            monkeypatch.setattr(cursor_provider, "fetch_profile_sync", fetch_cursor_profile)
             monkeypatch.setattr(cursor_provider, "fetch_usage_sync", lambda token: {"cursor": {"plan_name": "Fake Pro", "subscription_status": "active"}})
             _patch_save(env, monkeypatch)
             monkeypatch.setattr(om, "_save_usage_to_quota_cache", lambda *a, **k: env.events.append(["cursor_usage_saved", a[0]]) or None)
         om.on_login_cursor_done(42, 100, "cb-cursor-done")
+        expected_poll_calls = [] if status in {"missing", "expired"} else [
+            ("fake-cursor-uuid", "fake-cursor-verifier")
+        ]
+        assert poll_calls == expected_poll_calls, (
+            f"cursor provider parameters drifted: {poll_calls!r}"
+        )
+        expected_profile_calls = [
+            ("fake-cursor-access", "cursor:fake-cursor-subject", 20.0)
+        ] if status == "success" else []
+        assert profile_calls == expected_profile_calls, (
+            f"cursor profile parameters drifted: {profile_calls!r}"
+        )
         return actual(case, env, state_steps=[env.state_snapshot("done")])
     raise AssertionError(op)
 
@@ -328,3 +434,104 @@ RUNNERS = {"TG-OA-04": _run_oa04, "TG-OA-05": _run_oa05, "TG-OA-06": _run_oa06}
 @pytest.mark.parametrize("case", CASES, ids=lambda item: item["caseId"])
 def test_oauth_04_06_strict_trace(case, monkeypatch):
     check_trace(case, RUNNERS[case["capabilityId"]](case, monkeypatch))
+
+
+@pytest.mark.parametrize(
+    ("case_id", "control_method", "mutation", "failure_message"),
+    (
+        (
+            "TG-OA-04.openai_code_success",
+            "openai_exchange_code",
+            "openai",
+            "openai provider parameters drifted",
+        ),
+        (
+            "TG-OA-04.xai_code_success",
+            "xai_exchange_code",
+            "xai",
+            "xai provider parameters drifted",
+        ),
+        (
+            "TG-OA-04.antigravity_code_success",
+            "antigravity_complete_login",
+            "antigravity",
+            "antigravity provider parameters drifted",
+        ),
+        (
+            "TG-OA-04.cursor_done_success",
+            "cursor_poll_login",
+            "cursor_poll",
+            "cursor provider parameters drifted",
+        ),
+        (
+            "TG-OA-04.cursor_done_success",
+            "cursor_profile",
+            "cursor_profile",
+            "cursor profile parameters drifted",
+        ),
+    ),
+    ids=("openai", "xai", "antigravity", "cursor-poll", "cursor-profile"),
+)
+def test_oauth_04_wrong_provider_parameters_are_rejected(
+    case_id,
+    control_method,
+    mutation,
+    failure_message,
+    monkeypatch,
+):
+    case = next(item for item in CASES if item["caseId"] == case_id)
+    original = getattr(om.oauth_control, control_method)
+
+    if mutation == "openai":
+        def mutate_openai(code, code_verifier, *, redirect_uri=None):
+            return original(
+                "WRONG-CODE",
+                "WRONG-VERIFIER",
+                redirect_uri="wrong://redirect",
+            )
+
+        mutated = mutate_openai
+    elif mutation == "xai":
+        def mutate_xai(
+            code,
+            code_verifier,
+            *,
+            redirect_uri=None,
+            token_endpoint=None,
+        ):
+            return original(
+                "WRONG-CODE",
+                "WRONG-VERIFIER",
+                redirect_uri="wrong://redirect",
+                token_endpoint="wrong://token",
+            )
+
+        mutated = mutate_xai
+    elif mutation == "antigravity":
+        def mutate_antigravity(code, *, redirect_uri=None, token_endpoint=None):
+            return original(
+                "WRONG-CODE",
+                redirect_uri="wrong://redirect",
+                token_endpoint="wrong://token",
+            )
+
+        mutated = mutate_antigravity
+    elif mutation == "cursor_poll":
+        def mutate_cursor_poll(login_uuid, verifier):
+            return original("WRONG-UUID", "WRONG-VERIFIER")
+
+        mutated = mutate_cursor_poll
+    else:
+        def mutate_cursor_profile(access_token, *, account_key="", timeout=20.0):
+            return original(
+                "WRONG-ACCESS-TOKEN",
+                account_key="cursor:wrong-account-key",
+                timeout=timeout,
+            )
+
+        mutated = mutate_cursor_profile
+
+    monkeypatch.setattr(om.oauth_control, control_method, mutated)
+    with pytest.raises(AssertionError, match=failure_message):
+        observed = _run_oa04(case, monkeypatch)
+        check_trace(case, observed)

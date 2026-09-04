@@ -157,13 +157,21 @@ def test_public_text_and_operation_results_use_exact_known_fields(tmp_path):
     client, headers, _, _, backend = auth_client(tmp_path)
     try:
         ordinary = "Bearer provider routing is enabled; Basic tier remains active"
-        backend.cooldowns[0]["last_error"] = ordinary
+        backend.cooldowns[0]["last_error_message"] = ordinary
+        backend.cooldowns[0]["last_error"] = "obsolete fake-only shape"
         response = request(
             client, "GET", f"/oauth/accounts/{ACCOUNT_ID}", None, headers,
         )
         assert response.status_code == 200
         assert response.json()["data"]["runtimeErrors"][0]["message"] == ordinary
-        assert backend.cooldowns[0]["last_error"] == ordinary
+        assert backend.cooldowns[0]["last_error_message"] == ordinary
+
+        backend.cooldowns[0].pop("last_error_message")
+        legacy_only = request(
+            client, "GET", f"/oauth/accounts/{ACCOUNT_ID}", None, headers,
+        )
+        assert legacy_only.status_code == 200
+        assert legacy_only.json()["data"]["runtimeErrors"][0]["message"] is None
 
         secret = "SENTINEL-CREDENTIAL-987654"
         backend.sync_result = {

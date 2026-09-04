@@ -334,7 +334,11 @@ class OAuthControl(
             runtime_errors.append(
                 OAuthRuntimeError(
                     model_id=str(entry.get("model")) if entry.get("model") else None,
-                    message=sanitize_text(entry.get("last_error")) if entry.get("last_error") else None,
+                    message=(
+                        sanitize_text(entry.get("last_error_message"))
+                        if entry.get("last_error_message")
+                        else None
+                    ),
                     cooldown_until=utc_datetime(until),
                     cooldown_permanent=until == -1,
                 )
