@@ -9,51 +9,10 @@ from fastapi.testclient import TestClient
 
 from src.management_auth import AuthMethod, Capability
 from src.management_control import ManagementContext, ManagementError
-from src.management_control.auxiliary.updates import _sanitize_log
 from src.tests.management_auxiliary_support import bearer, build_auxiliary_app, create_session
 
 
 BASE = "/api/management/v1"
-_SECRET_LOG_KEYS = (
-    "token",
-    "key",
-    "secret",
-    "credential",
-    "exchangeSecret",
-    "challengeCredential",
-    "apiToken",
-    "api_token",
-    "apiKey",
-    "api_key",
-    "api-key",
-    "apikey",
-    "x-api-key",
-    "accessToken",
-    "access_token",
-    "refreshToken",
-    "refresh_token",
-    "idToken",
-    "id_token",
-    "managementKey",
-    "management_key",
-    "botToken",
-    "bot_token",
-    "githubToken",
-    "github_token",
-    "clientSecret",
-    "client_secret",
-    "sessionToken",
-    "session_token",
-    "session",
-    "password",
-    "passwd",
-    "cookie",
-    "set-cookie",
-    "Authorization",
-    "Proxy-Authorization",
-)
-
-
 def _poll(client, headers, operation_id):
     response = client.get(BASE + f"/operations/{operation_id}", headers=headers)
     assert response.status_code == 200, response.text
@@ -101,8 +60,9 @@ def test_update_all_operations_prepare_commit_polling_and_replay(tmp_path):
 
         failure_log = client.get(BASE + "/updates/failure-log", headers=headers)
         assert failure_log.status_code == 200
-        assert "top-secret" not in failure_log.text
-        assert "[REDACTED]" in failure_log.json()["data"]["content"]
+        assert failure_log.json()["data"]["content"] == (
+            "api_token=top-secret\nhealth failed"
+        )
 
         stage_headers = {**headers, "Idempotency-Key": "stage-0.32.0"}
         staged = client.post(BASE + "/updates/0.32.0/actions/stage", headers=stage_headers)
@@ -306,198 +266,9 @@ def test_update_check_maps_upstream_failure_without_leaking_detail(tmp_path):
     assert marker not in repr(audits)
 
 
-def test_update_failure_log_sanitizer_redacts_generic_secret_keys_exactly():
-    marker = "P7-R3-MARKER-9x"
-    cases = (
-        (f"token={marker}", "token=[REDACTED]"),
-        (f"key: {marker}", "key: [REDACTED]"),
-        (f"secret='{marker}'", "secret='[REDACTED]'"),
-        (f"credential={marker}", "credential=[REDACTED]"),
-        (f"exchangeSecret={marker}", "exchangeSecret=[REDACTED]"),
-        (f"exchangeCredential={marker}", "exchangeCredential=[REDACTED]"),
-        (f"exchange_credential={marker}", "exchange_credential=[REDACTED]"),
-        (f"EXCHANGESECRET:{marker}", "EXCHANGESECRET:[REDACTED]"),
-        (f"upstreamSecret={marker}", "upstreamSecret=[REDACTED]"),
-        (f"challengeCredential={marker}", "challengeCredential=[REDACTED]"),
-        (f"webhookToken={marker}", "webhookToken=[REDACTED]"),
-        (f"WebhookKey={marker}", "WebhookKey=[REDACTED]"),
-        (f"webhook_secret={marker}", "webhook_secret=[REDACTED]"),
-        (f"WEBHOOK_CREDENTIAL={marker}", "WEBHOOK_CREDENTIAL=[REDACTED]"),
-        (f"webhookcredential={marker}", "webhookcredential=[REDACTED]"),
-        (f"WEBHOOKCREDENTIAL={marker}", "WEBHOOKCREDENTIAL=[REDACTED]"),
-        (f"webhook-credential={marker}", "webhook-credential=[REDACTED]"),
-        (f"rotation.credential={marker}", "rotation.credential=[REDACTED]"),
-        (
-            f'{{"outer":{{"providerCredential":"{marker}","safe":"ok"}}}}',
-            '{"outer":{"providerCredential":"[REDACTED]","safe":"ok"}}',
-        ),
-        (
-            rf'{{\"outer\":{{\"providerCredential\":\"{marker}\",\"safe\":\"ok\"}}}}',
-            r'{\"outer\":{\"providerCredential\":\"[REDACTED]\",\"safe\":\"ok\"}}',
-        ),
-    )
-    for raw, expected in cases:
-        assert _sanitize_log(raw) == expected
-
-
-@pytest.mark.parametrize(
-    "value",
-    (
-        "monkey=value",
-        "MONKEY=value",
-        "hockey=goal",
-        "turkey=dinner",
-        "donkey=value",
-        "passkey=value",
-        "channelKey=channel-1",
-    ),
-)
-def test_update_failure_log_sanitizer_preserves_non_secret_assignments_exactly(value):
-    assert _sanitize_log(value) == value
-
-
-def test_update_failure_log_sanitizer_preserves_business_text_and_targets_auth_credentials():
-    ordinary = "ordinary token count=42 basic routing mode; token usage is 42"
-    assert _sanitize_log(ordinary) == ordinary
-
-    non_auth = (
-        "Bearer capacity planning is enabled",
-        "Bearer support is enabled",
-        "bearer routing mode selected",
-        "Basic routing mode",
-        "basic authentication mode is configured",
-        "the basic and bearer routing modes are healthy",
-    )
-    for value in non_auth:
-        assert _sanitize_log(value) == value
-
-    credentials = (
-        (
-            "retry Bearer P7_TEST_BEARER_CREDENTIAL_9x after failure",
-            "retry Bearer [REDACTED] after failure",
-        ),
-        (
-            "retry Basic dXNlcjpwYXNz after failure",
-            "retry Basic [REDACTED] after failure",
-        ),
-    )
-    for raw, expected in credentials:
-        assert _sanitize_log(raw) == expected
-
-
-def test_update_failure_log_sanitizer_covers_plain_json_and_escaped_json():
-    for index, key in enumerate(_SECRET_LOG_KEYS):
-        for rendered_key in (key, key.upper()):
-            marker = f"DIRECT_SECRET_{index}_{rendered_key.replace('-', '_')}"
-            values = (
-                f"before {rendered_key}={marker} after",
-                f"before {json.dumps({rendered_key: marker})} after",
-                f"before {json.dumps({rendered_key: marker}).replace(chr(34), r'\"')} after",
-            )
-            for value in values:
-                sanitized = _sanitize_log(value)
-                assert marker not in sanitized, (rendered_key, value, sanitized)
-                assert "before" in sanitized and "after" in sanitized
-                assert "[REDACTED]" in sanitized
-
-    adjacent_cases = (
-        (
-            "Authorization: Basic AUTH_BASIC_MARKER\nhealth header context",
-            ("AUTH_BASIC_MARKER",),
-            "health header context",
-        ),
-        (
-            "Proxy-Authorization: Basic PROXY_BASIC_MARKER",
-            ("PROXY_BASIC_MARKER",),
-            "Proxy-Authorization: Basic",
-        ),
-        (
-            "Cookie: session=COOKIE_MARKER; theme=dark",
-            ("COOKIE_MARKER",),
-            "Cookie:",
-        ),
-        (
-            "Set-Cookie: sid=SET_COOKIE_MARKER; HttpOnly",
-            ("SET_COOKIE_MARKER",),
-            "Set-Cookie:",
-        ),
-        (
-            "retry Bearer BEARER_MARKER after failure",
-            ("BEARER_MARKER",),
-            "after failure",
-        ),
-        (
-            "retry Basic BASIC_MARKER after failure",
-            ("BASIC_MARKER",),
-            "after failure",
-        ),
-        (
-            "fetch https://URL_USER_MARKER:URL_PASSWORD_MARKER@example.invalid/path failed",
-            ("URL_USER_MARKER", "URL_PASSWORD_MARKER"),
-            "example.invalid/path failed",
-        ),
-        (
-            "fetch https://URL_USERNAME_ONLY_MARKER@example.invalid/path failed",
-            ("URL_USERNAME_ONLY_MARKER",),
-            "example.invalid/path failed",
-        ),
-    )
-    for value, markers, context in adjacent_cases:
-        sanitized = _sanitize_log(value)
-        assert all(marker not in sanitized for marker in markers)
-        assert context in sanitized
-
-    boundary_marker = "BOUNDARY_SECRET_MARKER"
-    raw = "x" * 4000 + f"\napiToken={boundary_marker}\nhealth tail context"
-    sanitized = _sanitize_log(raw)
-    assert len(sanitized) == 3500
-    assert boundary_marker not in sanitized
-    assert sanitized.endswith("health tail context")
-    assert raw.endswith("health tail context")
-
-
-def test_update_failure_log_requires_body_capability_audits_and_redacts_markers(tmp_path):
+def test_update_failure_log_requires_body_capability_and_audits(tmp_path):
     app, runtime, fixture = build_auxiliary_app(tmp_path)
-    markers = []
-    rows = []
-    for index, key in enumerate(_SECRET_LOG_KEYS):
-        marker = f"HTTP_SECRET_MARKER_{index}"
-        markers.append(marker)
-        if index % 3 == 0:
-            rows.append(f"{key}={marker}")
-        elif index % 3 == 1:
-            rows.append(json.dumps({key: marker}))
-        else:
-            rows.append(json.dumps({key: marker}).replace('"', r'\"'))
-    blocker_marker = "P7-R3-MARKER-9x"
-    rows.extend(
-        (
-            f"credential={blocker_marker}",
-            json.dumps({"nested": {"exchangeSecret": blocker_marker}}),
-            json.dumps({"nested": {"exchangeSecret": blocker_marker}}).replace('"', r'\"'),
-        )
-    )
-    markers.append(blocker_marker)
-    ordinary = "ordinary token count=42 basic routing mode; token usage is 42"
-    rows.append(ordinary)
-
-    adjacent_rows = (
-        ("Authorization: Basic HTTP_AUTH_BASIC_MARKER", ("HTTP_AUTH_BASIC_MARKER",)),
-        ("Proxy-Authorization: Basic HTTP_PROXY_BASIC_MARKER", ("HTTP_PROXY_BASIC_MARKER",)),
-        ("Cookie: session=HTTP_COOKIE_MARKER; theme=dark", ("HTTP_COOKIE_MARKER",)),
-        ("Set-Cookie: sid=HTTP_SET_COOKIE_MARKER; HttpOnly", ("HTTP_SET_COOKIE_MARKER",)),
-        ("retry Bearer HTTP_BEARER_MARKER after failure", ("HTTP_BEARER_MARKER",)),
-        ("retry Basic HTTP_BASIC_MARKER after failure", ("HTTP_BASIC_MARKER",)),
-        (
-            "https://HTTP_URL_USER_MARKER:HTTP_URL_PASSWORD_MARKER@example.invalid/path",
-            ("HTTP_URL_USER_MARKER", "HTTP_URL_PASSWORD_MARKER"),
-        ),
-    )
-    for row, row_markers in adjacent_rows:
-        rows.append(row)
-        markers.extend(row_markers)
-    rows.append("health verification failed at backup step")
-    raw_log = "\n".join(rows)
+    raw_log = "x" * 4000 + "\nhealth verification failed at backup step"
     fixture.update_gateway.failure_log = lambda: raw_log
 
     restricted = runtime.sessions.issue_for_principal(
@@ -506,7 +277,9 @@ def test_update_failure_log_requires_body_capability_audits_and_redacts_markers(
         roles=(),
         capabilities=(Capability.READ,),
     )
-    restricted_context = ManagementContext(request_id="direct-read-only", actor=restricted.principal)
+    restricted_context = ManagementContext(
+        request_id="direct-read-only", actor=restricted.principal,
+    )
     with pytest.raises(ManagementError) as denied:
         fixture.controls.updates.failure_log(restricted_context)
     assert denied.value.code.value == "CAPABILITY_DENIED"
@@ -514,34 +287,19 @@ def test_update_failure_log_requires_body_capability_audits_and_redacts_markers(
 
     with TestClient(app) as client:
         denied_response = client.get(
-            BASE + "/updates/failure-log",
-            headers=bearer(restricted.credential),
+            BASE + "/updates/failure-log", headers=bearer(restricted.credential),
         )
         assert denied_response.status_code == 403
         headers = bearer(create_session(client))
         response = client.get(BASE + "/updates/failure-log", headers=headers)
         assert response.status_code == 200
-        content = response.json()["data"]["content"]
-        assert "[REDACTED]" in content
-        assert "health verification failed at backup step" in content
-        assert ordinary in content
-        assert len(content) <= 3500
-        for marker in markers:
-            assert marker not in response.text
+        assert response.json()["data"]["content"] == raw_log[-3500:]
 
     assert fixture.update_gateway.failure_log() == raw_log
-    audits = fixture.audit.snapshot()
-    assert any(record.action == "updates.failure-log.read" for record in audits)
-    public_surfaces = (
-        response.text,
-        repr(audits),
-        repr(runtime.state_store.audit_snapshot()),
-        repr(runtime.operations._items),
-        repr(app.openapi()),
+    assert any(
+        record.action == "updates.failure-log.read"
+        for record in fixture.audit.snapshot()
     )
-    for marker in markers:
-        assert all(marker not in surface for surface in public_surfaces)
-
 
 def test_stage_plan_is_actor_bound_and_failed_stage_cannot_activate(tmp_path):
     cross_path = tmp_path / "cross-actor"

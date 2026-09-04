@@ -16,6 +16,7 @@ from src.management_auth.principal import Capability
 
 from .context import AuditSink, ManagementContext, audit_record
 from .errors import ManagementError, ManagementErrorCode
+from .public_safety import redact_known_fields
 
 
 class OperationStatus(str, Enum):
@@ -33,43 +34,19 @@ _TERMINAL = {
 }
 
 
-class PublicIdentifier(str):
-    """Explicit marker for a reviewed public identifier in an Operation DTO."""
-
-
-_SENSITIVE_KEYS = {
-    "apikey",
-    "accesstoken",
-    "refreshtoken",
-    "credential",
-    "exchangesecret",
-    "managementkey",
-    "password",
-    "secret",
-    "sessiontoken",
-    "token",
-}
-
-
-def _public_value(value: Any) -> Any:
-    """Recursively redact credential-shaped fields before they reach a store."""
+def _coerce_public_value(value: Any) -> Any:
     if isinstance(value, Mapping):
-        public: dict[str, Any] = {}
-        for key, item in value.items():
-            normalized = "".join(ch for ch in str(key).lower() if ch.isalnum())
-            public[str(key)] = (
-                str(item)
-                if normalized in _SENSITIVE_KEYS and isinstance(item, PublicIdentifier)
-                else "[REDACTED]"
-                if normalized in _SENSITIVE_KEYS
-                else _public_value(item)
-            )
-        return public
+        return {str(key): _coerce_public_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_public_value(item) for item in value]
+        return [_coerce_public_value(item) for item in value]
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
+
+
+def _public_value(value: Any) -> Any:
+    """Keep Operation results serializable after exact known-field redaction."""
+    return _coerce_public_value(redact_known_fields(value))
 
 
 @dataclass(frozen=True, slots=True)

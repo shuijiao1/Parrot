@@ -218,8 +218,10 @@ def test_runtime_fastest_excludes_temporary_and_permanent_cooldown_pairs(cooldow
     assert [item["model"] for item in fastest] == ["available-model"]
 
 
-def test_runtime_error_and_message_fields_are_secret_safe_and_preserve_business_text():
-    marker = "P4_SECRET_MARKER"
+def test_runtime_error_and_message_fields_preserve_business_text():
+    disabled_reason = "Bearer provider routing is unavailable"
+    cooldown_message = "Basic tier is temporarily unavailable"
+    alert_message = "Bearer support is enabled"
 
     class SecretRegistry:
         @staticmethod
@@ -227,7 +229,7 @@ def test_runtime_error_and_message_fields_are_secret_safe_and_preserve_business_
             return [SimpleNamespace(
                 key="api:one", display_name="one", protocol="anthropic",
                 type="api", enabled=False,
-                disabled_reason=f"managementKey={marker}; ordinary disable reason",
+                disabled_reason=disabled_reason,
             )]
 
     class SecretCooldown:
@@ -236,13 +238,11 @@ def test_runtime_error_and_message_fields_are_secret_safe_and_preserve_business_
             return [{
                 "channel_key": "api:one", "model": "model", "error_count": 1,
                 "cooldown_until": -1,
-                "message": f"botToken: {marker}; ordinary cooldown message",
+                "message": cooldown_message,
             }]
 
     class SecretStatusMonitor:
-        snapshot_active = staticmethod(lambda: {
-            "error": f"github_token={marker}; ordinary alert message",
-        })
+        snapshot_active = staticmethod(lambda: {"error": alert_message})
 
     control = StatusControl(
         config=Config(), registry=SecretRegistry(), cooldown=SecretCooldown(), scorer=Scorer(),
@@ -259,7 +259,6 @@ def test_runtime_error_and_message_fields_are_secret_safe_and_preserve_business_
     }
     serialized = json.dumps(exposed, default=str)
 
-    assert marker not in serialized
-    assert "ordinary disable reason" in serialized
-    assert "ordinary cooldown message" in serialized
-    assert "ordinary alert message" in serialized
+    assert disabled_reason in serialized
+    assert cooldown_message in serialized
+    assert alert_message in serialized

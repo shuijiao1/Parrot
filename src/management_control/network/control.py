@@ -19,11 +19,7 @@ from src.management_auth import Capability
 from src.management_control.context import AuditSink, ManagementContext
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
 from src.management_control.models.common import DomainControl, stable_revision
-from src.management_control.operations import (
-    ManagementOperation,
-    OperationStore,
-    PublicIdentifier,
-)
+from src.management_control.operations import ManagementOperation, OperationStore
 
 from .gateway import DEFAULT_NETWORK_GATEWAY, NetworkGateway
 from .models import (
@@ -41,7 +37,6 @@ from .models import (
     Socks5Settings,
 )
 from .security import (
-    MONITOR_PUBLIC_IDENTIFIER_KEYS,
     safe_dns_server,
     safe_network_url,
     sanitize_public_network,
@@ -50,36 +45,6 @@ from .security import (
 
 
 _MONITOR_CATEGORIES = frozenset({"dns", "socks5", "channel", "core"})
-
-
-def _mark_monitor_operation_identifiers(
-    value: Any, *, top_level: bool = True,
-) -> Any:
-    """Expose the check key only; protect every descendant generic key."""
-    if isinstance(value, Mapping):
-        marked: dict[str, Any] = {}
-        for raw_key, item in value.items():
-            key = str(raw_key)
-            if top_level and key == "key":
-                marked[key] = PublicIdentifier(str(item or ""))
-            elif key == "key":
-                marked[key] = "[REDACTED]"
-            else:
-                marked[key] = _mark_monitor_operation_identifiers(
-                    item, top_level=False,
-                )
-        return marked
-    if isinstance(value, list):
-        return [
-            _mark_monitor_operation_identifiers(item, top_level=False)
-            for item in value
-        ]
-    if isinstance(value, tuple):
-        return tuple(
-            _mark_monitor_operation_identifiers(item, top_level=False)
-            for item in value
-        )
-    return value
 
 
 class PlanState(str, Enum):
@@ -268,11 +233,7 @@ class NetworkControl(DomainControl):
     @staticmethod
     def _public_monitor_result(value: Mapping[str, Any]) -> dict[str, Any]:
         """Sanitize untrusted fields without treating public DTO names as secrets."""
-        clean = sanitize_public_network(
-            copy.deepcopy(dict(value)),
-            public_identifier_keys=MONITOR_PUBLIC_IDENTIFIER_KEYS,
-        )
-        clean = _mark_monitor_operation_identifiers(clean)
+        clean = sanitize_public_network(copy.deepcopy(dict(value)))
         category = str(clean.get("category") or "")
         if category not in _MONITOR_CATEGORIES:
             raise NetworkControl._validation(

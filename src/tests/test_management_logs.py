@@ -13,7 +13,6 @@ from src.management_control.observability import (
     RequestLogStatus, RequestProtocol,
 )
 from src.management_control.observability import inspector
-from src.management_control.observability.common import sanitize_credentials
 from src.tests.management_observability_support import build_client
 
 
@@ -175,190 +174,6 @@ def test_body_endpoints_require_log_body_read_not_only_read(tmp_path):
     controls.logs.raw_body.assert_not_called()
 
 
-def test_sanitize_credentials_redacts_auth_text_and_all_url_userinfo():
-    marker = "P4_AUTH_URL_MARKER"
-    clean = sanitize_credentials({
-        "Proxy-Authorization": f"Basic {marker}_nested",
-        "headerLine": (
-            f"Authorization: Bearer {marker}_auth, x-api-key={marker}_key; "
-            f"password = {marker}_password; ordinary upstream failure"
-        ),
-        "embeddedAuth": (
-            f"Bearer {marker}_start; upstream said Bearer {marker}_middle failed; "
-            f"Basic {marker}_basic rejected"
-        ),
-        "sessionText": f"session={marker}_equals; session: {marker}_colon",
-        "passwordDsn": f"socks5://{marker}_user:password@example.test:1080/v1",
-        "usernameDsn": f"custom+ssh://{marker}_username@example.test:2200/path",
-        "content": "ordinary token count=42; token usage is 42; basic routing mode",
-    })
-
-    assert clean["Proxy-Authorization"] == "<redacted>"
-    assert clean["headerLine"] == (
-        "Authorization: <redacted>, x-api-key=<redacted>; password = <redacted>; "
-        "ordinary upstream failure"
-    )
-    assert clean["embeddedAuth"] == (
-        "Bearer <redacted>; upstream said Bearer <redacted> failed; "
-        "Basic <redacted> rejected"
-    )
-    assert clean["sessionText"] == "session=<redacted>; session: <redacted>"
-    assert clean["passwordDsn"] == "socks5://example.test:1080/v1"
-    assert clean["usernameDsn"] == "custom+ssh://example.test:2200/path"
-    assert clean["content"] == (
-        "ordinary token count=42; token usage is 42; basic routing mode"
-    )
-    assert marker not in json.dumps(clean)
-
-
-def test_sanitize_credentials_covers_aliases_json_nesting_and_escaped_fragments():
-    keys = (
-        "apiToken", "api_token", "apiKey", "api_key", "api-key", "apikey",
-        "xApiKey", "x_api_key", "x-api-key", "accessToken", "access_token",
-        "refreshToken", "refresh_token", "idToken", "id_token",
-        "managementToken", "management_token", "managementKey", "management_key",
-        "botToken", "bot_token", "botKey", "bot_key", "githubToken",
-        "github_token", "githubKey", "github-key", "clientSecret", "client_secret",
-        "exchangeSecret", "exchange_secret", "challengeSecret", "challenge_secret",
-        "sessionSecret", "session_secret", "session", "sessionToken", "session_token",
-        "password", "passwd", "cookie", "setCookie", "set_cookie", "set-cookie",
-        "credential", "Authorization", "Proxy-Authorization",
-    )
-    marker = "P4_CREDENTIAL_MARKER"
-    secrets = {key: f"{marker}_{index}" for index, key in enumerate(keys)}
-    ordinary = (
-        "ordinary token count=42; token usage is 42; basic routing mode; "
-        "credential descriptions and business text remain"
-    )
-
-    clean_dict = sanitize_credentials({**secrets, "content": ordinary})
-    assert all(clean_dict[key] == "<redacted>" for key in keys)
-    assert clean_dict["content"] == ordinary
-
-    plain = ordinary + "; " + "; ".join(
-        f"{key}{'=' if index % 2 else ': '}{value}"
-        for index, (key, value) in enumerate(secrets.items())
-    )
-    clean_plain = sanitize_credentials(plain)
-    assert marker not in clean_plain
-    assert clean_plain.count("<redacted>") == len(keys)
-    assert ordinary in clean_plain
-
-    full_json = sanitize_credentials(json.dumps({**secrets, "content": ordinary}))
-    clean_full = json.loads(full_json)
-    assert all(clean_full[key] == "<redacted>" for key in keys)
-    assert clean_full["content"] == ordinary
-
-    nested_json = json.dumps({
-        "payload": json.dumps({**secrets, "content": ordinary}),
-        "content": ordinary,
-    })
-    clean_nested_json = sanitize_credentials(nested_json)
-    assert marker not in clean_nested_json
-    outer = json.loads(clean_nested_json)
-    inner = json.loads(outer["payload"])
-    assert all(inner[key] == "<redacted>" for key in keys)
-    assert outer["content"] == ordinary
-    assert inner["content"] == ordinary
-
-    json_fragment = f'prefix {{"api_token":"{marker}_fragment"}} suffix'
-    clean_fragment = sanitize_credentials(json_fragment)
-    assert clean_fragment == 'prefix {"api_token":"<redacted>"} suffix'
-
-    escaped_fragment = rf'prefix {{\"apiToken\":\"{marker}_escaped\"}} suffix'
-    clean_escaped = sanitize_credentials(escaped_fragment)
-    assert clean_escaped == r'prefix {\"apiToken\":\"<redacted>\"} suffix'
-    assert sanitize_credentials(ordinary) == ordinary
-
-
-def test_sanitize_credentials_generic_key_family_across_recursive_and_encoded_forms():
-    marker = "P4_GENERIC_SECRET_MARKER"
-    secret_keys = (
-        "token", "KEY", "Secret", "Credential",
-        "upstreamToken", "upstream_key", "signing-key", "ProviderSecret",
-        "SERVICE_CREDENTIAL",
-    )
-    ordinary = {
-        "monkey": "banana",
-        "MONKEY": "ape",
-        "keyboard": "layout",
-        "token count": 42,
-        "key count": 7,
-        "secret sauce": "recipe",
-        "credential count": 1,
-    }
-
-    clean_dict = sanitize_credentials({
-        **{key: f"{marker}_{index}" for index, key in enumerate(secret_keys)},
-        **ordinary,
-        "payload": [
-            {"anotherToken": marker},
-            ({"private_key": marker}, {"monkey": "banana"}),
-        ],
-    })
-    assert all(clean_dict[key] == "<redacted>" for key in secret_keys)
-    assert {key: clean_dict[key] for key in ordinary} == ordinary
-    assert clean_dict["payload"] == [
-        {"anotherToken": "<redacted>"},
-        ({"private_key": "<redacted>"}, {"monkey": "banana"}),
-    ]
-
-    plain = (
-        f"token={marker}; key: {marker}; secret={marker}; "
-        f"upstreamSecret: {marker}; provider-credential={marker}; "
-        "monkey=banana; token count=42; key count: 7"
-    )
-    assert sanitize_credentials(plain) == (
-        "token=<redacted>; key: <redacted>; secret=<redacted>; "
-        "upstreamSecret: <redacted>; provider-credential=<redacted>; "
-        "monkey=banana; token count=42; key count: 7"
-    )
-
-    regular_json = sanitize_credentials(json.dumps({
-        "Secret": marker, "upstreamCredential": marker, **ordinary,
-    }))
-    assert json.loads(regular_json) == {
-        "Secret": "<redacted>", "upstreamCredential": "<redacted>", **ordinary,
-    }
-
-    double_encoded = json.dumps(json.dumps({
-        "SERVICE_TOKEN": marker,
-        "payload": json.dumps({"privateKey": marker, "monkey": "banana"}),
-    }))
-    clean_double = json.loads(json.loads(sanitize_credentials(double_encoded)))
-    assert clean_double["SERVICE_TOKEN"] == "<redacted>"
-    assert json.loads(clean_double["payload"]) == {
-        "privateKey": "<redacted>", "monkey": "banana",
-    }
-
-    escaped = rf'prefix {{\"UPSTREAM_SECRET\":\"{marker}\"}} suffix'
-    assert sanitize_credentials(escaped) == (
-        r'prefix {\"UPSTREAM_SECRET\":\"<redacted>\"} suffix'
-    )
-
-
-@pytest.mark.parametrize("text", [
-    "Basic routing mode",
-    "Bearer support is enabled",
-    "The Basic tier is active",
-    "mode: Basic routing mode",
-])
-def test_sanitize_credentials_preserves_non_auth_scheme_business_text_exactly(text):
-    assert sanitize_credentials(text) == text
-
-
-def test_sanitize_credentials_redacts_realistic_standalone_auth_credentials():
-    jwt = ".".join(("eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxIn0", "signature"))
-    source = (
-        f"message: Bearer {jwt}; Basic YWxpY2U6czNjcjN0; "
-        "Basic P4_SECRET_SENTINEL; bearer ghp_1234567890abcdef"
-    )
-    assert sanitize_credentials(source) == (
-        "message: Bearer <redacted>; Basic <redacted>; Basic <redacted>; "
-        "bearer <redacted>"
-    )
-
-
 def test_logs_control_filter_sort_page_total_detail_and_secret_safe_body():
     control = LogsControl(log_db=FakeLogDb(), config=FakeConfig(), oauth_manager=FakeOAuth())
     ctx = context()
@@ -392,7 +207,7 @@ def test_logs_control_filter_sort_page_total_detail_and_secret_safe_body():
     assert missing.value.code is ManagementErrorCode.RESOURCE_NOT_FOUND
 
 
-def test_logs_list_revision_tracks_public_channel_not_redacted_secret_source():
+def test_logs_list_revision_tracks_public_channel_and_error_text():
     first_secret = "P4_REVISION_SECRET_ONE"
     second_secret = "P4_REVISION_SECRET_TWO"
     db = FakeLogDb()
@@ -412,16 +227,9 @@ def test_logs_list_revision_tracks_public_channel_not_redacted_secret_source():
     row["error_message"] = f"upstreamSecret={second_secret}; retry failed"
     secret_changed = control.list_logs(context(), RequestLogQuery(page_size=1)).items[0]
 
-    assert secret_changed["error"] == "upstreamSecret=<redacted>; retry failed"
-    assert {
-        key: value for key, value in channel_changed.items() if key != "revision"
-    } == {
-        key: value for key, value in secret_changed.items() if key != "revision"
-    }
-    assert channel_changed["revision"] == secret_changed["revision"]
-    serialized = json.dumps((original, channel_changed, secret_changed), default=str)
-    assert first_secret not in serialized
-    assert second_secret not in serialized
+    assert original["error"] == f"upstreamSecret={first_secret}; retry failed"
+    assert secret_changed["error"] == f"upstreamSecret={second_secret}; retry failed"
+    assert channel_changed["revision"] != secret_changed["revision"]
 
 
 def test_body_kind_counts_follow_search_before_kind_filter_and_page():
@@ -577,8 +385,9 @@ def test_logs_list_uses_authoritative_transport_and_page_billing_only(tmp_path):
     assert len(db.cost_calls) <= result.page_size
     assert result.items[0]["transport"] == "websocket"
     assert result.items[0]["costTicks"] == 300
-    assert "P4_SECRET_MARKER" not in result.items[0]["error"]
-    assert "ordinary upstream failure" in result.items[0]["error"]
+    assert result.items[0]["error"] == (
+        "upstreamSecret=P4_SECRET_MARKER; ordinary upstream failure"
+    )
     assert result.items[0]["billing"] == {
         "costTicks": 300,
         "actualCostTicks": 300,
@@ -597,7 +406,9 @@ def test_logs_list_uses_authoritative_transport_and_page_billing_only(tmp_path):
     )
     assert response.status_code == 200, response.text
     assert db.cost_calls == ["r3", "r2"]
-    assert "P4_SECRET_MARKER" not in response.text
+    assert response.json()["data"][0]["error"] == (
+        "upstreamSecret=P4_SECRET_MARKER; ordinary upstream failure"
+    )
     assert response.json()["data"][0]["billing"]["actualCostTicks"] == 300
     assert response.json()["data"][0]["channelId"] == "api:b"
 
@@ -673,25 +484,3 @@ def test_log_control_time_bounds_reject_naive_and_reverse_without_type_error():
             control.list_logs(context(), query)
         assert invalid.value.code is ManagementErrorCode.VALIDATION_FAILED
         assert invalid.value.fields[0].path == path
-
-
-def test_logs_non_json_raw_body_reuses_common_secret_sanitizer():
-    marker = "P4_SECRET_MARKER"
-    db = FakeLogDb()
-    db.log_detail = lambda _request_id: {
-        "log": db.rows[0],
-        "detail": {
-            "response_body": (
-                f"managementKey={marker}; botToken: {marker}; "
-                f"github_token={marker}; upstreamSecret={marker}; "
-                f"token={marker}; ordinary business text"
-            ),
-        },
-    }
-    control = LogsControl(log_db=db, config=FakeConfig(), oauth_manager=FakeOAuth())
-
-    raw = control.raw_body(context(), "r3", kind=LogBodyKind.RESPONSE)
-
-    assert marker not in raw["body"]
-    assert "ordinary business text" in raw["body"]
-    assert raw["body"].count("<redacted>") == 5

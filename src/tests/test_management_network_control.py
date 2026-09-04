@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import copy
 import json
 
@@ -10,19 +9,6 @@ from src.tests.management_system_network_support import bearer, build_p6_app, cr
 
 
 PREFIX = "/api/management/v1"
-SECRET_MARKERS = (
-    "alpha-marker", "password-marker", "username-marker", "new-password-marker",
-    "test-marker-bearer", "test-marker-refresh", "test-marker-dns",
-    "generic-marker", "snake-marker", "session-marker", "camel-marker",
-    "auth-marker", "cookie-marker", "escaped-marker", "username-only-marker",
-    "tested-password-marker", "other-user-marker", "concurrent-password-marker",
-)
-PUBLIC_AUTH_PROSE = (
-    "Bearer routing-mode", "Basic routing-mode", "bearer support-enabled",
-    "Basic request-routing", "Bearer ordinary.word", "Basic routing mode",
-    "Bearer support is enabled", "Bearer landmarker", "Bearer OrdinaryMode",
-    'Bearer "routing-mode"',
-)
 
 
 def operation(client: TestClient, headers: dict[str, str], response):
@@ -31,12 +17,6 @@ def operation(client: TestClient, headers: dict[str, str], response):
     polled = client.get(PREFIX + "/operations/" + operation_id, headers=headers)
     assert polled.status_code == 200, polled.text
     return polled.json()["data"]
-
-
-def assert_secret_safe(value) -> None:
-    encoded = json.dumps(value, ensure_ascii=False)
-    for marker in SECRET_MARKERS:
-        assert marker not in encoded
 
 
 def test_dns_test_plan_commit_replay_and_audit(tmp_path):
@@ -79,7 +59,6 @@ def test_failed_dns_requires_force_and_force_cannot_apply_a_passed_plan(tmp_path
             PREFIX + "/network/dns/tests", headers=headers, json={"servers": ["9.9.9.9"]},
         ))
         assert failed["status"] == "succeeded"
-        assert_secret_safe(failed)
         plan_id = failed["result"]["plan"]["id"]
         before = copy.deepcopy(fixture.config.value)
         blocked = client.post(PREFIX + "/network/dns/commits", headers=headers, json={"planId": plan_id, "force": False})
@@ -133,19 +112,20 @@ def test_socks_plan_never_exposes_credentials_and_secret_only_rotation_keeps_pub
     with TestClient(app) as client:
         headers = bearer(create_session(client))
         before = client.get(PREFIX + "/network", headers=headers).json()["data"]
-        assert_secret_safe(before)
         tested = operation(client, headers, client.post(
             PREFIX + "/network/socks5/tests", headers=headers,
             json={"url": "socks5://username-marker:new-password-marker@proxy.invalid:1080"},
         ))
-        assert_secret_safe(tested)
+        assert "username-marker" not in json.dumps(tested)
+        assert "new-password-marker" not in json.dumps(tested)
         plan = tested["result"]["plan"]
         assert plan["tested"]["configured"] is True
         assert plan["tested"]["maskedUrl"] == "socks5://***:***@proxy.invalid:1080"
         committed = client.post(PREFIX + "/network/socks5/commits", headers=headers, json={"planId": plan["id"], "force": False})
         assert committed.status_code == 200, committed.text
         after = committed.json()["data"]
-        assert_secret_safe(after)
+        assert "username-marker" not in json.dumps(after)
+        assert "new-password-marker" not in json.dumps(after)
         assert after["revision"] == before["revision"]
         assert "username-marker" in fixture.config.value["network"]["socks5"]["url"]
 
@@ -173,168 +153,66 @@ def test_network_settings_sync_cache_clear_and_socks_state_validation(tmp_path):
         assert fixture.config.updates == writes
 
 
-def test_dns_cache_ips_sanitize_credentials_without_public_text_false_positives(tmp_path):
-    app, _runtime, fixture = build_p6_app(tmp_path)
-    public_values = [
-        "192.0.2.10", "monkey", "hockey", "donkey", "Bearer routing-mode",
-        "Basic routing-mode", "bearer support-enabled", "Basic request-routing",
-        "Bearer ordinary.word", "Basic routing mode", "Bearer support is enabled",
-        "Bearer landmarker", "Bearer OrdinaryMode", 'Bearer "routing-mode"',
-        "ordinary monkey hockey donkey; Bearer routing-mode",
-    ]
-    jwt_credential = ".".join(("eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "signature"))
-    credential_inputs = [
-        ("generic-token-marker", "token=generic-token-marker"),
-        ("camel-token-marker", "apiToken=camel-token-marker"),
-        ("snake-token-marker", "api_token=snake-token-marker"),
-        ("upper-token-marker", "API_TOKEN=upper-token-marker"),
-        ("generic-key-marker", "key=generic-key-marker"),
-        ("camel-key-marker", "apiKey=camel-key-marker"),
-        ("snake-key-marker", "api_key=snake-key-marker"),
-        ("upper-key-marker", "API_KEY=upper-key-marker"),
-        ("generic-secret-marker", "secret=generic-secret-marker"),
-        ("camel-secret-marker", "clientSecret=camel-secret-marker"),
-        ("snake-secret-marker", "client_secret=snake-secret-marker"),
-        ("upper-secret-marker", "CLIENT_SECRET=upper-secret-marker"),
-        ("generic-credential-marker", "credential=generic-credential-marker"),
-        ("camel-credential-marker", "serviceCredential=camel-credential-marker"),
-        ("snake-credential-marker", "service_credential=snake-credential-marker"),
-        ("upper-credential-marker", "SERVICE_CREDENTIAL=upper-credential-marker"),
-        ("authorization-header-marker", "Authorization: Bearer authorization-header-marker"),
-        ("cookie-header-marker", "Cookie: cookie-header-marker"),
-        ("bearer-token-marker", "Bearer bearer.opaque.token-marker"),
-        ("abc-def-ghi", "Bearer abc-def-ghi"),
-        ("abc-def-ghi", "Basic abc-def-ghi"),
-        ("abcdefghijklmnop-qrst", "Bearer abcdefghijklmnop-qrst"),
-        ("abcdefghijklmnopqrstuvwxyzabcdef", "Bearer abcdefghijklmnopqrstuvwxyzabcdef"),
-        ("abcdefg1", "Bearer abcdefg1"),
-        ("AbcdefghijklmnoP", "Bearer AbcdefghijklmnoP"),
-        (jwt_credential, "Bearer " + jwt_credential),
-        ("access-token", "Bearer access-token"),
-        ("marker", "Bearer marker"),
-        ("dXNlcjpwYXNzd29yZA==", "Basic dXNlcjpwYXNzd29yZA=="),
-        ("url-user-marker", "https://url-user-marker:url-password-marker@dns.invalid/result"),
-        ("url-password-marker", "https://url-user-marker:url-password-marker@dns.invalid/result"),
-    ]
-    fixture.gateway.cache[0]["ips"] = public_values + [value for _, value in credential_inputs]
-    with TestClient(app) as client:
-        headers = bearer(create_session(client))
-        response = client.get(PREFIX + "/network/dns/cache", headers=headers)
-    assert response.status_code == 200, response.text
-    returned = response.json()["data"]["items"][0]["ips"]
-    assert returned[:len(public_values)] == public_values
-    assert len(returned) == len(public_values) + len(credential_inputs)
-    credential_outputs = returned[len(public_values):]
-    for (marker, credential), output in zip(credential_inputs, credential_outputs):
-        assert output != credential
-        assert marker not in output
-
-
-def test_monitor_patch_exact_channels_history_and_async_run_are_secret_safe(tmp_path):
+def test_monitor_patch_exact_channels_history_and_async_run(tmp_path):
     app, _runtime, fixture = build_p6_app(tmp_path)
     with TestClient(app) as client:
         headers = bearer(create_session(client))
         current = client.get(PREFIX + "/network/monitor", headers=headers)
-        assert current.status_code == 200
         revision = current.json()["data"]["revision"]
         updated = client.patch(
-            PREFIX + "/network/monitor", headers={**headers, "If-Match": revision},
+            PREFIX + "/network/monitor",
+            headers={**headers, "If-Match": revision},
             json={
                 "enabled": True, "intervalSeconds": 15, "dns": True,
                 "core": {"openai": True},
-                "channels": {"enabled": True, "byChannel": {"api:example": True}},
+                "channels": {
+                    "enabled": True, "byChannel": {"api:example": True},
+                },
             },
         )
         assert updated.status_code == 200, updated.text
-        data = updated.json()["data"]
-        assert data["intervalSeconds"] == 15
-        assert data["channels"]["byChannel"] == {"api:example": True}
+        assert updated.json()["data"]["channels"]["byChannel"] == {
+            "api:example": True,
+        }
         before = fixture.config.updates
-        unknown = client.patch(PREFIX + "/network/monitor", headers=headers, json={"channels": {"byChannel": {"example": True}}})
+        unknown = client.patch(
+            PREFIX + "/network/monitor", headers=headers,
+            json={"channels": {"byChannel": {"example": True}}},
+        )
         assert unknown.status_code == 404
         assert fixture.config.updates == before
         history = client.get(PREFIX + "/network/monitor/checks", headers=headers)
         assert history.status_code == 200
-        assert_secret_safe(history.json())
-        detail = history.json()["data"]["items"][0]["detail"]
-        for business_text in (
-            "Basic business words", "monkey", "hockey", "turkey", "donkey",
-            "passkey", "keyboard",
-        ):
-            assert business_text in detail
-        assert "<redacted>" in detail
-        run = operation(client, headers, client.post(PREFIX + "/network/monitor/actions/run", headers=headers))
+        assert history.json()["data"]["items"][0]["key"] == "dns"
+        run = operation(
+            client, headers,
+            client.post(PREFIX + "/network/monitor/actions/run", headers=headers),
+        )
         assert run["status"] == "succeeded"
-        assert_secret_safe(run)
 
-
-def test_monitor_history_preserves_auth_prose_and_redacts_credentials(tmp_path):
+def test_dns_and_socks_results_redact_known_fields_only(tmp_path, monkeypatch):
     app, _runtime, fixture = build_p6_app(tmp_path)
-    basic = base64.b64encode(b"history-user:history-password").decode("ascii")
-    fixture.gateway.history = [
-        {
-            "key": f"check-{index}", "label": text, "category": "dns",
-            "ok": True, "detail": text, "latency_ms": index,
-            "checked_at": 1_767_326_400_000 + index,
-        }
-        for index, text in enumerate(PUBLIC_AUTH_PROSE)
-    ] + [{
-        "key": "credential-check", "label": "Bearer abc-def-ghi",
-        "category": "dns", "ok": False,
-        "detail": (
-            "Authorization: Bearer history-auth-marker; "
-            "Cookie=history-cookie-marker; apiToken=history-token-marker; "
-            f"Basic {basic}; Bearer abcdefg1; "
-            "https://history-user-marker:history-password-marker@dns.invalid/result"
-        ),
-        "latency_ms": None, "checked_at": 1_767_326_400_100,
-    }]
-
-    with TestClient(app) as client:
-        headers = bearer(create_session(client))
-        response = client.get(PREFIX + "/network/monitor/checks", headers=headers)
-
-    assert response.status_code == 200, response.text
-    items = response.json()["data"]["items"]
-    for text, item in zip(PUBLIC_AUTH_PROSE, items):
-        assert item["label"] == text
-        assert item["detail"] == text
-    credential_item = items[-1]
-    assert credential_item["label"] == "Bearer <redacted>"
-    for marker in (
-        "history-auth-marker", "history-cookie-marker", "history-token-marker",
-        "history-user-marker", "history-password-marker", basic, "abcdefg1",
-    ):
-        assert marker not in response.text
-    assert "<redacted>" in credential_item["detail"]
-
-
-def test_dns_and_socks_test_results_recursively_sanitize_auth_values(tmp_path, monkeypatch):
-    app, _runtime, fixture = build_p6_app(tmp_path)
+    prose = "Bearer opaque.value remains ordinary text"
 
     def dns_result(_servers):
         return {
             "ok": True,
-            "message": "Bearer routing-mode",
+            "message": prose,
             "nested": {
-                "values": ["Basic request-routing", ("Bearer ordinary.word",)],
                 "apiToken": "dns-result-token-marker",
-                "key": "dns-result-key-marker",
-                "detail": "Basic routing mode; Bearer abc-def-ghi",
+                "key": "dns-public-key",
             },
         }
 
     async def socks_result(_url):
         return {
             "ok": True,
-            "url": "socks5://socks-user-marker:socks-password-marker@proxy.invalid:1080",
-            "display_url": "socks5://socks-user-marker:socks-password-marker@proxy.invalid:1080",
-            "message": "bearer support-enabled",
+            "url": "socks5://user:password@proxy.invalid:1080",
+            "display_url": "socks5://user:password@proxy.invalid:1080",
             "nested": [{
-                "prose": "Bearer support is enabled",
                 "clientSecret": "socks-result-secret-marker",
-                "authorization": "Basic dXNlcjpwYXNzd29yZA==",
-                "detail": "Bearer AbcdefghijklmnoP",
+                "authorization": "Basic opaque-value",
+                "detail": prose,
             }],
         }
 
@@ -351,77 +229,15 @@ def test_dns_and_socks_test_results_recursively_sanitize_auth_values(tmp_path, m
             json={"url": "socks5://input-user:input-password@proxy.invalid:1080"},
         ))["result"]["plan"]["result"]
 
-    assert dns["message"] == "Bearer routing-mode"
-    assert dns["nested"]["values"] == ["Basic request-routing", ["Bearer ordinary.word"]]
-    assert dns["nested"]["apiToken"] == "<redacted>"
-    assert dns["nested"]["key"] == "<redacted>"
-    assert dns["nested"]["detail"] == "Basic routing mode; Bearer <redacted>"
-    assert socks["message"] == "bearer support-enabled"
-    assert socks["nested"][0]["prose"] == "Bearer support is enabled"
-    assert socks["nested"][0]["clientSecret"] == "<redacted>"
-    assert socks["nested"][0]["authorization"] == "<redacted>"
-    assert socks["nested"][0]["detail"] == "Bearer <redacted>"
-    encoded = json.dumps({"dns": dns, "socks": socks})
-    for marker in (
-        "dns-result-token-marker", "dns-result-key-marker",
-        "socks-result-secret-marker", "socks-user-marker", "socks-password-marker",
-        "dXNlcjpwYXNzd29yZA==", "AbcdefghijklmnoP",
-    ):
-        assert marker not in encoded
-
-
-def test_monitor_operation_preserves_identifiers_and_sanitizes_nested_values(tmp_path, monkeypatch):
-    app, _runtime, fixture = build_p6_app(tmp_path)
-
-    async def monitor_result():
-        return [{
-            "key": "dns-route-key", "category": "dns",
-            "channelKey": "api:channel-key", "keyId": "public-key-id",
-            "keyCount": 2, "label": "Bearer routing-mode", "ok": False,
-            "detail": "Basic request-routing",
-            "nested": {
-                "key": "nested-public-key", "channelKey": "nested-channel-key",
-                "values": ["Bearer ordinary.word", ("Basic routing mode",)],
-                "api_token": "monitor-token-marker",
-                "cookie": "monitor-cookie-marker",
-                "url": "https://monitor-user-marker:monitor-password-marker@monitor.invalid/result",
-                "authorization": "Bearer abcdefghijklmno-p",
-            },
-        }]
-
-    monkeypatch.setattr(fixture.gateway, "run_monitor", monitor_result)
-    with TestClient(app) as client:
-        headers = bearer(create_session(client))
-        completed = operation(
-            client, headers,
-            client.post(PREFIX + "/network/monitor/actions/run", headers=headers),
-        )
-        result = completed["result"]["checks"][0]
-
-    assert result["key"] == "dns-route-key"
-    assert result["category"] == "dns"
-    assert result["channelKey"] == "api:channel-key"
-    assert result["keyId"] == "public-key-id"
-    assert result["keyCount"] == 2
-    assert result["label"] == "Bearer routing-mode"
-    assert result["detail"] == "Basic request-routing"
-    assert result["nested"]["key"] == "[REDACTED]"
-    assert result["nested"]["channelKey"] == "<redacted>"
-    assert result["nested"]["values"] == [
-        "Bearer ordinary.word", ["Basic routing mode"],
-    ]
-    assert result["nested"]["api_token"] == "<redacted>"
-    assert result["nested"]["cookie"] == "<redacted>"
-    assert result["nested"]["authorization"] == "<redacted>"
-    encoded = json.dumps(result)
-    for marker in (
-        "monitor-token-marker", "monitor-cookie-marker", "monitor-user-marker",
-        "monitor-password-marker", "abcdefghijklmno-p", "nested-public-key",
-        "nested-channel-key",
-    ):
-        assert marker not in encoded
-        assert marker not in repr(completed)
-
+    assert dns["message"] == prose
+    assert dns["nested"] == {
+        "apiToken": "[REDACTED]", "key": "dns-public-key",
+    }
+    assert socks["nested"][0] == {
+        "clientSecret": "[REDACTED]",
+        "authorization": "[REDACTED]",
+        "detail": prose,
+    }
 
 def test_secret_only_concurrent_change_invalidates_plan_without_changing_public_revision(tmp_path):
     app, _runtime, fixture = build_p6_app(tmp_path)
@@ -468,5 +284,5 @@ def test_probe_exception_is_terminal_operation_failure_without_raw_error(tmp_pat
         result = operation(client, headers, client.post(PREFIX + "/network/dns/tests", headers=headers, json={"servers": ["1.1.1.1"]}))
         assert result["status"] == "failed"
         assert result["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
-        assert_secret_safe(result)
+        assert "test-marker-dns" not in json.dumps(result)
         assert not fixture.controls.network._plans

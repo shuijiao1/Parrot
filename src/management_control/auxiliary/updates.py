@@ -43,51 +43,6 @@ STAGE_FAILED = "failed"
 STAGE_ROLLED_BACK = "rolled_back"
 _ACTIVE_STAGES = {STAGE_BACKING_UP, STAGE_PULLING, STAGE_RESTARTING, STAGE_VERIFYING}
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
-_REDACTED = "[REDACTED]"
-_SECRET_SUFFIX_PATTERN = r"(?i:token|key|secret|credential)"
-_KNOWN_CONCATENATED_SECRET_KEY_PATTERN = (
-    r"(?i:api(?:token|key)|xapikey|accesstoken|refreshtoken|idtoken|"
-    r"managementkey|bottoken|githubtoken|clientsecret|sessiontoken|"
-    r"exchange(?:secret|credential)|challengecredential|upstreamsecret|"
-    r"webhook(?:token|key|secret|credential))"
-)
-# Keep known credential aliases above. Other generic suffixes require a real
-# case transition; generic camel-case ``Key`` is too ambiguous (``channelKey``).
-_CAMEL_SECRET_KEY_PATTERN = r"[A-Za-z0-9]*[a-z0-9](?:Token|Secret|Credential)"
-_SECRET_KEY_PATTERN = (
-    rf"(?:{_SECRET_SUFFIX_PATTERN}|{_KNOWN_CONCATENATED_SECRET_KEY_PATTERN}|"
-    rf"{_CAMEL_SECRET_KEY_PATTERN}|"
-    rf"(?:[A-Za-z0-9]+[-_.])+(?:{_SECRET_SUFFIX_PATTERN}|(?i:password))|"
-    r"(?i:session|password|passwd|cookie|set[-_]?cookie))"
-)
-_ALL_SECRET_KEY_PATTERN = (
-    rf"(?:{_SECRET_KEY_PATTERN}|(?i:authorization|proxy[-_]?authorization))"
-)
-_SECRET_KEY_WITH_BOUNDARIES = rf"(?<![A-Za-z0-9_-]){_SECRET_KEY_PATTERN}(?![A-Za-z0-9_-])"
-_ALL_SECRET_KEY_WITH_BOUNDARIES = rf"(?<![A-Za-z0-9_-]){_ALL_SECRET_KEY_PATTERN}(?![A-Za-z0-9_-])"
-_URL_USERINFO_RE = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s?#@]+@")
-_ESCAPED_JSON_SECRET_RE = re.compile(
-    rf"((?:\\[\"']){_ALL_SECRET_KEY_PATTERN}(?:\\[\"'])\s*:\s*)(\\[\"'])(.*?)\2"
-)
-_JSON_SECRET_RE = re.compile(
-    rf"((?:[\"']){_ALL_SECRET_KEY_PATTERN}(?:[\"'])\s*:\s*)([\"'])(.*?)\2"
-)
-_QUOTED_SECRET_RE = re.compile(
-    rf"({_ALL_SECRET_KEY_WITH_BOUNDARIES}\s*[:=]\s*)([\"'])(.*?)\2"
-)
-_AUTH_ASSIGNMENT_RE = re.compile(
-    r"(?i)((?<![A-Za-z0-9_-])(?:proxy[-_]?authorization|authorization)"
-    r"(?![A-Za-z0-9_-])\s*=\s*)((?:bearer|basic)\s+)?[^\s,;}\]]+"
-)
-_PLAIN_SECRET_RE = re.compile(
-    rf"({_SECRET_KEY_WITH_BOUNDARIES}\s*[:=]\s*)[^\s\"',;}}\]]+"
-)
-_SECRET_HEADER_RE = re.compile(
-    r"(?i)(\b(?:proxy[-_]?authorization|authorization|set-cookie|cookie)\b\s*:\s*)[^\r\n]*"
-)
-_STANDALONE_AUTH_RE = re.compile(
-    r"(?i)(\b(?:bearer|basic)\s+)([A-Za-z0-9._~+/=-]+)"
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,33 +214,9 @@ def _actor_key(context: ManagementContext) -> str:
     return context.actor.session_id or context.actor.subject_id
 
 
-def _redact_standalone_auth(match: re.Match[str]) -> str:
-    candidate = match.group(2)
-    looks_credential = len(candidate) >= 8 and (
-        not candidate.isalpha() or not (candidate.islower() or candidate.isupper())
-    )
-    return match.group(1) + (_REDACTED if looks_credential else candidate)
-
-
 def _sanitize_log(value: str) -> str:
-    result = _URL_USERINFO_RE.sub(rf"\1{_REDACTED}@", str(value or ""))
-    for pattern in (_ESCAPED_JSON_SECRET_RE, _JSON_SECRET_RE, _QUOTED_SECRET_RE):
-        result = pattern.sub(
-            lambda match: match.group(1) + match.group(2) + _REDACTED + match.group(2),
-            result,
-        )
-    result = _AUTH_ASSIGNMENT_RE.sub(rf"\1\2{_REDACTED}", result)
-    result = _PLAIN_SECRET_RE.sub(rf"\1{_REDACTED}", result)
-
-    def redact_header(match: re.Match[str]) -> str:
-        prefix = match.group(1)
-        value = match.group(0)[len(prefix):]
-        scheme = re.match(r"(?i)((?:bearer|basic)\s+)", value)
-        return prefix + (scheme.group(1) if scheme else "") + _REDACTED
-
-    result = _SECRET_HEADER_RE.sub(redact_header, result)
-    result = _STANDALONE_AUTH_RE.sub(_redact_standalone_auth, result)
-    return result[-3500:]
+    """Bound failure-log size while preserving its ordinary text verbatim."""
+    return str(value or "")[-3500:]
 
 
 class UpdateControl:

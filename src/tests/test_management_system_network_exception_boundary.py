@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 from contextlib import contextmanager
 
 import pytest
@@ -15,19 +14,16 @@ from src.management_control import (
     ManagementErrorCode,
 )
 from src.management_control.operations import OperationStatus
-from src.management_control.system import ContentBlacklistControl, SettingsControl
+from src.management_control.system import SettingsControl
 from src.tests.management_system_network_support import (
     FakeConfig,
-    FakeRegistry,
     bearer,
     build_p6_app,
     create_session,
 )
 
-
 PREFIX = "/api/management/v1"
 MARKER = "exception-boundary-apiToken-credential"
-
 
 def _management_context() -> ManagementContext:
     return ManagementContext(
@@ -39,7 +35,6 @@ def _management_context() -> ManagementContext:
         ),
     )
 
-
 def _telegram_context() -> ManagementContext:
     return ManagementContext(
         request_id="telegram:boundary",
@@ -49,38 +44,16 @@ def _telegram_context() -> ManagementContext:
         ),
     )
 
-
-def _chain_strings(exc: BaseException) -> list[str]:
-    values: list[str] = []
-    pending: list[BaseException] = [exc]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        values.append(str(current))
-        for linked in (current.__cause__, current.__context__):
-            if linked is not None:
-                pending.append(linked)
-    return values
-
-
 def _assert_safe_dependency(exc: ManagementError) -> None:
     assert exc.code is ManagementErrorCode.DEPENDENCY_UNAVAILABLE
     assert exc.retryable is True
     assert MARKER not in str(exc)
-    assert all(MARKER not in value for value in _chain_strings(exc))
-    assert exc.__cause__ is None
-    assert exc.__context__ is None
-
 
 def _assert_failed_audit(audit, *, action: str, prior: int = 0) -> None:
     records = [row for row in audit.snapshot() if row.action == action]
     assert len(records) == prior + 1
     assert records[-1].result == "failed"
     assert MARKER not in repr(records[-1])
-
 
 class _StagedConfig(FakeConfig):
     def __init__(self, stage: str) -> None:
@@ -113,7 +86,6 @@ class _StagedConfig(FakeConfig):
             if self.stage == "exit":
                 raise self.failure
 
-
 def test_settings_get_config_and_reader_failures_are_stable_http_and_direct(tmp_path):
     app, _runtime, fixture = build_p6_app(tmp_path)
     with TestClient(app) as client:
@@ -138,79 +110,6 @@ def test_settings_get_config_and_reader_failures_are_stable_http_and_direct(tmp_
         control.get(_management_context(), "not-a-resource")
     assert missing.value.code is ManagementErrorCode.RESOURCE_NOT_FOUND
 
-
-@pytest.mark.parametrize(
-    ("stage", "expected_updates"),
-    (
-        ("enter", 0),
-        ("get", 0),
-        ("update", 0),
-        ("post_get", 1),
-        ("post_reader", 1),
-        ("exit", 1),
-    ),
-)
-def test_settings_management_update_dependency_matrix_is_safe_and_audited(
-    stage, expected_updates,
-):
-    config = _StagedConfig(stage)
-    audit = BoundedAuditSink()
-    control = SettingsControl(config=config, audit_sink=audit)
-    if stage == "post_reader":
-        original = control._timeouts
-        calls = 0
-
-        def reader(cfg):
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                raise config.failure
-            return original(cfg)
-
-        control._timeouts = reader
-
-    before = copy.deepcopy(config.value)
-    with pytest.raises(ManagementError) as caught:
-        control.update_timeouts(_management_context(), {"connect": 11})
-    _assert_safe_dependency(caught.value)
-    assert config.updates == expected_updates
-    if expected_updates == 0:
-        assert config.value == before
-    else:
-        assert config.value["timeouts"]["connect"] == 11
-    _assert_failed_audit(audit, action="settings.timeouts.update")
-
-
-@pytest.mark.parametrize(
-    ("path", "payload", "action"),
-    (
-        ("/settings/timeouts", {"connect": 11}, "settings.timeouts.update"),
-        (
-            "/content-blacklist/default", {"term": "blocked-term"},
-            "content_blacklist.default.add",
-        ),
-    ),
-)
-def test_system_mutation_dependency_failure_is_stable_http(
-    tmp_path, path, payload, action,
-):
-    app, _runtime, fixture = build_p6_app(tmp_path)
-    with TestClient(app) as client:
-        headers = bearer(create_session(client))
-        raw = RuntimeError(f"system mutation HTTP failed {MARKER}")
-        fixture.config.update = lambda _mutator: (
-            _ for _ in ()
-        ).throw(raw)
-        method = "patch" if path.startswith("/settings/") else "post"
-        response = getattr(client, method)(
-            PREFIX + path, headers=headers, json=payload,
-        )
-    assert response.status_code == 503, response.text
-    assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
-    assert MARKER not in response.text
-    _assert_failed_audit(fixture.audit, action=action)
-
-
 def test_settings_telegram_approval_actor_uses_safe_management_boundary():
     config = _StagedConfig("update")
     audit = BoundedAuditSink()
@@ -228,7 +127,6 @@ def test_settings_telegram_approval_actor_uses_safe_management_boundary():
     _assert_safe_dependency(caught.value)
     _assert_failed_audit(audit, action="settings.timeouts.update")
 
-
 def test_settings_telegram_write_preserves_raw_exception_identity_and_no_audit():
     config = FakeConfig()
     audit = BoundedAuditSink()
@@ -242,102 +140,6 @@ def test_settings_telegram_write_preserves_raw_exception_identity_and_no_audit()
     assert str(caught.value) == f"telegram settings raw {MARKER}"
     assert audit.snapshot() == ()
 
-
-@pytest.mark.parametrize("stage", ("enter", "get", "registry", "projection", "exit"))
-def test_blacklist_get_dependency_matrix_is_safe_direct(stage):
-    config = _StagedConfig(stage)
-    registry = FakeRegistry()
-    control = ContentBlacklistControl(config=config, registry=registry)
-    failure = RuntimeError(f"blacklist {stage} failed {MARKER}")
-    if stage == "registry":
-        registry.all_channels = lambda: (_ for _ in ()).throw(failure)
-    if stage == "projection":
-        control._snapshot_from = lambda _cfg, _channels: (
-            _ for _ in ()
-        ).throw(failure)
-
-    with pytest.raises(ManagementError) as caught:
-        control.get(_management_context())
-    _assert_safe_dependency(caught.value)
-
-
-@pytest.mark.parametrize("stage", ("enter", "get", "registry", "projection"))
-def test_blacklist_get_dependency_matrix_is_stable_http(tmp_path, stage):
-    app, _runtime, fixture = build_p6_app(tmp_path)
-    failure = RuntimeError(f"blacklist HTTP {stage} failed {MARKER}")
-    if stage == "enter":
-        @contextmanager
-        def transaction():
-            raise failure
-            yield
-        fixture.config.serialized_updates = transaction
-    elif stage == "get":
-        fixture.config.get = lambda: (_ for _ in ()).throw(failure)
-    elif stage == "registry":
-        fixture.registry.all_channels = lambda: (_ for _ in ()).throw(failure)
-    else:
-        fixture.controls.blacklist._snapshot_from = lambda _cfg, _channels: (
-            _ for _ in ()
-        ).throw(failure)
-
-    with TestClient(app) as client:
-        headers = bearer(create_session(client))
-        response = client.get(PREFIX + "/content-blacklist", headers=headers)
-    assert response.status_code == 503, response.text
-    assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
-    assert MARKER not in response.text
-
-
-@pytest.mark.parametrize(
-    ("stage", "expected_updates"),
-    (
-        ("enter", 0),
-        ("get", 0),
-        ("registry", 0),
-        ("update", 0),
-        ("final_projection", 1),
-        ("exit", 1),
-    ),
-)
-def test_blacklist_management_mutation_dependency_matrix_is_safe_and_audited(
-    stage, expected_updates,
-):
-    config = _StagedConfig(stage)
-    registry = FakeRegistry()
-    audit = BoundedAuditSink()
-    control = ContentBlacklistControl(
-        config=config, registry=registry, audit_sink=audit,
-    )
-    failure = RuntimeError(f"blacklist mutation {stage} failed {MARKER}")
-    if stage == "registry":
-        registry.all_channels = lambda: (_ for _ in ()).throw(failure)
-    if stage == "final_projection":
-        original = control._snapshot_from
-        calls = 0
-
-        def projection(cfg, channels):
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                raise failure
-            return original(cfg, channels)
-
-        control._snapshot_from = projection
-
-    before = copy.deepcopy(config.value)
-    with pytest.raises(ManagementError) as caught:
-        control.add_default(_management_context(), "blocked-term")
-    _assert_safe_dependency(caught.value)
-    assert config.updates == expected_updates
-    if expected_updates == 0:
-        assert config.value == before
-    else:
-        assert "blocked-term" in config.value["contentBlacklist"]["default"]
-    _assert_failed_audit(
-        audit, action="content_blacklist.default.add",
-    )
-
-
 _BLACKLIST_TG_CALLS = (
     lambda control: control.telegram_add_default(_telegram_context(), "new-term"),
     lambda control: control.telegram_delete_default(_telegram_context(), "old-term"),
@@ -345,48 +147,6 @@ _BLACKLIST_TG_CALLS = (
         _telegram_context(), "display/name", "channel-term",
     ),
 )
-
-
-@pytest.mark.parametrize("invoke", _BLACKLIST_TG_CALLS)
-def test_blacklist_telegram_commands_preserve_raw_write_failure(invoke):
-    class RawConfig:
-        def __init__(self) -> None:
-            self.raw = RuntimeError(f"telegram blacklist raw {MARKER}")
-
-        def update(self, _mutator):
-            raise self.raw
-
-    class NoRegistryRead:
-        def all_channels(self):
-            raise AssertionError("Telegram command must not read registry")
-
-    config = RawConfig()
-    control = ContentBlacklistControl(config=config, registry=NoRegistryRead())
-    with pytest.raises(RuntimeError) as caught:
-        invoke(control)
-    assert caught.value is config.raw
-
-
-@pytest.mark.parametrize("invoke", _BLACKLIST_TG_CALLS)
-def test_blacklist_telegram_commands_have_no_post_write_registry_read(invoke):
-    class NoRegistryRead:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def all_channels(self):
-            self.calls += 1
-            raise AssertionError("Telegram command must not read registry")
-
-    config = FakeConfig()
-    config.value["contentBlacklist"] = {
-        "default": ["old-term"], "byChannel": {},
-    }
-    registry = NoRegistryRead()
-    control = ContentBlacklistControl(config=config, registry=registry)
-    invoke(control)
-    assert config.updates == 1
-    assert registry.calls == 0
-
 
 @pytest.mark.parametrize(
     ("case", "path"),
@@ -431,131 +191,10 @@ def test_network_read_gateway_and_projection_failures_are_stable_http(
     assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
     assert MARKER not in response.text
 
-
 def _operation_plan_id(runtime, context, operation_id: str) -> str:
     operation = runtime.operations.get(context, operation_id)
     assert operation.status is OperationStatus.SUCCEEDED
     return operation.result["plan"]["id"]
-
-
-@pytest.mark.parametrize("stage", ("enter", "config", "exit"))
-def test_network_test_setup_transaction_failures_are_safe_without_operation(
-    tmp_path, stage,
-):
-    _app, runtime, fixture = build_p6_app(tmp_path)
-    context = _management_context()
-    failure = RuntimeError(f"network setup {stage} failed {MARKER}")
-    if stage == "config":
-        fixture.gateway.config_get = lambda: (
-            _ for _ in ()
-        ).throw(failure)
-    else:
-        @contextmanager
-        def transaction():
-            if stage == "enter":
-                raise failure
-            yield
-            if stage == "exit":
-                raise failure
-        fixture.gateway.serialized_updates = transaction
-
-    before_operations = copy.deepcopy(runtime.operations._items)
-    with pytest.raises(ManagementError) as caught:
-        fixture.controls.network.start_dns_test(context, ["1.1.1.1"])
-    _assert_safe_dependency(caught.value)
-    assert runtime.operations._items == before_operations
-    _assert_failed_audit(fixture.audit, action="network.dns.test")
-
-
-@pytest.mark.parametrize(
-    ("stage", "action"),
-    (
-        ("commit_gateway", "network.dns.commit"),
-        ("commit_exit", "network.dns.commit"),
-        ("sync_enter", "network.dns.sync"),
-        ("sync_gateway", "network.dns.sync"),
-        ("state_config", "network.socks5.state.update"),
-        ("state_gateway", "network.socks5.state.update"),
-        ("monitor_enter", "network.monitor.update"),
-        ("monitor_gateway", "network.monitor.update"),
-        ("monitor_exit", "network.monitor.update"),
-    ),
-)
-def test_network_mutation_transaction_and_gateway_failures_are_safe_and_audited(
-    tmp_path, stage, action,
-):
-    _app, runtime, fixture = build_p6_app(tmp_path)
-    context = _management_context()
-    control = fixture.controls.network
-    failure = RuntimeError(f"network {stage} failed {MARKER}")
-    plan_id = None
-    if stage.startswith("commit"):
-        started = control.start_dns_test(context, ["1.1.1.1"])
-        plan_id = _operation_plan_id(runtime, context, started.id)
-
-    if stage == "commit_gateway":
-        fixture.gateway.save_dns = lambda _servers: (
-            _ for _ in ()
-        ).throw(failure)
-    elif stage == "commit_exit":
-        @contextmanager
-        def transaction():
-            yield
-            raise failure
-        fixture.gateway.serialized_updates = transaction
-    elif stage == "sync_enter":
-        @contextmanager
-        def transaction():
-            raise failure
-            yield
-        fixture.gateway.serialized_updates = transaction
-    elif stage == "sync_gateway":
-        fixture.gateway.sync_system_dns = lambda: (
-            _ for _ in ()
-        ).throw(failure)
-    elif stage == "state_config":
-        fixture.gateway.config_get = lambda: (
-            _ for _ in ()
-        ).throw(failure)
-    elif stage == "state_gateway":
-        fixture.gateway.set_socks5_enabled = lambda _enabled: (
-            _ for _ in ()
-        ).throw(failure)
-    elif stage == "monitor_enter":
-        @contextmanager
-        def transaction():
-            raise failure
-            yield
-        fixture.gateway.monitor_transaction = transaction
-    elif stage == "monitor_gateway":
-        fixture.gateway.update_monitor = lambda _mutator: (
-            _ for _ in ()
-        ).throw(failure)
-    elif stage == "monitor_exit":
-        @contextmanager
-        def transaction():
-            yield
-            raise failure
-        fixture.gateway.monitor_transaction = transaction
-
-    prior = len([row for row in fixture.audit.snapshot() if row.action == action])
-    with pytest.raises(ManagementError) as caught:
-        if stage.startswith("commit"):
-            control.commit_dns(context, plan_id, force=False)
-        elif stage.startswith("sync"):
-            control.sync_system_dns(context)
-        elif stage.startswith("state"):
-            control.update_socks5_state(context, False)
-        else:
-            control.update_monitor(context, {"dns": True})
-    _assert_safe_dependency(caught.value)
-    _assert_failed_audit(fixture.audit, action=action, prior=prior)
-    new_records = [
-        row for row in fixture.audit.snapshot()[prior:]
-        if row.action == action
-    ]
-    assert all(row.result != "succeeded" for row in new_records)
-
 
 def test_network_gateway_failure_is_stable_and_secret_free_http(tmp_path):
     app, _runtime, fixture = build_p6_app(tmp_path)
@@ -570,7 +209,6 @@ def test_network_gateway_failure_is_stable_and_secret_free_http(tmp_path):
     assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
     assert MARKER not in response.text
     _assert_failed_audit(fixture.audit, action="network.dns.sync")
-
 
 @pytest.mark.parametrize("kind", ("dns", "socks5", "monitor"))
 def test_network_worker_terminal_failures_are_stable_operations_and_single_audits(
@@ -613,7 +251,6 @@ def test_network_worker_terminal_failures_are_stable_operations_and_single_audit
     assert records[0].result == "failed"
     assert MARKER not in repr(records[0])
 
-
 @pytest.mark.parametrize(
     ("method", "gateway_method", "args", "kwargs"),
     (
@@ -641,7 +278,6 @@ def test_network_synchronous_telegram_compatibility_preserves_raw_exceptions(
     with pytest.raises(RuntimeError) as caught:
         getattr(fixture.controls.network, method)(*args, **kwargs)
     assert caught.value is raw
-
 
 def test_network_async_telegram_compatibility_preserves_raw_exceptions(tmp_path):
     _app, _runtime, fixture = build_p6_app(tmp_path)

@@ -96,6 +96,8 @@ def test_operation_lifecycle_visibility_cancellation_audit_and_secret_redaction(
         operation.id,
         {
             "count": 2,
+            "key": "public-check-id",
+            "message": "Bearer support is enabled",
             "managementKey": "fake-management-secret",
             "nested": {"exchange_secret": "fake-exchange-secret"},
         },
@@ -103,6 +105,8 @@ def test_operation_lifecycle_visibility_cancellation_audit_and_secret_redaction(
     assert completed.status is OperationStatus.SUCCEEDED
     assert completed.result == {
         "count": 2,
+        "key": "public-check-id",
+        "message": "Bearer support is enabled",
         "managementKey": "[REDACTED]",
         "nested": {"exchange_secret": "[REDACTED]"},
     }
