@@ -62,6 +62,11 @@ def assert_strict_equal(expected: Any, actual: Any, path: str = "$") -> None:
             missing = sorted(set(expected_keys) - set(actual_keys))
             extra = sorted(set(actual_keys) - set(expected_keys))
             raise StrictMismatch(f"{path}: object keys differ: missing={missing}, extra={extra}")
+        if expected_keys != actual_keys:
+            raise StrictMismatch(
+                f"{path}: object key order differs: "
+                f"expected {expected_keys!r}, actual {actual_keys!r}"
+            )
         for key in expected_keys:
             assert_strict_equal(expected[key], actual[key], f"{path}.{key}")
         return

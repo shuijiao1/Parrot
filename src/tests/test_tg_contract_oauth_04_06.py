@@ -103,13 +103,30 @@ def _run_oa04(case, monkeypatch):
         states.set_state(42, "oa_login_code", {"code_verifier": "fake-verifier", "state": "fake-state"})
         if case["entry"].get("expired"):
             states.pop_state(42)
-        monkeypatch.setattr(oauth_manager, "exchange_code", lambda *a: (_ for _ in ()).throw(RuntimeError("fake exchange failure")) if case["entry"].get("failure") else {"access_token": "fake-access", "refresh_token": "fake-refresh", "expires_in": 3600})
+        exchange_calls: list[tuple[str, str, str]] = []
+
+        def exchange_code(code: str, code_verifier: str, state: str) -> dict:
+            exchange_calls.append((code, code_verifier, state))
+            if case["entry"].get("failure"):
+                raise RuntimeError("fake exchange failure")
+            return {
+                "access_token": "fake-access",
+                "refresh_token": "fake-refresh",
+                "expires_in": 3600,
+            }
+
+        monkeypatch.setattr(oauth_manager, "exchange_code", exchange_code)
         async def profile(_): return {"account": {"email": "claude-login@fake.invalid"}}
         monkeypatch.setattr(oauth_manager, "fetch_profile", profile)
         monkeypatch.setattr(oauth_manager, "extract_claude_plan_info", lambda p: {})
         monkeypatch.setattr(oauth_manager, "claude_plan_label", lambda a: "Fake Plan")
         _patch_save(env, monkeypatch)
-        om.on_login_code_input(42, case["entry"].get("text", "fake-code#fake-state"))
+        submitted_text = case["entry"].get("text", "fake-code#fake-state")
+        om.on_login_code_input(42, submitted_text)
+        expected_calls = [] if case["entry"].get("expired") or not (submitted_text or "").strip() else [
+            ("fake-code", "fake-verifier", "fake-state")
+        ]
+        assert exchange_calls == expected_calls
         return actual(case, env, state_steps=[env.state_snapshot("code")])
     if op == "json_input":
         states.set_state(42, "oa_set_json", {})

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -55,6 +56,17 @@ SEGMENT_CAPABILITIES = {
 SEGMENT_ORDER = tuple(SEGMENT_CAPABILITIES)
 EXPECTED_CAPABILITIES = set().union(*SEGMENT_CAPABILITIES.values())
 EXPECTED_CASE_COUNT = 663
+EXPECTED_FIXTURE_SHA256 = {
+    "manifest.jsonl": "a68f37eb211c9606401e93e8f598866afd9e2df7160a30c966f2f030fd568e0c",
+    "segments/auxiliary.jsonl": "f8ff628ff205ed682b0f7406ddc6f358479a49abe668a8340e012bd8d006dbf9",
+    "segments/channels_apikey.jsonl": "12c189f697a1c4868caca3608bdb15185af6959fb0aac5e5a8177be68f624539",
+    "segments/core.jsonl": "78856cde55811d973552b893a7af7d9d2ec982dd2ea87c971df7dd454e06d73b",
+    "segments/main_status.jsonl": "32d065524cf3f7e727e8d894cfa552a1293dcee3bf28c50f37b77f67143dbe00",
+    "segments/model_routing.jsonl": "6477b4bb46f3874c0f170729cef1ec817099741d9ea065b11ba8e6f9adcf9b6d",
+    "segments/oauth.jsonl": "d098f379c7daa7a2e2cc691807a67032d98051849551f531d3acb987e9a8869b",
+    "segments/observability.jsonl": "ff6acee94170c119e9bae472ff0562f19d0457a16d83fd0c28c94cce1d81f444",
+    "segments/system.jsonl": "1840150adab1acac78dc35f0acc5b7d191dc59e265890a030a261b0ee2d13c59",
+}
 
 
 def _doc_capabilities() -> set[str]:
@@ -62,6 +74,16 @@ def _doc_capabilities() -> set[str]:
     section = text.split("## 14. Telegram 零变化完整功能清单", 1)[1]
     section = section.split("### 14.6 基线轨迹格式", 1)[0]
     return set(re.findall(r"TG-[A-Z]+(?:-[A-Z]+)*-\d{2}", section))
+
+
+def test_frozen_fixture_content_hashes_are_pinned():
+    assert {
+        path.relative_to(FIXTURE_ROOT).as_posix()
+        for path in FIXTURE_ROOT.rglob("*.jsonl")
+    } == set(EXPECTED_FIXTURE_SHA256)
+    for relative_path, expected in EXPECTED_FIXTURE_SHA256.items():
+        actual = hashlib.sha256((FIXTURE_ROOT / relative_path).read_bytes()).hexdigest()
+        assert actual == expected, relative_path
 
 
 def test_final_manifest_is_exact_stable_concatenation_of_all_segments():
