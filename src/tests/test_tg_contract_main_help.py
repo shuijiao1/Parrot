@@ -12,7 +12,6 @@ import textwrap
 
 import pytest
 
-from src import network_monitor, status_monitor, update_checker
 from src.telegram import bot, menu_cache, states, ui
 from src.telegram.menus import help_menu, main as main_menu
 from src.tests.tg_contract import (
@@ -97,16 +96,17 @@ def _patch_main(case: dict[str, Any], monkeypatch) -> tuple[dict[str, Any], list
     cfg = deepcopy(case["initialConfig"]["app"])
     runtime = case["initialRuntime"]
     events: list[dict[str, Any]] = []
-    monkeypatch.setattr(main_menu.config, "get", lambda: cfg)
-    monkeypatch.setattr(main_menu.oauth_manager, "list_accounts", lambda: deepcopy(cfg.get("oauthAccounts") or []))
+    control = main_menu._CONTROL
+    monkeypatch.setattr(control.config, "get", lambda: cfg)
+    monkeypatch.setattr(control.oauth_manager, "list_accounts", lambda: deepcopy(cfg.get("oauthAccounts") or []))
     quota_rows = deepcopy(runtime.get("quotaRows") or {})
-    monkeypatch.setattr(main_menu.state_db, "quota_load", lambda key: deepcopy(quota_rows.get(key)))
+    monkeypatch.setattr(control.state_db, "quota_load", lambda key: deepcopy(quota_rows.get(key)))
     channels = [SimpleNamespace(**item) for item in runtime.get("registryChannels", [])]
-    monkeypatch.setattr(main_menu.registry, "all_channels", lambda: channels)
-    monkeypatch.setattr(main_menu.affinity, "count", lambda: runtime.get("affinityCount", 0))
-    monkeypatch.setattr(main_menu.public_ip, "get", lambda: runtime.get("publicIp"))
+    monkeypatch.setattr(control.registry, "all_channels", lambda: channels)
+    monkeypatch.setattr(control.affinity, "count", lambda: runtime.get("affinityCount", 0))
+    monkeypatch.setattr(control.public_ip_service, "get", lambda: runtime.get("publicIp"))
     monkeypatch.setattr(
-        main_menu.concurrency,
+        control.concurrency,
         "totals",
         lambda: deepcopy(runtime.get("concurrencyTotals") or {
             "in_flight": 0, "waiting": 0, "tracked_channels": 0,
@@ -126,9 +126,9 @@ def _patch_main(case: dict[str, Any], monkeypatch) -> tuple[dict[str, Any], list
         }) or 9001,
     )
     banners = runtime.get("banners") or {}
-    monkeypatch.setattr(status_monitor, "get_active_summary", lambda: banners.get("status"))
-    monkeypatch.setattr(update_checker, "get_update_banner", lambda: banners.get("update"))
-    monkeypatch.setattr(network_monitor, "active_summary", lambda: banners.get("network"))
+    monkeypatch.setattr(control.status_monitor, "get_active_summary", lambda: banners.get("status"))
+    monkeypatch.setattr(control.update_checker, "get_update_banner", lambda: banners.get("update"))
+    monkeypatch.setattr(control.network_monitor, "active_summary", lambda: banners.get("network"))
     return cfg, events
 
 

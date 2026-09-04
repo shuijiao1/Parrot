@@ -17,11 +17,14 @@ from src import config as config_module
 from src import cooldown as cooldown_module
 from src import load_balancing as load_balancing_module
 from src import log_db as log_db_module
+from src import network_monitor as network_monitor_module
 from src import oauth_manager as oauth_manager_module
+from src import public_ip as public_ip_module
 from src import quota_errors as quota_errors_module
 from src import scorer as scorer_module
 from src import state_db as state_db_module
 from src import status_monitor as status_monitor_module
+from src import update_checker as update_checker_module
 from src.channel import registry as registry_module
 from src.management_control.context import ManagementContext
 
@@ -68,6 +71,9 @@ class StatusControl:
         quota_errors=quota_errors_module,
         state_db=state_db_module,
         status_monitor=status_monitor_module,
+        network_monitor=network_monitor_module,
+        public_ip=public_ip_module,
+        update_checker=update_checker_module,
         load_balancing=load_balancing_module,
         now=time.time,
         service_started_at: float = _SERVICE_START_TS,
@@ -85,6 +91,9 @@ class StatusControl:
         self.quota_errors = quota_errors
         self.state_db = state_db
         self.status_monitor = status_monitor
+        self.network_monitor = network_monitor
+        self.public_ip_service = public_ip
+        self.update_checker = update_checker
         self.load_balancing = load_balancing
         self._now = now
         self.service_started_at = service_started_at
@@ -121,6 +130,10 @@ class StatusControl:
 
     def api_concurrency_snapshot(self, context: ManagementContext) -> dict[str, Any]:
         return camelize(self.concurrency_snapshot(context))
+
+    def channel_concurrency_totals(self, context: ManagementContext) -> dict[str, Any]:
+        require(context)
+        return copy.deepcopy(self.concurrency.totals())
 
     def stats_summary(self, context: ManagementContext, *, since_ts: float, family: str | None = None) -> dict:
         require(context)
@@ -163,6 +176,23 @@ class StatusControl:
     def selection_mode(self, context: ManagementContext, value: str) -> str:
         require(context)
         return str(self.load_balancing.display_mode(value))
+
+    def public_ip(self, context: ManagementContext) -> str | None:
+        require(context)
+        value = self.public_ip_service.get()
+        return str(value) if value else None
+
+    def status_summary(self, context: ManagementContext) -> str | None:
+        require(context)
+        return self.status_monitor.get_active_summary()
+
+    def update_banner(self, context: ManagementContext) -> str | None:
+        require(context)
+        return self.update_checker.get_update_banner()
+
+    def network_summary(self, context: ManagementContext) -> str | None:
+        require(context)
+        return self.network_monitor.active_summary()
 
     def quota_row(self, context: ManagementContext, account_key: str) -> dict | None:
         require(context)

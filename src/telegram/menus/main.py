@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from ... import __version__, affinity, concurrency, config, load_balancing, oauth_manager, public_ip, state_db
-from ...oauth_ids import account_key as _account_key
-from ...channel import registry
+from ... import __version__
+from ...management_control.observability import DEFAULT_STATUS_CONTROL, telegram_context
 from .. import menu_cache, ui
+
+
+_CONTROL = DEFAULT_STATUS_CONTROL
+_CONTEXT = telegram_context()
 
 
 def _kb() -> dict:
@@ -23,19 +26,18 @@ def _kb() -> dict:
 
 def _quota_hot_count(threshold_pct: float = 80.0) -> int:
     """返回当前用量 >= threshold 的 OAuth 账户数量（不含已禁用）。"""
-    # 使用 oauth_manager.list_accounts() 作为唯一数据源。
     # Claude/OpenAI 走窗口配额；Grok/xAI 走官方月度 billing percent。
-    accounts = oauth_manager.list_accounts()
+    accounts = _CONTROL.oauth_accounts(_CONTEXT)
     n = 0
     for acc in accounts:
         email = acc.get("email")
         if not email:
             continue
-        provider = oauth_manager.provider_of(acc)
+        provider = _CONTROL.provider_of(_CONTEXT, acc)
         if provider not in ("claude", "openai", "xai", "cursor"):
             continue
-        ak = _account_key(acc)
-        row = state_db.quota_load(ak)
+        ak = _CONTROL.account_key(_CONTEXT, acc)
+        row = _CONTROL.quota_row(_CONTEXT, ak)
         if not row:
             continue
         if provider in {"xai", "cursor"}:
@@ -43,7 +45,7 @@ def _quota_hot_count(threshold_pct: float = 80.0) -> int:
         else:
             utils = [row.get(k) for k in ("five_hour_util", "seven_day_util",
                                            "thirty_day_util", "sonnet_util", "opus_util")]
-            utils.append(oauth_manager.fable_display_from_quota_row(row)[0])
+            utils.append(_CONTROL.fable_display(_CONTEXT, row)[0])
         if any(u is not None and u >= threshold_pct for u in utils):
             n += 1
     return n
@@ -63,7 +65,7 @@ def _first_run_banner() -> str:
 
 def _overview(lifetime_stats: dict | None = None, *, lifetime_loading: bool = False) -> str:
     """主菜单顶部的服务一览；慢统计只能来自进程内快照。"""
-    cfg = config.get()
+    cfg = _CONTROL.config_snapshot(_CONTEXT)
     oauth_accounts = cfg.get("oauthAccounts") or []
     api_channels = cfg.get("channels") or []
     api_keys = cfg.get("apiKeys") or {}
@@ -81,13 +83,13 @@ def _overview(lifetime_stats: dict | None = None, *, lifetime_loading: bool = Fa
         if c.get("enabled", True) and not c.get("disabled_reason")
     )
 
-    chs = registry.all_channels()
+    chs = _CONTROL.channels(_CONTEXT)
     total_registered = len(chs)
 
     listen = cfg.get("listen") or {}
     port = listen.get("port", 22122)
     cch = cfg.get("cchMode", "disabled")
-    mode = load_balancing.display_mode(cfg.get("channelSelection", "smart"))
+    mode = _CONTROL.selection_mode(_CONTEXT, cfg.get("channelSelection", "smart"))
 
     # 配额预警高亮（≥80%）
     quota_hot = _quota_hot_count(80.0)
@@ -101,13 +103,13 @@ def _overview(lifetime_stats: dict | None = None, *, lifetime_loading: bool = Fa
         + (f" · 🚫 用户 {oauth_user}" if oauth_user else "")
         + (f" · ❌ 认证失败 {oauth_auth_err}" if oauth_auth_err else ""),
         f"📡 API 渠道: {api_enabled}/{len(api_channels)} 可用 · registry {total_registered}",
-        f"🔑 下游 Key: {len(api_keys)} 个 · 🔗 亲和绑定 {affinity.count()}",
+        f"🔑 下游 Key: {len(api_keys)} 个 · 🔗 亲和绑定 {_CONTROL.affinity_count(_CONTEXT)}",
     ]
 
     # 并发队列（总开关关闭时标注为"关"，开启时显示在途 / 排队 / 追踪渠道数）
     cc_cfg = cfg.get("concurrency") or {}
     if bool(cc_cfg.get("enabled", True)):
-        cc_totals = concurrency.totals()
+        cc_totals = _CONTROL.channel_concurrency_totals(_CONTEXT)
         inf = cc_totals["in_flight"]
         wait = cc_totals["waiting"]
         track = cc_totals["tracked_channels"]
@@ -140,7 +142,7 @@ def _overview(lifetime_stats: dict | None = None, *, lifetime_loading: bool = Fa
 
 def _address_block(port: int) -> list[str]:
     """服务地址 + 完整接口地址。<code> 包裹便于点击复制。"""
-    pub = public_ip.get()
+    pub = _CONTROL.public_ip(_CONTEXT)
     out = [
         "🌐 <b>服务地址</b> (BaseURL)",
         f"  本地 <code>http://127.0.0.1:{port}</code>",
@@ -196,22 +198,19 @@ def _maybe_suffix_status_banner(text: str) -> str:
     """在文本底部追加 banner：上游故障 + 新版本可用（任一存在即拼到末尾）。"""
     extras: list[str] = []
     try:
-        from ... import status_monitor
-        line = status_monitor.get_active_summary()
+        line = _CONTROL.status_summary(_CONTEXT)
         if line:
             extras.append(line)
     except Exception:
         pass
     try:
-        from ... import update_checker
-        line = update_checker.get_update_banner()
+        line = _CONTROL.update_banner(_CONTEXT)
         if line:
             extras.append(line)
     except Exception:
         pass
     try:
-        from ... import network_monitor
-        line = network_monitor.active_summary()
+        line = _CONTROL.network_summary(_CONTEXT)
         if line:
             extras.append(line)
     except Exception:
@@ -222,7 +221,7 @@ def _maybe_suffix_status_banner(text: str) -> str:
 
 
 def _compose_text(lifetime_stats: dict | None = None, *, lifetime_loading: bool = False) -> str:
-    cfg = config.get()
+    cfg = _CONTROL.config_snapshot(_CONTEXT)
     empty = (
         not (cfg.get("oauthAccounts") or [])
         and not (cfg.get("channels") or [])
