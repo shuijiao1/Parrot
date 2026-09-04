@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import copy
 import hashlib
 import json
-import re
 import secrets
 import threading
 import time
@@ -16,13 +14,11 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Mapping
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from src.management_auth import Capability
 from src.management_control.context import AuditSink, ManagementContext
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
 from src.management_control.models.common import DomainControl, stable_revision
-from src.management_control.observability.common import sanitize_credentials
 from src.management_control.operations import (
     ManagementOperation,
     OperationStore,
@@ -44,11 +40,31 @@ from .models import (
     ProxySummary,
     Socks5Settings,
 )
+from .security import (
+    MONITOR_PUBLIC_IDENTIFIER_KEYS,
+    safe_dns_server,
+    safe_network_url,
+    sanitize_public_network,
+    sanitize_public_network_text,
+)
 
 
 _MONITOR_CATEGORIES = frozenset({"dns", "socks5", "channel", "core"})
-_MONITOR_PUBLIC_IDENTIFIERS = frozenset({"key", "category"})
-_AUTH_SCHEME_RE = re.compile(r"(?P<prefix>\b(?P<scheme>bearer|basic)\s+)(?:(?P<quote>\\*[\"'])(?P<quoted>.*?)(?P=quote)|(?P<bare>(?!\[REDACTED\])[^\s\\\"',;&}\]]+))", re.IGNORECASE)
+
+
+def _mark_monitor_operation_identifiers(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): PublicIdentifier(str(item or ""))
+            if str(key) == "key"
+            else _mark_monitor_operation_identifiers(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_mark_monitor_operation_identifiers(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_mark_monitor_operation_identifiers(item) for item in value)
+    return value
 
 
 class PlanState(str, Enum):
@@ -70,78 +86,6 @@ class _Plan:
     created_at: float
     expires_at: float
     state: PlanState = PlanState.PREPARED
-
-
-def _safe_url(value: str, *, mask_user: bool = False, drop_path: bool = False) -> str:
-    raw = str(value or "")
-    try:
-        parsed = urlsplit(raw)
-        if not parsed.scheme or not parsed.hostname:
-            return str(sanitize_credentials(raw))
-        host = parsed.hostname
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        netloc = host + (f":{parsed.port}" if parsed.port else "")
-        if mask_user and (parsed.username is not None or parsed.password is not None):
-            netloc = "***:***@" + netloc
-        query = []
-        if not drop_path:
-            for key, item in parse_qsl(parsed.query, keep_blank_values=True):
-                cleaned = sanitize_credentials({key: item}).get(key)
-                query.append((key, "[REDACTED]" if cleaned != item else item))
-        result = urlunsplit((parsed.scheme, netloc, "" if drop_path else parsed.path, urlencode(query), ""))
-        # Any original userinfo is already replaced byte-for-byte above. Keep
-        # the explicit mask for clients instead of letting the generic sanitizer
-        # remove the whole safe placeholder.
-        return result if mask_user else str(sanitize_credentials(result))
-    except Exception:
-        return str(sanitize_credentials(raw))
-
-
-def _safe_dns_server(value: Any) -> str:
-    raw = str(value or "")
-    return _safe_url(raw) if "://" in raw else str(sanitize_credentials(raw))
-
-
-def _looks_like_auth_credential(scheme: str, candidate: str) -> bool:
-    if not candidate or not re.fullmatch(r"[A-Za-z0-9._~+/=-]+", candidate):
-        return False
-    marker_parts = {part for part in re.split(r"[^a-z0-9]+", candidate.casefold()) if part}
-    if marker_parts & {"token", "key", "secret", "credential", "marker"}:
-        return True
-    if scheme.casefold() == "basic" and len(candidate) >= 8:
-        try:
-            decoded = base64.b64decode(candidate + "=" * (-len(candidate) % 4), altchars=b"-_", validate=True)
-        except (ValueError, TypeError):
-            decoded = b""
-        if b":" in decoded:
-            return True
-    punctuation_count = sum(not char.isalnum() for char in candidate)
-    return (
-        (any(char.isdigit() for char in candidate) and len(candidate) >= 8) or (punctuation_count >= 2 and len(candidate) >= 8)
-        or (bool(punctuation_count) and len(candidate) >= 16) or (candidate.isalpha() and len(candidate) >= 24) or (candidate.lower() != candidate and candidate.upper() != candidate and len(candidate) >= 16)
-    )
-
-
-def _safe_dns_cache_ip(value: Any) -> str:
-    raw = str(value)
-    preserved: dict[str, str] = {}
-    def replace_auth(match: re.Match[str]) -> str:
-        quote = match.group("quote") or ""
-        candidate = match.group("quoted") or match.group("bare") or ""
-        stripped = candidate if quote else candidate.rstrip(".,!?)")
-        trailing = candidate[len(stripped):]
-        if _looks_like_auth_credential(match.group("scheme"), stripped):
-            return match.group("prefix") + quote + "<redacted>" + quote + trailing
-        placeholder = f"\0PUBLICAUTH{len(preserved)}\0"
-        while placeholder in raw:
-            placeholder += "\0"
-        preserved[placeholder] = match.group(0)
-        return placeholder
-    clean = str(sanitize_credentials(_AUTH_SCHEME_RE.sub(replace_auth, raw)))
-    for placeholder, text in preserved.items():
-        clean = clean.replace(placeholder, text)
-    return clean
 
 
 def _utc(seconds: Any) -> datetime | None:
@@ -222,9 +166,9 @@ class NetworkControl(DomainControl):
         groups = net.get("groups") if isinstance(net.get("groups"), Mapping) else {}
         routing = net.get("routing") if isinstance(net.get("routing"), Mapping) else {}
         raw_servers = dns.get("servers") or ["8.8.8.8"]
-        servers = tuple(_safe_dns_server(item) for item in raw_servers)
+        servers = tuple(safe_dns_server(item) for item in raw_servers)
         raw_url = str(socks.get("url") or "").strip()
-        masked = _safe_url(raw_url, mask_user=True, drop_path=True) if raw_url else None
+        masked = safe_network_url(raw_url, mask_user=True, drop_path=True) if raw_url else None
         rule_count = sum(1 for key in routing if key != "default")
         rule_count += sum(len(value) for value in routing.values() if isinstance(value, Mapping))
         values = {
@@ -239,7 +183,7 @@ class NetworkControl(DomainControl):
             ),
             "proxySummary": ProxySummary(
                 proxyCount=len(proxies), groupCount=len(groups), ruleCount=rule_count,
-                defaultRoute=str(routing.get("default") or "direct"),
+                defaultRoute=sanitize_public_network_text(routing.get("default") or "direct"),
                 directFallback=bool(routing.get("directFallback", False)),
             ),
         }
@@ -299,7 +243,7 @@ class NetworkControl(DomainControl):
         return plan
 
     def _public_test(self, kind: str, test: Mapping[str, Any]) -> dict[str, Any]:
-        clean = sanitize_credentials(copy.deepcopy(dict(test)))
+        clean = sanitize_public_network(copy.deepcopy(dict(test)))
         if kind == "socks5":
             clean.pop("url", None)
             clean.pop("display_url", None)
@@ -309,17 +253,11 @@ class NetworkControl(DomainControl):
     @staticmethod
     def _public_monitor_result(value: Mapping[str, Any]) -> dict[str, Any]:
         """Sanitize untrusted fields without treating public DTO names as secrets."""
-        clean: dict[str, Any] = {}
-        for raw_key, item in value.items():
-            key = str(raw_key)
-            if key == "key":
-                clean[key] = PublicIdentifier(str(item or ""))
-            elif key in _MONITOR_PUBLIC_IDENTIFIERS:
-                clean[key] = copy.deepcopy(item)
-            else:
-                # Preserve shape while applying key-name and text credential
-                # rules to every untrusted value/detail/error field.
-                clean[key] = sanitize_credentials({key: copy.deepcopy(item)})[key]
+        clean = sanitize_public_network(
+            copy.deepcopy(dict(value)),
+            public_identifier_keys=MONITOR_PUBLIC_IDENTIFIER_KEYS,
+        )
+        clean = _mark_monitor_operation_identifiers(clean)
         category = str(clean.get("category") or "")
         if category not in _MONITOR_CATEGORIES:
             raise NetworkControl._validation(
@@ -330,9 +268,9 @@ class NetworkControl(DomainControl):
 
     def _public_plan(self, plan: _Plan) -> NetworkTestPlan:
         tested = (
-            {"servers": tuple(_safe_dns_server(item) for item in plan.value)}
+            {"servers": tuple(safe_dns_server(item) for item in plan.value)}
             if plan.kind == "dns"
-            else {"configured": True, "maskedUrl": _safe_url(str(plan.value), mask_user=True, drop_path=True)}
+            else {"configured": True, "maskedUrl": safe_network_url(str(plan.value), mask_user=True, drop_path=True)}
         )
         return NetworkTestPlan(
             id=plan.id,
@@ -662,10 +600,10 @@ class NetworkControl(DomainControl):
                 if expires is None:
                     continue
                 items.append(DnsCacheEntry(
-                    host=str(sanitize_credentials(row.get("host") or "")),
+                    host=sanitize_public_network_text(row.get("host") or ""),
                     family=self._safe_int(row.get("family"), 0),
-                    servers=tuple(_safe_dns_server(item) for item in row.get("servers") or []),
-                    ips=tuple(_safe_dns_cache_ip(item) for item in row.get("ips") or []),
+                    servers=tuple(safe_dns_server(item) for item in row.get("servers") or []),
+                    ips=tuple(sanitize_public_network_text(item) for item in row.get("ips") or []),
                     expiresAt=expires,
                     ttlRemainingSeconds=max(0, self._safe_int(row.get("ttl_remaining_seconds"), 0)),
                 ))
@@ -872,9 +810,9 @@ class NetworkControl(DomainControl):
                     return None
                 items.append(NetworkCheck(
                     key=str(row.get("key") or ""),
-                    label=str(sanitize_credentials(row.get("label") or "")),
+                    label=sanitize_public_network_text(row.get("label") or ""),
                     category=category, ok=bool(row.get("ok")),
-                    detail=str(sanitize_credentials(row.get("detail") or "")),
+                    detail=sanitize_public_network_text(row.get("detail") or ""),
                     latencyMilliseconds=(
                         self._safe_int(row.get("latency_ms"), 0)
                         if row.get("latency_ms") is not None else None
