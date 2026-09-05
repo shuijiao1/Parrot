@@ -175,6 +175,9 @@ class FakeLogDb:
             "proxy_chain": [], "local_web_log": [], "billing_attempts": [],
         }
 
+    def management_log_detail(self, request_id):
+        return self.log_detail(request_id)
+
 
 class FakeConfig:
     def get(self):
@@ -250,7 +253,7 @@ def test_body_endpoints_require_log_body_read_not_only_read(tmp_path):
     controls.logs.raw_body.assert_not_called()
 
 
-def test_logs_control_filter_sort_page_total_detail_and_secret_safe_body():
+def test_logs_control_filter_sort_page_total_detail_and_business_body_fidelity():
     control = LogsControl(log_db=FakeLogDb(), config=FakeConfig(), oauth_manager=FakeOAuth())
     ctx = context()
     result = control.list_logs(ctx, RequestLogQuery(
@@ -273,8 +276,8 @@ def test_logs_control_filter_sort_page_total_detail_and_secret_safe_body():
     assert body.total >= 1
     assert sum(item["count"] for item in body.kind_counts) >= body.total
     raw = control.raw_body(ctx, "r3", kind=LogBodyKind.REQUEST)
-    assert raw["body"]["api_key"] == "<redacted>"
-    assert "secret" not in json.dumps(raw)
+    assert raw["body"]["api_key"] == "secret"
+    assert "secret" in json.dumps(raw)
     item = control.body_item(ctx, "r3", kind=LogBodyKind.REQUEST, item_id="item_1")
     assert item["id"] == "item_1"
 
@@ -404,7 +407,7 @@ def test_response_parser_preserves_frozen_dict_raw_fallback_and_json_string_resu
     assert from_string[0]["text"] == "structured answer"
 
 
-def test_logs_control_and_http_structure_sanitized_json_response_body(tmp_path):
+def test_logs_control_and_http_structure_parses_json_response_body(tmp_path):
     marker = "P4_SECRET_MARKER"
     db = FakeLogDb()
     original_detail = db.log_detail
@@ -434,7 +437,10 @@ def test_logs_control_and_http_structure_sanitized_json_response_body(tmp_path):
         {"kind": "finish", "count": 1},
         {"kind": "usage", "count": 1},
     )
-    assert marker not in json.dumps(result.items)
+    assert marker not in json.dumps(result.items)  # parser exposes only known response items
+    raw = control.raw_body(context(), "r3", kind=LogBodyKind.RESPONSE)
+    assert raw["body"]["github_token"] == marker
+    assert raw["body"]["upstreamSecret"] == marker
 
     client, _, controls, auth = build_client(tmp_path)
     controls.logs = control
@@ -446,6 +452,12 @@ def test_logs_control_and_http_structure_sanitized_json_response_body(tmp_path):
         "assistant", "finish", "usage",
     ]
     assert marker not in response.text
+    raw_response = client.get(
+        "/api/management/v1/logs/r3/raw-body?kind=response", headers=auth,
+    )
+    assert raw_response.status_code == 200, raw_response.text
+    assert raw_response.json()["data"]["body"]["github_token"] == marker
+    assert raw_response.json()["data"]["body"]["upstreamSecret"] == marker
 
 
 def test_logs_list_uses_authoritative_transport_and_page_billing_only(tmp_path):
