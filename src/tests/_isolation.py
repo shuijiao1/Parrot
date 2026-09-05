@@ -58,11 +58,8 @@ def isolate() -> str:
         "telegram": {"botToken": "", "adminIds": []},
         # 确保测试里 mock 模式开（OAuth 不触网）
         "oauth": {"mockMode": True},
-        # 生产配置没有 Codex 版本/profile 默认；测试基线显式选择固定 fixture。
-        "openaiOAuth": {
-            "codexCliVersion": "0.153.4",
-            "codexProtocolProfile": "rust-v0.153.4",
-        },
+        # 不固定会过期的版本/profile；首次 config.get() 必须走生产归一化，
+        # 从 codex_profiles/current.json 选择当前已审核组合。
         "images": {"dbPath": os.environ["PARROT_TEST_IMAGE_PATH"]},
     }
     with open(cfg_path, "w") as f:
