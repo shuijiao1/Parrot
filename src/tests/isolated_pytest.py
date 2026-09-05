@@ -142,10 +142,8 @@ def main(argv: list[str]) -> int:
         "logDir": str(log_dir),
         "telegram": {"botToken": "", "adminIds": []},
         "oauth": {"mockMode": True},
-        "openaiOAuth": {
-            "codexCliVersion": "0.153.4",
-            "codexProtocolProfile": "rust-v0.153.4",
-        },
+        # Keep the raw fixture release-agnostic.  The first config load must run
+        # the production normalizer and select codex_profiles/current.json.
         "images": {"dbPath": str(image_path)},
     }
     config_path.write_text(json.dumps(minimal, ensure_ascii=False, indent=2))

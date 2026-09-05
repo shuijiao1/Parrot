@@ -15,7 +15,7 @@ def _import_modules():
     root = _ap_os.path.dirname(_ap_os.path.dirname(_ap_os.path.dirname(_ap_os.path.abspath(__file__))))
     if root not in _ap_sys.path:
         _ap_sys.path.insert(0, root)
-    from src import config, oauth_manager
+    from src import config, oauth_manager, state_db
     from src.oauth import openai as openai_provider
     from src.oauth.openai_import import parse_openai_import_payload
     from src.telegram import states, ui
@@ -23,6 +23,7 @@ def _import_modules():
     return {
         "config": config,
         "oauth_manager": oauth_manager,
+        "state_db": state_db,
         "openai_provider": openai_provider,
         "parse_openai_import_payload": parse_openai_import_payload,
         "oauth_menu": oauth_menu,
@@ -48,6 +49,8 @@ class ApiRecorder:
 
 
 def _setup(m):
+    m["state_db"].init()
+
     def _reset(c):
         c.setdefault("oauth", {})["mockMode"] = True
         c["oauthAccounts"] = []
@@ -252,9 +255,17 @@ def test_finish_openai_add_saves_only_current_workspace_identity(m):
     assert acc["organization_id"] == "org-team"
     assert acc["plan_type"] == "team"
     assert om.get_account("openai:same@example.com:acct-personal") is None
-    sent = rec.last("sendMessage")
-    assert sent and "OpenAI OAuth 账户已添加" in sent["text"]
-    assert "Team Space" in sent["text"]
+    # Post-save model discovery is asynchronous and may legitimately emit a
+    # later progress/result message through the same recorder.  Assert the
+    # account-add result itself was emitted rather than assuming it stays last.
+    sent = next(
+        (
+            item for item in rec.by("sendMessage")
+            if "OpenAI OAuth 账户已添加" in item.get("text", "")
+        ),
+        None,
+    )
+    assert sent and "Team Space" in sent["text"]
 
 
 def test_same_email_different_workspace_adds_separate_openai_account(m):
