@@ -17,6 +17,7 @@ from src.management_control.context import ManagementContext
 from src.management_control.errors import ManagementError, ManagementErrorCode
 
 from . import inspector
+from ._log_errors import map_historical_log_errors
 from .common import (
     PageResult,
     camelize,
@@ -102,20 +103,21 @@ class LogsControl:
         require(context)
         started_at, ended_at = normalize_utc_range(query.started_at, query.ended_at)
         query = replace(query, started_at=started_at, ended_at=ended_at)
-        rows, total = self.log_db.management_logs_page(
-            statuses=[item.value for item in query.statuses] or None,
-            api_keys=list(query.api_keys) or None,
-            models=list(query.models) or None,
-            channel_keys=list(query.channels) or None,
-            protocols=[item.value for item in query.protocols] or None,
-            query=query.query,
-            started_at=(query.started_at.timestamp() if query.started_at is not None else None),
-            ended_at=(query.ended_at.timestamp() if query.ended_at is not None else None),
-            sort=query.sort.value,
-            descending=query.descending,
-            page=query.page,
-            page_size=query.page_size,
-        )
+        with map_historical_log_errors():
+            rows, total = self.log_db.management_logs_page(
+                statuses=[item.value for item in query.statuses] or None,
+                api_keys=list(query.api_keys) or None,
+                models=list(query.models) or None,
+                channel_keys=list(query.channels) or None,
+                protocols=[item.value for item in query.protocols] or None,
+                query=query.query,
+                started_at=(query.started_at.timestamp() if query.started_at is not None else None),
+                ended_at=(query.ended_at.timestamp() if query.ended_at is not None else None),
+                sort=query.sort.value,
+                descending=query.descending,
+                page=query.page,
+                page_size=query.page_size,
+            )
         billing = self.log_db.costs_for_logs(rows)
         return PageResult(
             tuple(
@@ -206,13 +208,15 @@ class LogsControl:
 
     def filter_options(self, context: ManagementContext) -> dict[str, Any]:
         require(context)
-        result = copy.deepcopy(self.log_db.management_log_filter_options())
+        with map_historical_log_errors():
+            result = copy.deepcopy(self.log_db.management_log_filter_options())
         result["revision"] = revision_for(result)
         return result
 
     def detail(self, context: ManagementContext, log_id: str) -> dict[str, Any]:
         require(context)
-        raw = self.log_db.management_log_detail(log_id)
+        with map_historical_log_errors():
+            raw = self.log_db.management_log_detail(log_id)
         if not raw or not raw.get("log"):
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         detail = raw.get("detail") or {}
@@ -237,7 +241,8 @@ class LogsControl:
 
     def _body_snapshot(self, context: ManagementContext, log_id: str, kind: LogBodyKind) -> tuple[Any, str]:
         require(context, Capability.LOG_BODY_READ)
-        raw = self.log_db.management_log_detail(log_id)
+        with map_historical_log_errors():
+            raw = self.log_db.management_log_detail(log_id)
         if not raw or not raw.get("log"):
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         detail = raw.get("detail") or {}

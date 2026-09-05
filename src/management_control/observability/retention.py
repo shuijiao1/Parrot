@@ -113,6 +113,10 @@ class RetentionControl:
         policy = self.log_db.retention_policy(cfg)
         try:
             rows = int(self.log_db.management_logs_count())
+        except log_db_module.HistoricalLogError as exc:
+            raise ManagementError(
+                ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
+            ) from exc
         except Exception:
             rows = 0
         data = {
