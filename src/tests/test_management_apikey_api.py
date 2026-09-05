@@ -46,7 +46,7 @@ class FakeNotifier:
         return True
 
 
-def build_app(tmp_path, *, initial_config=None):
+def build_app(tmp_path, *, initial_config=None, generated=None):
     store = ManagementStateStore(str(tmp_path / "management-apikey.db"), clock=time.time)
     sessions = SessionService(
         store,
@@ -81,8 +81,9 @@ def build_app(tmp_path, *, initial_config=None):
     )
     control, config_store, limiter, _ = make_control(
         initial_config,
-        generated=Sequence(["ccp-" + "r" * 48]),
+        generated=generated or Sequence(["ccp-" + "r" * 48]),
         tokens=Sequence(["plan-public", "plan-secret"]),
+        provenance_store=store,
     )
     app = FastAPI()
     app.state.management_runtime = runtime
@@ -271,7 +272,7 @@ def test_all_operations_happy_path_call_control_once_with_authenticated_actor(tm
         assert created.headers["cache-control"] == "no-store"
         assert created.json()["data"]["secret"] == "ccp-client-custom-secret"
         assert created.json()["data"]["apiKey"]["source"] == "custom"
-        assert store.value["apiKeys"]["client.new"]["source"] == "custom"
+        assert "source" not in store.value["apiKeys"]["client.new"]
         custom_items = client.get(
             "/api/management/v1/api-keys?source=custom&pageSize=200",
             headers=headers,

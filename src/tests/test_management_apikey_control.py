@@ -116,7 +116,9 @@ def context(*capabilities, subject="actor"):
     return ManagementContext(request_id="request-test", actor=principal)
 
 
-def make_control(value=None, *, clock=None, generated=None, tokens=None):
+def make_control(
+    value=None, *, clock=None, generated=None, tokens=None, provenance_store=None,
+):
     store = FakeConfig(value or {
         "apiKeys": {
             "alpha": {
@@ -142,6 +144,7 @@ def make_control(value=None, *, clock=None, generated=None, tokens=None):
     audit = BoundedAuditSink()
     control = ApiKeyControl(
         config_store=store,
+        provenance_store=provenance_store,
         limiter=limiter,
         statistics=FakeStats(),
         model_registry=FakeModels(),
