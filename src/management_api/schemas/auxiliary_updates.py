@@ -83,7 +83,6 @@ class StageUpdateOperationData(ManagementOperationData):
         default=None,
         min_length=16,
         max_length=256,
-        json_schema_extra={"writeOnly": True},
     )
 
 
