@@ -282,8 +282,6 @@ class ApiKeyControl:
             raise self._validation("mode", "UNSUPPORTED_VALUE", "unsupported creation mode")
         self.validate_custom_secret(secret)
 
-        self._stage_provenance(name, secret)
-
         def mutate(cfg: dict) -> None:
             keys = cfg.setdefault("apiKeys", {})
             if not isinstance(keys, dict):
@@ -294,12 +292,12 @@ class ApiKeyControl:
             for raw in keys.values():
                 if self._normalize_entry(raw).get("key") == secret:
                     raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT, "API key secret is already in use")
+            self._stage_provenance(name, secret)
             keys[name] = {
                 "key": secret,
                 **(
                     {"source": mode.value}
-                    if self._provenance_store is None
-                    and context.actor.auth_method is not AuthMethod.TELEGRAM_ADMIN
+                    if context.actor.auth_method is not AuthMethod.TELEGRAM_ADMIN
                     else {}
                 ),
                 "enabled": True,
@@ -402,11 +400,9 @@ class ApiKeyControl:
                 raise self._not_found(key_id)
             entry = self._normalize_entry(raw)
             self._check_revision(key_id, entry, if_match)
+            self._stage_provenance(key_id, str(entry.get("key") or ""))
             keys.pop(key_id, None)
 
-        current = self._raw_keys().get(key_id)
-        if current is not None:
-            self._stage_provenance(key_id, str(current.get("key") or ""))
         self._config.update(mutate)
         self._forget_provenance(key_id)
         self._limiter.forget_key(key_id)
@@ -580,8 +576,6 @@ class ApiKeyControl:
         source: ApiKeyProvenance,
         record_source: bool,
     ) -> None:
-        self._stage_provenance(key_id, secret)
-
         def mutate(cfg: dict) -> None:
             keys = cfg.get("apiKeys") or {}
             raw = keys.get(key_id) if isinstance(keys, dict) else None
@@ -592,8 +586,9 @@ class ApiKeyControl:
             for name, other in keys.items():
                 if name != key_id and self._normalize_entry(other).get("key") == secret:
                     raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT, "API key secret is already in use")
+            self._stage_provenance(key_id, secret)
             entry["key"] = secret
-            if self._provenance_store is None and (record_source or "source" in entry):
+            if record_source or "source" in entry:
                 entry["source"] = source.value
             keys[key_id] = entry
         self._config.update(mutate)
@@ -754,11 +749,29 @@ class ApiKeyControl:
             secret = str(entry.get("key") or "")
             if not secret:
                 return ApiKeyProvenance.UNKNOWN
+            fingerprint = self._provenance_fingerprint(key_id, secret)
             try:
-                source = self._provenance_store.get_api_key_provenance(
+                state, source = self._provenance_store.get_api_key_provenance_state(
                     key_id=key_id,
-                    secret_fingerprint=self._provenance_fingerprint(key_id, secret),
+                    secret_fingerprint=fingerprint,
                 )
+                if state == "missing":
+                    configured = str(entry.get("source") or "")
+                    if configured not in {
+                        ApiKeyProvenance.CUSTOM.value,
+                        ApiKeyProvenance.GENERATED.value,
+                    }:
+                        return ApiKeyProvenance.UNKNOWN
+                    try:
+                        state, source = self._provenance_store.adopt_api_key_provenance(
+                            key_id=key_id,
+                            secret_fingerprint=fingerprint,
+                            source=configured,
+                        )
+                    except Exception:
+                        return ApiKeyProvenance(configured)
+                if state != "valid":
+                    return ApiKeyProvenance.UNKNOWN
             except Exception:
                 return ApiKeyProvenance.UNKNOWN
         else:
