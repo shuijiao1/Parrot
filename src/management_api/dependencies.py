@@ -67,6 +67,7 @@ class ManagementRuntime:
                     audit_sink=self.audit_sink,
                     operations=self.operations,
                     operation_registry=self.operation_registry,
+                    state_store=self.state_store,
                 )
             return self.controls
 

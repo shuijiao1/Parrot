@@ -409,6 +409,7 @@ def _save_usage_to_quota_cache(
     ak: str,
     usage: dict,
     *,
+    chat_id: int,
     email: str | None = None,
     already_saved: bool = False,
 ):
@@ -417,7 +418,7 @@ def _save_usage_to_quota_cache(
         return None
     try:
         oauth_control.save_usage_snapshot(
-            _management_context(0), ak, usage,
+            _management_context(chat_id), ak, usage,
             email=email if email is not None else _account_email(ak),
         )
     except Exception as exc:
@@ -425,26 +426,32 @@ def _save_usage_to_quota_cache(
     return None
 
 
-def _fetch_and_save_usage_result_sync(ak: str, *, email: str | None = None, on_stage=None) -> dict:
+def _fetch_and_save_usage_result_sync(
+    ak: str, *, chat_id: int, email: str | None = None, on_stage=None,
+) -> dict:
     """Delegate the complete refresh/save/evaluate use case to shared Control."""
     return oauth_control.refresh_usage_now(
-        _management_context(0),
+        _management_context(chat_id),
         ak,
         email=email if email is not None else _account_email(ak),
         on_stage=on_stage,
     )
 
 
-def _fetch_and_save_usage_sync(ak: str, *, email: str | None = None):
+def _fetch_and_save_usage_sync(
+    ak: str, *, chat_id: int, email: str | None = None,
+):
     """同步拉 usage 并写 quota cache；返回 usage 或 Exception。"""
-    result = _fetch_and_save_usage_result_sync(ak, email=email)
+    result = _fetch_and_save_usage_result_sync(ak, chat_id=chat_id, email=email)
     return result.get("error") or result.get("usage")
 
 
-def _evaluate_quota_action(ak: str, usage: dict) -> dict | None:
+def _evaluate_quota_action(
+    ak: str, usage: dict, *, chat_id: int,
+) -> dict | None:
     """Legacy test seam; production refresh orchestration evaluates in Control."""
     try:
-        return oauth_control.evaluate_usage(_management_context(0), ak, usage)
+        return oauth_control.evaluate_usage(_management_context(chat_id), ak, usage)
     except Exception as exc:
         print(f"[oauth_menu] quota evaluate failed for {ak}: {exc}")
         return None
@@ -752,7 +759,9 @@ def _schedule_openai_metadata_for_ui(account_keys: list[str] | str, *, force: bo
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def _schedule_oauth_cache_refresh_for_ui(account_keys: list[str] | str, *, force: bool = False) -> None:
+def _schedule_oauth_cache_refresh_for_ui(
+    account_keys: list[str] | str, *, chat_id: int, force: bool = False,
+) -> None:
     if isinstance(account_keys, str):
         keys = [account_keys]
     else:
@@ -775,7 +784,9 @@ def _schedule_oauth_cache_refresh_for_ui(account_keys: list[str] | str, *, force
         for ak in pending:
             try:
                 email = _account_email(ak)
-                result = _fetch_and_save_usage_result_sync(ak, email=email)
+                result = _fetch_and_save_usage_result_sync(
+                    ak, chat_id=chat_id, email=email,
+                )
                 if result.get("error") is not None:
                     print(f"[oauth_menu] background quota refresh failed for {ak}: {result.get('error')}")
                     continue
@@ -3023,6 +3034,7 @@ def _format_month_stats_block(account_key: str, *,
 
 def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILTER_ALL,
                         *, refresh_quota: bool = True,
+                        actor_chat_id: int | None = None,
                         reset_credit_count_override: int | None = None,
                         month_snapshot: dict | None = None,
                         model_stats: list[dict] | None = None,
@@ -3039,7 +3051,11 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
             print(f"[oauth_menu] cached quota evaluate failed for {account_key}: {exc}")
         acc = oauth_control.account_snapshot(account_key) or acc
         if _should_refresh_account_for_ui(acc):
-            _schedule_oauth_cache_refresh_for_ui(account_key)
+            if actor_chat_id is None:
+                raise ValueError("actor_chat_id is required when quota refresh is enabled")
+            _schedule_oauth_cache_refresh_for_ui(
+                account_key, chat_id=actor_chat_id,
+            )
     if oauth_control.provider_of_snapshot(acc) == "openai":
         _schedule_openai_metadata_for_ui(account_key)
         acc = oauth_control.account_snapshot(account_key) or acc
@@ -3308,7 +3324,9 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
         return
 
     email = _account_email(ak)
-    usage_result = _fetch_and_save_usage_sync(ak, email=email)
+    usage_result = _fetch_and_save_usage_sync(
+        ak, chat_id=chat_id, email=email,
+    )
     if isinstance(usage_result, Exception):
         print(f"[oauth_menu] usage fetch after token refresh failed for {ak}: {usage_result}")
 
@@ -3324,7 +3342,9 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
         elif isinstance(sync_result, (dict, Exception)):
             model_sync_note = " · 模型同步失败（保留原目录）"
 
-    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
+    text, kb = _detail_text_and_kb(
+        ak, page=page, filter_key=filter_key, actor_chat_id=chat_id,
+    )
     if text:
         ui.edit(chat_id, message_id,
                 f"✅ Token 已刷新{model_sync_note}\n\n" + text,
@@ -3351,7 +3371,9 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
     else:
         ui.answer_cb(cb_id, "拉取中...")
 
-    refresh_result = _fetch_and_save_usage_result_sync(ak, email=email)
+    refresh_result = _fetch_and_save_usage_result_sync(
+        ak, chat_id=chat_id, email=email,
+    )
     if refresh_result.get("error") is not None:
         err = refresh_result["error"]
         ui.send(chat_id, _oauth_error_html(
@@ -3934,7 +3956,9 @@ def on_clear_errors(chat_id: int, message_id: int, cb_id: str, short: str, page:
         return
     oauth_control.clear_errors(_management_context(chat_id), ak)
     ui.answer_cb(cb_id, "已清除该账号的所有模型冷却")
-    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
+    text, kb = _detail_text_and_kb(
+        ak, page=page, filter_key=filter_key, actor_chat_id=chat_id,
+    )
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
@@ -3950,7 +3974,9 @@ def on_reset_quota_ask(chat_id: int, message_id: int, cb_id: str, short: str,
         return
 
     email = _account_email(ak)
-    usage_result = _fetch_and_save_usage_sync(ak, email=email)
+    usage_result = _fetch_and_save_usage_sync(
+        ak, chat_id=chat_id, email=email,
+    )
     if isinstance(usage_result, Exception):
         ui.answer_cb(cb_id)
         return
@@ -4166,7 +4192,9 @@ def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str, pag
         return
     oauth_control.clear_affinity(_management_context(chat_id), ak)
     ui.answer_cb(cb_id, "已清亲和")
-    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
+    text, kb = _detail_text_and_kb(
+        ak, page=page, filter_key=filter_key, actor_chat_id=chat_id,
+    )
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
@@ -4194,7 +4222,9 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int =
         oauth_control.set_account_enabled(_management_context(chat_id), ak, True)
         ui.answer_cb(cb_id, "已启用")
 
-    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
+    text, kb = _detail_text_and_kb(
+        ak, page=page, filter_key=filter_key, actor_chat_id=chat_id,
+    )
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
@@ -4360,7 +4390,9 @@ def _run_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: list[
                 _set_item(idx0, ak, "  ⚠ 重置卡明细更新失败，已保留用量结果")
 
         try:
-            result = _fetch_and_save_usage_result_sync(ak, email=_account_email(ak), on_stage=_stage)
+            result = _fetch_and_save_usage_result_sync(
+                ak, chat_id=chat_id, email=_account_email(ak), on_stage=_stage,
+            )
             if result.get("error") is not None:
                 fail_count += 1
                 err = _oauth_error_html(result["error"], provider=provider, operation="fetch_usage", indent="  ")
@@ -4558,7 +4590,9 @@ def _run_refresh_all_legacy_panel(chat_id: int, progress_mid: int, account_keys:
             continue
 
         try:
-            result = _fetch_and_save_usage_result_sync(ak, email=email, on_stage=_stage)
+            result = _fetch_and_save_usage_result_sync(
+                ak, chat_id=chat_id, email=email, on_stage=_stage,
+            )
             if result.get("error") is not None:
                 fail_count += 1
                 _replace_last_with_oauth_error(
@@ -5097,7 +5131,7 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
             # ``_persist_new_or_stage_overwrite`` has already delegated the full
             # usage/quota post-save use case to Control.
             _save_usage_to_quota_cache(
-                account_key, usage, email=email, already_saved=True,
+                account_key, usage, chat_id=chat_id, email=email, already_saved=True,
             )
     except Exception as exc:
         ui.edit(
@@ -5394,24 +5428,31 @@ def _find_openai_existing_for_entry(entry: dict) -> dict | None:
     return _find_openai_account_by_email(entry.get("email", ""))
 
 
-def _upsert_openai_account_entry(entry: dict, *, preserve_existing_settings: bool = True) -> bool:
+def _upsert_openai_account_entry(
+    entry: dict, *, chat_id: int, preserve_existing_settings: bool = True,
+) -> bool:
     """写入 OpenAI 账号。返回 True 表示替换既有账号，False 表示新增。"""
     # The authoritative identity writer already preserves account-local settings.
     # This compatibility helper is retained for existing callers, but no longer
     # edits oauthAccounts directly.
-    return oauth_control.upsert_openai_account_entry(_management_context(0), entry)
+    return oauth_control.upsert_openai_account_entry(
+        _management_context(chat_id), entry,
+    )
 
 
-def _save_openai_entry_with_duplicate_policy(entry: dict) -> tuple[str, str]:
+def _save_openai_entry_with_duplicate_policy(
+    entry: dict, *, chat_id: int,
+) -> tuple[str, str]:
     """Compatibility helper for non-interactive callers; never overwrite a duplicate.
 
     Production Telegram paths stage duplicates through
     ``_persist_new_or_stage_overwrite``.  Keeping this helper fail-closed prevents
     old call sites/tests from reviving token-validity based skip/replace behavior.
     """
-    if oauth_control.find_exact_identity(_management_context(0), entry) is not None:
+    context = _management_context(chat_id)
+    if oauth_control.find_exact_identity(context, entry) is not None:
         return "duplicate", "需要用户确认覆盖"
-    added = oauth_control.add_account_entry(_management_context(0), entry)
+    added = oauth_control.add_account_entry(context, entry)
     if added.get("status") != "added":
         return "duplicate", "需要用户确认覆盖"
     return "added", "新增"
@@ -5991,7 +6032,7 @@ def _stage_openai_import_candidates(items: list[dict]) -> dict:
     return staged
 
 
-def _commit_staged_openai_import(staged: dict, *, chat_id: int = 0) -> dict:
+def _commit_staged_openai_import(staged: dict, *, chat_id: int) -> dict:
     context = _management_context(chat_id)
     result = {"added": [], "replaced": [], "failed": list(staged.get("failed") or []), "model_sync_keys": []}
     for record in staged.get("new") or []:
@@ -6001,11 +6042,11 @@ def _commit_staged_openai_import(staged: dict, *, chat_id: int = 0) -> dict:
         )
         if added.get("status") != "added":
             result["failed"].append((entry.get("email") or "?", "账户已并发出现，请重新导入确认")); continue
-        post_save = oauth_control.start_post_save_model_sync(context, record["account_key"])
         result["added"].append(entry.get("email") or "?")
         result["model_sync_keys"].append(record["account_key"])
-        result.setdefault("model_sync_futures", []).append(
-            (record["account_key"], post_save.get("model_sync_future"))
+        _fetch_and_save_usage_sync(
+            record["account_key"], chat_id=chat_id,
+            email=entry.get("email") or "",
         )
     for record in staged.get("duplicate") or []:
         entry = record["entry"]
@@ -6014,11 +6055,11 @@ def _commit_staged_openai_import(staged: dict, *, chat_id: int = 0) -> dict:
         )
         if replacement.get("status") != "replaced":
             result["failed"].append((entry.get("email") or "?", "目标账户已变化，请重新导入确认")); continue
-        post_save = oauth_control.start_post_save_model_sync(context, record["account_key"])
         result["replaced"].append(entry.get("email") or "?")
         result["model_sync_keys"].append(record["account_key"])
-        result.setdefault("model_sync_futures", []).append(
-            (record["account_key"], post_save.get("model_sync_future"))
+        _fetch_and_save_usage_sync(
+            record["account_key"], chat_id=chat_id,
+            email=entry.get("email") or "",
         )
     return result
 
@@ -6033,11 +6074,20 @@ def _wait_import_model_sync(chat_id: int, message_id: int, result: dict) -> None
         f"🔄 <b>正在同步模型，请稍候…</b>\n\n类型: <code>OpenAI</code>\n"
         f"进度: <code>0 / {len(keys)}</code>（最多并发 3）",
     )
-    future_by_key = dict(result.get("model_sync_futures") or ())
-    futures = [future_by_key[key] for key in keys if future_by_key.get(key) is not None]
+    context = _management_context(chat_id)
+    futures = []
+    for key in keys:
+        post_save = oauth_control.start_post_save_model_sync(context, key)
+        future = post_save.get("model_sync_future")
+        if future is None:
+            launch_error = post_save.get("model_sync_error")
+            if isinstance(launch_error, BaseException):
+                raise launch_error
+            raise RuntimeError(str(launch_error or "model sync did not start"))
+        futures.append(future)
     done, pending = concurrent.futures.wait(
         futures, timeout=oauth_control.model_sync_foreground_timeout_seconds(),
-    ) if futures else (set(), set())
+    )
     success = failed = 0
     for future in done:
         try:
@@ -6048,7 +6098,6 @@ def _wait_import_model_sync(chat_id: int, message_id: int, result: dict) -> None
                 failed += 1
         except Exception:
             failed += 1
-    failed += len(keys) - len(futures)
     result["model_sync"] = {"success": success, "failed": failed, "background": len(pending)}
 
 

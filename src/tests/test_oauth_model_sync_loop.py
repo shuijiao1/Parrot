@@ -42,7 +42,12 @@ def sync_config():
 
 def test_due_requires_complete_provider_native_catalog():
     now = datetime.now(timezone.utc)
-    fresh = {"models": ["a", "b"], "last_model_sync": _iso(-60)}
+    fresh = {
+        "models": ["a", "b"],
+        "last_model_sync": _iso(-60),
+        "last_model_sync_client_version": oauth_manager.codex_cli_version(),
+        "last_model_sync_profile": oauth_manager.codex_protocol_profile().profile_id,
+    }
 
     assert oauth_manager._model_sync_due(_account("openai", 1, **fresh), now=now)
     assert oauth_manager._model_sync_due(_account(
@@ -73,6 +78,27 @@ def test_due_empty_stale_and_failed_retry():
     old_failure = _account("claude", 1, last_model_sync_attempt=_iso(-(15 * 60 + 1)), last_model_sync_error="timeout")
     assert not oauth_manager._model_sync_due(recent_failure, now=now)
     assert oauth_manager._model_sync_due(old_failure, now=now)
+
+
+def test_openai_profile_or_client_version_change_bypasses_success_ttl():
+    """A fresh complete LKG is stale immediately when Codex identity changes."""
+    now = datetime.now(timezone.utc)
+    profile = oauth_manager.codex_protocol_profile()
+    base = _account(
+        "openai",
+        1,
+        models=["gpt-6-astra"],
+        account_model_catalog={"models": [{"id": "gpt-6-astra"}]},
+        last_model_sync=_iso(-60),
+    )
+    assert oauth_manager._model_sync_due(base, now=now)
+    base["last_model_sync_client_version"] = "0.152.0"
+    base["last_model_sync_profile"] = profile.profile_id
+    assert oauth_manager._model_sync_due(base, now=now)
+    base["last_model_sync_client_version"] = profile.client_version
+    assert not oauth_manager._model_sync_due(base, now=now)
+    base["last_model_sync_profile"] = "stale-profile"
+    assert oauth_manager._model_sync_due(base, now=now)
 
 
 @pytest.mark.asyncio
@@ -107,6 +133,7 @@ async def test_metadata_only_backfill_does_not_notify_or_repeat_when_fresh(monke
 
     saved = oauth_manager.get_account("openai:openai1@x:ws1")
     assert saved["account_model_catalog"]["models"][1]["name"] == "B"
+    assert saved["last_model_sync_client_version"] == oauth_manager.codex_cli_version()
     assert not oauth_manager._model_sync_due(saved)
     assert await oauth_manager.oauth_model_sync_once(trigger="background") == []
     assert len(calls) == 1

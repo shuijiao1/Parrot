@@ -49,6 +49,12 @@ from .oauth import antigravity as antigravity_provider
 from .oauth import cursor as cursor_provider
 from .oauth import openai as openai_provider
 from .oauth import xai as xai_provider
+from .openai.codex_constants import (
+    codex_backend_base_url,
+    codex_cli_version,
+    codex_protocol_profile,
+    current_codex_protocol_profile,
+)
 from .transform.cc_mimicry import CLI_USER_AGENT
 
 
@@ -550,7 +556,11 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> bool:
             acc.update(new)
             if _acc_provider(acc) == "openai":
                 from .openai.codex_device_fingerprint import normalize_account_device
-                normalize_account_device(acc)
+                provider_cfg = cfg.get("openaiOAuth") or {}
+                normalize_account_device(
+                    acc,
+                    protocol_profile=codex_protocol_profile(provider_cfg).profile_id,
+                )
             if acc.get("disabled_reason") == "auth_error":
                 acc["disabled_reason"] = None
                 acc["disabled_until"] = None
@@ -581,6 +591,12 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> bool:
         )
     else:
         config.update(mutate)
+    if _acc_provider(old_acc) == "openai":
+        from .openai.codex_identity import register_account_identity
+        refreshed = get_account(new_key)
+        if refreshed is None:
+            raise RuntimeError("refreshed OpenAI account disappeared before identity registration")
+        register_account_identity(refreshed)
     return True
 
 
@@ -707,7 +723,11 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
         # 双重检查：force 路径不做（强制刷）
         if not force:
             expired = _parse_iso(acc.get("expired"))
-            if expired and (expired - datetime.now(timezone.utc)).total_seconds() >= 300:
+            if (
+                expired
+                and (expired - datetime.now(timezone.utc)).total_seconds() >= 300
+                and (provider_of(acc) != "openai" or _openai_workspace_id(acc))
+            ):
                 return acc["access_token"]
 
         provider = provider_of(acc)
@@ -876,7 +896,8 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
 async def ensure_valid_token(account_key: str) -> str:
     """调用方：OAuthChannel.build_upstream_request。
 
-    返回可用的 access_token。剩余 ≥ 5min 直接返回缓存；否则在线程中持锁刷新。
+    返回可用的 access_token。剩余 ≥ 5min 且身份完整时返回缓存；否则持锁刷新。
+    旧 OpenAI 账号缺 workspace 时也需刷新一次，不能因 token 尚有效而跳过补全。
     同一 account_key 的并发请求由 threading.Lock 串行（跨 event loop 安全）。
     """
     account_key = _resolve_existing_account_key_or_raise(account_key)
@@ -885,7 +906,11 @@ async def ensure_valid_token(account_key: str) -> str:
         raise ValueError(f"unknown OAuth account: {account_key}")
 
     expired = _parse_iso(acc.get("expired"))
-    if expired and (expired - datetime.now(timezone.utc)).total_seconds() >= 300:
+    if (
+        expired
+        and (expired - datetime.now(timezone.utc)).total_seconds() >= 300
+        and (provider_of(acc) != "openai" or _openai_workspace_id(acc))
+    ):
         return acc["access_token"]
 
     return await asyncio.to_thread(_refresh_sync_locked, account_key, False)
@@ -2988,7 +3013,7 @@ def bootstrap_openai_workspace_key_migration() -> dict:
 
 
 def _openai_metadata_patch(entry: dict) -> dict:
-    from .openai.codex_device_fingerprint import normalize_account_device
+    from .openai.codex_identity import normalize_account_identity
 
     patch: dict[str, Any] = {
         "id_token": entry.get("id_token", "") or "",
@@ -3002,10 +3027,25 @@ def _openai_metadata_patch(entry: dict) -> dict:
     }
     if "codexDeviceInstallationId" in entry:
         patch["codexDeviceInstallationId"] = entry.get("codexDeviceInstallationId")
-    if "codexDeviceConvergenceEnabled" in entry:
-        patch["codexDeviceConvergenceEnabled"] = entry.get("codexDeviceConvergenceEnabled")
+    if "codexIdentity" in entry:
+        patch["codexIdentity"] = copy.deepcopy(entry.get("codexIdentity"))
     candidate = {"provider": "openai", **patch}
-    normalize_account_device(candidate)
+    provider_cfg = config.get().get("openaiOAuth") or {}
+    if provider_cfg.get("codexProfileAutoUpdate", True) is True:
+        selected = current_codex_protocol_profile()
+        provider_cfg = {
+            **provider_cfg,
+            "codexProtocolProfile": selected.profile_id,
+            "codexCliVersion": selected.client_version,
+        }
+    identity_cfg = provider_cfg.get("codexIdentity") or {}
+    normalize_account_identity(
+        candidate,
+        protocol_profile=codex_protocol_profile(provider_cfg).profile_id,
+        new_identity_generation_version=identity_cfg.get(
+            "newIdentityGenerationVersion", 1
+        ),
+    )
     candidate.pop("provider", None)
     return candidate
 
@@ -3105,9 +3145,21 @@ def _replace_exact_identity_in_config(
         if "models" in current:
             replacement["models"] = copy.deepcopy(current["models"])
     if provider == "openai":
-        for key in ("codexDeviceInstallationId", "codexDeviceConvergenceEnabled"):
+        from .openai.codex_identity import account_identity_from_account
+
+        replacement.pop("codexDeviceConvergenceEnabled", None)
+        for key in ("codexIdentity", "codexDeviceInstallationId"):
             if key not in entry and key in current:
                 replacement[key] = copy.deepcopy(current[key])
+        current_identity = account_identity_from_account(current, require=False)
+        replacement_identity = account_identity_from_account(replacement, require=False)
+        if (
+            current_identity is not None
+            and replacement_identity is not None
+            and current_identity.installation_id != replacement_identity.installation_id
+        ):
+            result["status"] = "identity_conflict"
+            return result
     if provider == "cursor":
         for key in ("cursor_max_context_disabled_models", "cursor_disabled_models"):
             if key not in entry and key in current:
@@ -3257,8 +3309,8 @@ def _add_account_serialized(
       - provider: "claude" (默认) / "openai" / "xai" / "cursor" / "antigravity"
       - id_token / chatgpt_account_id / workspace_id / workspace_name /
         workspace_type / organization_id / plan_type / subscription_expires_at /
-        codexDeviceInstallationId / codexDeviceConvergenceEnabled
-        (OpenAI 专属；有 workspace 时默认开启并生成 UUIDv4；显式 false 关闭)
+        codexIdentity / codexDeviceInstallationId
+        (OpenAI 专属；按 canonical workspace 强制建立 versioned UUIDv4 identity)
       - id_token / subject / sub / base_url / token_endpoint / redirect_uri
         (xAI 专属)
       - cursor_max_context_disabled_models（Cursor 每账号显式关闭 Max Context 的例外）
@@ -3320,6 +3372,21 @@ def _add_account_serialized(
     # OpenAI 专属字段（缺失时保持空串，渲染端按需展示）
     if provider == "openai":
         normalized.update(_openai_metadata_patch(entry))
+        normalized["last_model_sync_client_version"] = str(
+            entry.get("last_model_sync_client_version") or ""
+        )
+        normalized["last_model_sync_profile"] = str(
+            entry.get("last_model_sync_profile") or ""
+        )
+        for field in ("last_model_sync_attempt_client_version", "last_model_sync_attempt_profile"):
+            normalized[field] = str(entry.get(field) or "")
+        normalized["models_etag"] = str(entry.get("models_etag") or "")
+        normalized["models_etag_client_version"] = str(
+            entry.get("models_etag_client_version") or ""
+        )
+        normalized["models_etag_profile"] = str(
+            entry.get("models_etag_profile") or ""
+        )
     # xAI 专属字段（缺失时保持空串；subject 用于稳定 account_key）
     elif provider == "xai":
         subject = str(entry.get("subject") or entry.get("sub") or "")
@@ -3447,6 +3514,32 @@ def _add_account_serialized(
         for account in active_config.get("oauthAccounts", []):
             if account is not existing_target and _canonical_key(account) == normalized_key:
                 raise ValueError(f"OAuth account identity already exists: {normalized_key}")
+    if provider == "openai":
+        from .openai.codex_identity import (
+            account_identity_from_account,
+            register_account_identity,
+        )
+        incoming_explicit_identity = (
+            "codexIdentity" in entry or "codexDeviceInstallationId" in entry
+        )
+        if existing_target is not None:
+            existing_identity = account_identity_from_account(existing_target, require=False)
+            incoming_identity = account_identity_from_account(normalized, require=False)
+            if (
+                incoming_explicit_identity
+                and existing_identity is not None
+                and incoming_identity is not None
+                and existing_identity.installation_id != incoming_identity.installation_id
+            ):
+                raise ValueError("OpenAI OAuth import cannot rotate an existing Codex identity")
+            if not incoming_explicit_identity and existing_identity is not None:
+                normalized["codexIdentity"] = existing_identity.as_config()
+                normalized["codexDeviceInstallationId"] = existing_identity.installation_id
+        # Claim before credentials are published.  A later config write failure may
+        # leave only the non-secret tombstone, which safely preserves continuity.
+        if account_identity_from_account(normalized, require=False) is not None:
+            register_account_identity(normalized)
+
     existing_snapshot = copy.deepcopy(existing_target) if existing_target else None
     old_load_balancing = copy.deepcopy(
         active_config.get("loadBalancing", {})
@@ -3496,11 +3589,14 @@ def _add_account_serialized(
                     "cursor_disabled_models", "cursor_max_context_disabled_models",
                     "last_model_sync", "last_model_sync_source",
                     "last_model_sync_error", "last_model_sync_attempt",
+                    "last_model_sync_client_version", "last_model_sync_profile",
+                    "last_model_sync_attempt_client_version", "last_model_sync_attempt_profile",
+                    "models_etag", "models_etag_client_version", "models_etag_profile",
                 ) if key in target
             }
             keep_max = target.get("maxConcurrent")
             keep_device_id = target.get("codexDeviceInstallationId")
-            keep_device_enabled = target.get("codexDeviceConvergenceEnabled")
+            keep_codex_identity = copy.deepcopy(target.get("codexIdentity"))
             keep_enabled = target.get("enabled")
             keep_disabled_reason = target.get("disabled_reason")
             keep_disabled_until = target.get("disabled_until")
@@ -3531,8 +3627,8 @@ def _add_account_serialized(
                 # A transient cursor.com profile failure during re-login must not
                 # replace previously verified identity metadata with a hash label.
                 target.update(keep_cursor_profile)
-            # Same canonical OpenAI workspace reimport preserves omitted
-            # device identity and explicit opt-out state.
+            # Same canonical OpenAI workspace reimport preserves the versioned
+            # identity whenever the import omitted identity state.
             if (
                 provider == "openai"
                 and "codexDeviceInstallationId" not in entry
@@ -3541,10 +3637,10 @@ def _add_account_serialized(
                 target["codexDeviceInstallationId"] = keep_device_id
             if (
                 provider == "openai"
-                and "codexDeviceConvergenceEnabled" not in entry
-                and keep_device_enabled is not None
+                and "codexIdentity" not in entry
+                and keep_codex_identity is not None
             ):
-                target["codexDeviceConvergenceEnabled"] = keep_device_enabled
+                target["codexIdentity"] = keep_codex_identity
             if rename_new_key:
                 fam = "openai" if _is_openai_family_provider(provider) else "anthropic"
                 _rename_priority_orders_in_config(
@@ -3701,6 +3797,7 @@ def delete_invalid_accounts_batch_if_unchanged(
         for account_key, expected in expected_accounts
     )
     result = {"status": "missing"}
+    removed_owner_digests: set[str] = set()
     account_keys = tuple(account_key for account_key, _expected in expected_batch)
     channel_keys = {f"oauth:{account_key}" for account_key in account_keys}
 
@@ -3742,6 +3839,15 @@ def delete_invalid_accounts_batch_if_unchanged(
                 if matches[0].get("disabled_reason") != "auth_error":
                     result["status"] = "state_conflict"
                     return
+
+            # Match single-account deletion: keep installation continuity before
+            # removing credentials, but defer owner-state cleanup until publish.
+            from .openai.codex_identity import account_identity_from_account, register_account_identity
+            for _account_key, account in expected_batch:
+                identity = account_identity_from_account(account, require=False)
+                if identity is not None:
+                    register_account_identity(account)
+                    removed_owner_digests.add(identity.owner_digest)
 
             for account_key in account_keys:
                 _remove_exact_account_from_config(cfg, account_key)
@@ -3789,6 +3895,13 @@ def delete_invalid_accounts_batch_if_unchanged(
                     cursor_bridge_runtime.drop_account(account_key)
                 except Exception:
                     pass
+
+        # Do not remove identity tombstones; only deleted owners' session state.
+        from .openai import reasoning_replay
+        for owner_digest in removed_owner_digests:
+            state_db.codex_logical_session_delete_owner(owner_digest)
+            state_db.compaction_owner_delete_owner(owner_digest)
+            reasoning_replay.delete_owner(owner_digest)
     return result
 
 
@@ -3826,13 +3939,23 @@ def _delete_account_serialized(account_key: str) -> None:
             return True
         return _acc_provider(account) == target_provider
 
-    cleanup_keys = [
-        _canonical_key(account)
+    matched_accounts = [
+        copy.deepcopy(account)
         for account in config.get().get("oauthAccounts", [])
         if matches(account)
     ]
+    cleanup_keys = [_canonical_key(account) for account in matched_accounts]
     if not cleanup_keys:
         return
+    # Preserve only the non-secret owner→installation mapping before credentials
+    # are removed. Failure aborts deletion rather than breaking continuity.
+    from .openai.codex_identity import account_identity_from_account, register_account_identity
+    removed_owner_digests: set[str] = set()
+    for account in matched_accounts:
+        identity = account_identity_from_account(account, require=False)
+        if identity is not None:
+            register_account_identity(account)
+            removed_owner_digests.add(identity.owner_digest)
     channel_keys = {f"oauth:{key}" for key in cleanup_keys}
 
     def mutate(cfg):
@@ -3896,6 +4019,33 @@ def _delete_account_serialized(account_key: str) -> None:
                     cursor_bridge_runtime.drop_account(cleanup_key)
                 except Exception:
                     pass
+
+        # Credential deletion destroys session/reasoning/compaction state but
+        # deliberately retains the owner installation tombstone registered above.
+        from .openai import reasoning_replay
+        for owner_digest in removed_owner_digests:
+            state_db.codex_logical_session_delete_owner(owner_digest)
+            state_db.compaction_owner_delete_owner(owner_digest)
+            reasoning_replay.delete_owner(owner_digest)
+
+
+def forget_codex_identity(owner_digest: str) -> bool:
+    """Explicitly forget a deleted OAuth owner's installation identity.
+
+    This high-risk operation is intentionally not coupled to the existing delete
+    UI. Credentials must be removed first so a live account cannot silently rotate.
+    """
+    from .openai.codex_identity import account_identity_from_account, forget_owner_identity
+    owner = str(owner_digest or "").strip()
+    for account in config.get().get("oauthAccounts", []):
+        if _acc_provider(account) != "openai":
+            continue
+        identity = account_identity_from_account(account, require=False)
+        if identity is not None and identity.owner_digest == owner:
+            raise ValueError("delete OAuth credentials before forgetting Codex identity")
+    from .openai import reasoning_replay
+    reasoning_replay.delete_owner(owner)
+    return forget_owner_identity(owner)
 
 
 _EXPECTED_REASON_UNSET = object()
@@ -4367,7 +4517,7 @@ def ensure_openai_metadata_fresh_sync(account_keys: list[str] | str, *,
 
 
 def _provider_default_models(provider: str) -> tuple[list[str], str]:
-    """Return configured stateless fallback, then built-in fallback if empty."""
+    """Return an explicit provider fallback; OpenAI falls back only to its profile."""
     cfg = config.get()
     section = {
         "openai": "openaiOAuth",
@@ -4385,6 +4535,13 @@ def _provider_default_models(provider: str) -> tuple[list[str], str]:
     ))
     if models:
         return models, "default:configured"
+    if provider == "openai":
+        try:
+            profile = codex_protocol_profile()
+        except Exception:
+            # Invalid pinned configuration must not revive a mutable Python fallback.
+            return [], "profile:unavailable"
+        return list(profile.models), f"profile:{profile.profile_id}"
     return list(dict.fromkeys(
         str(model).strip() for model in built_in if str(model).strip()
     )), "default:built-in"
@@ -4568,10 +4725,21 @@ _model_discovery_executor = concurrent.futures.ThreadPoolExecutor(
 
 
 def _discovery_generation(account: dict) -> str:
+    provider = provider_of(account)
+    # A hot Codex identity change invalidates any in-flight model fetch as well
+    # as the six-hour success TTL checked by ``_model_sync_due``.
+    if provider == "openai":
+        profile = codex_protocol_profile()
+        client_identity = "\0".join((
+            profile.profile_id, profile.client_version, codex_backend_base_url(),
+        ))
+    else:
+        client_identity = ""
     raw = "\0".join((
-        _canonical_key(account), provider_of(account),
+        _canonical_key(account), provider,
         str(account.get("access_token") or ""),
         str(account.get("project_id") or account.get("workspace_id") or ""),
+        client_identity,
     ))
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -4593,6 +4761,10 @@ def _persist_model_discovery_failure(account_key: str, generation: str, error: s
             if _canonical_key(item) == account_key and _discovery_generation(item) == generation:
                 item["last_model_sync_attempt"] = now
                 item["last_model_sync_error"] = str(error or "discovery failed")[:500]
+                if provider_of(item) == "openai":
+                    profile = codex_protocol_profile()
+                    item["last_model_sync_attempt_client_version"] = profile.client_version
+                    item["last_model_sync_attempt_profile"] = profile.profile_id
                 changed["value"] = True
                 return
 
@@ -4664,6 +4836,38 @@ async def _discover_account_models_once(account_key: str, *, timeout_s: float) -
         _persist_model_discovery_failure(canonical, generation, error)
         return {"action": "error", "account_key": canonical, "error": error}
 
+    if provider == "openai" and getattr(result, "not_modified", False):
+        existing_models = _model_ids(account)
+        if not existing_models or not _model_catalog_complete(account, existing_models):
+            _persist_model_discovery_failure(canonical, generation, "empty catalog")
+            return {"action": "empty", "account_key": canonical}
+        now = _format_utc(datetime.now(timezone.utc))
+        saved = {"value": False}
+
+        def refresh_lkg(cfg):
+            for item in cfg.get("oauthAccounts", []):
+                if _canonical_key(item) != canonical or _discovery_generation(item) != generation:
+                    continue
+                item["last_model_sync"] = now
+                item["last_model_sync_attempt"] = now
+                item["last_model_sync_source"] = result.source
+                item["last_model_sync_error"] = ""
+                item["last_model_sync_client_version"] = str(result.client_version or "")
+                item["last_model_sync_profile"] = str(result.profile_id or "")
+                if str(result.etag or ""):
+                    item["models_etag"] = str(result.etag)
+                    item["models_etag_client_version"] = str(result.client_version or "")
+                    item["models_etag_profile"] = str(result.profile_id or "")
+                saved["value"] = True
+                return
+
+        config.update(refresh_lkg, skip_if_unchanged=True)
+        return {
+            "action": "not_modified" if saved["value"] else "stale",
+            "account_key": canonical, "models": len(existing_models),
+            "source": result.source, "fetched_at": now,
+        }
+
     models = list(dict.fromkeys(str(model).strip() for model in result.models if str(model).strip()))
     if not models:
         _persist_model_discovery_failure(canonical, generation, "empty catalog")
@@ -4683,6 +4887,20 @@ async def _discover_account_models_once(account_key: str, *, timeout_s: float) -
             item["last_model_sync_attempt"] = now
             item["last_model_sync_source"] = result.source
             item["last_model_sync_error"] = ""
+            if provider == "openai":
+                result_version = (
+                    str(getattr(result, "client_version", "") or "")
+                    or codex_cli_version()
+                )
+                result_profile = (
+                    str(getattr(result, "profile_id", "") or "")
+                    or codex_protocol_profile().profile_id
+                )
+                item["last_model_sync_client_version"] = result_version
+                item["last_model_sync_profile"] = result_profile
+                item["models_etag"] = str(getattr(result, "etag", "") or "")
+                item["models_etag_client_version"] = result_version
+                item["models_etag_profile"] = result_profile
             saved["value"] = True
             return
 
@@ -4734,10 +4952,20 @@ async def refresh_account_models(
             _model_discovery_flights[canonical] = flight
             owner = True
     if not owner:
-        return await asyncio.wrap_future(flight)
-    before = copy.deepcopy(get_account(canonical))
-    generation = _discovery_generation(before or {})
+        waiter = asyncio.wrap_future(flight)
+        try:
+            return await asyncio.shield(waiter)
+        except asyncio.CancelledError:
+            # shield detaches from a pending waiter when its caller is cancelled;
+            # observe any later flight exception on that abandoned proxy.
+            def observe_completion(completed: asyncio.Future) -> None:
+                if not completed.cancelled():
+                    completed.exception()
+            waiter.add_done_callback(observe_completion)
+            raise
     try:
+        before = copy.deepcopy(get_account(canonical))
+        generation = _discovery_generation(before or {})
         result = await _discover_account_models_once(canonical, timeout_s=timeout_s)
         # Cursor's native fetch owns its LKG, but the unified scheduler owns
         # retry metadata so all five providers obey the same backoff policy.
@@ -4772,6 +5000,115 @@ async def refresh_account_models(
         with _model_discovery_tasks_guard:
             if _model_discovery_flights.get(canonical) is flight:
                 _model_discovery_flights.pop(canonical, None)
+
+
+_codex_catalog_observation_lock = threading.Lock()
+_codex_catalog_refresh_pending: set[tuple[str, str]] = set()
+_codex_catalog_refresh_last: dict[tuple[str, str], float] = {}
+_CODEX_CATALOG_REFRESH_DEBOUNCE_SECONDS = 60.0
+
+
+def _observed_header(headers: Any, *names: str) -> str:
+    wanted = {name.lower() for name in names}
+    try:
+        items = headers.items()
+    except Exception:
+        return ""
+    for raw_name, raw_value in items:
+        if str(raw_name).lower() not in wanted:
+            continue
+        value = str(raw_value or "").strip()
+        if value and len(value) <= 512 and "\r" not in value and "\n" not in value:
+            return value
+    return ""
+
+
+def observe_openai_response_metadata(
+    account_key: str,
+    headers: Any,
+    translator_ctx: dict | None = None,
+) -> dict[str, Any]:
+    """Capture actual model and schedule one non-blocking catalog refresh on ETag drift."""
+    actual_model = _observed_header(headers, "openai-model", "x-openai-model")
+    if actual_model and isinstance(translator_ctx, dict):
+        translator_ctx["codex_actual_model"] = actual_model
+
+    etag = _observed_header(headers, "x-models-etag")
+    if not etag:
+        return {"actual_model": actual_model, "refresh_scheduled": False}
+    try:
+        canonical = _resolve_existing_account_key_or_raise(account_key)
+        account = get_account(canonical)
+        if not isinstance(account, dict) or provider_of(account) != "openai":
+            return {"actual_model": actual_model, "refresh_scheduled": False}
+        profile = codex_protocol_profile()
+        cached_matches_scope = (
+            str(account.get("models_etag_client_version") or "") == profile.client_version
+            and str(account.get("models_etag_profile") or "") == profile.profile_id
+        )
+        if cached_matches_scope and str(account.get("models_etag") or "") == etag:
+            return {"actual_model": actual_model, "refresh_scheduled": False}
+        generation = _discovery_generation(account)
+        key = (canonical, generation)
+        now = time.monotonic()
+        with _codex_catalog_observation_lock:
+            if (
+                key in _codex_catalog_refresh_pending
+                or now - _codex_catalog_refresh_last.get(key, 0.0)
+                < _CODEX_CATALOG_REFRESH_DEBOUNCE_SECONDS
+            ):
+                return {"actual_model": actual_model, "refresh_scheduled": False}
+            loop = asyncio.get_running_loop()
+            _codex_catalog_refresh_pending.add(key)
+            _codex_catalog_refresh_last[key] = now
+
+        async def refresh_observed_catalog() -> None:
+            try:
+                await refresh_account_models(canonical)
+            except Exception:
+                # Response observation is auxiliary; the existing LKG remains usable.
+                pass
+            finally:
+                with _codex_catalog_observation_lock:
+                    _codex_catalog_refresh_pending.discard(key)
+
+        loop.create_task(
+            refresh_observed_catalog(),
+            name="codex-model-catalog-etag-refresh",
+        )
+        return {"actual_model": actual_model, "refresh_scheduled": True}
+    except Exception:
+        return {"actual_model": actual_model, "refresh_scheduled": False}
+
+
+def observe_openai_response_event(
+    account_key: str,
+    frame: str | bytes | dict,
+    translator_ctx: dict | None = None,
+) -> dict[str, Any]:
+    """Observe official WS response headers without rewriting the frame."""
+    try:
+        if isinstance(frame, bytes):
+            event = json.loads(frame.decode("utf-8"))
+        elif isinstance(frame, str):
+            event = json.loads(frame)
+        else:
+            event = frame
+    except Exception:
+        return {"actual_model": "", "refresh_scheduled": False}
+    if not isinstance(event, dict):
+        return {"actual_model": "", "refresh_scheduled": False}
+    merged: dict[str, Any] = {}
+    top_headers = event.get("headers")
+    if isinstance(top_headers, dict):
+        merged.update(top_headers)
+    response = event.get("response")
+    response_headers = response.get("headers") if isinstance(response, dict) else None
+    if isinstance(response_headers, dict):
+        merged.update(response_headers)
+    if not merged:
+        return {"actual_model": "", "refresh_scheduled": False}
+    return observe_openai_response_metadata(account_key, merged, translator_ctx)
 
 
 def start_account_model_refresh(
@@ -4966,7 +5303,28 @@ def _model_sync_due(account: dict, *, now: datetime | None = None) -> bool:
     last_attempt = _parse_iso(account.get("last_model_sync_attempt"))
     failed = bool(account.get("last_model_sync_error"))
     if failed and last_attempt is not None:
+        if provider_of(account) == "openai":
+            profile = codex_protocol_profile()
+            # Old-client failures cannot suppress the first upgraded fetch.
+            # Failed-attempt identity is separate from the last successful sync
+            # so another failure still observes the normal retry backoff.
+            if (
+                str(account.get("last_model_sync_attempt_client_version") or "")
+                != profile.client_version
+                or str(account.get("last_model_sync_attempt_profile") or "")
+                != profile.profile_id
+            ):
+                return True
         return (now - last_attempt.astimezone(timezone.utc)).total_seconds() >= OAUTH_MODEL_SYNC_FAILURE_RETRY_SECONDS
+    if provider_of(account) == "openai":
+        profile = codex_protocol_profile()
+        if (
+            str(account.get("last_model_sync_client_version") or "")
+            != profile.client_version
+            or str(account.get("last_model_sync_profile") or "")
+            != profile.profile_id
+        ):
+            return True
     model_ids = _model_ids(account)
     if not model_ids or last_success is None or not _model_catalog_complete(account, model_ids):
         return True

@@ -133,24 +133,34 @@ def test_oauth_openapi_matches_owned_manifest_and_declares_security_and_secrets(
         "JsonOAuthCredential": ("payload",),
         "RefreshTokenOAuthCredential": ("refreshToken",),
         "CreateOAuthAccountRequest": ("replacePlanToken",),
-        "OAuthLoginFlowData": ("flowSecret",),
         "CompleteOAuthLoginFlowRequest": ("flowSecret", "code", "state", "callbackUrl", "replacePlanToken"),
         "PreviewOAuthImportRequest": ("payload",),
-        "OAuthImportPreviewData": ("importSecret",),
         "CommitOAuthImportRequest": ("importSecret",),
         "CommitPlanRequest": ("planToken",),
     }
     for schema, fields in write_only.items():
         for field in fields:
             assert schemas[schema]["properties"][field]["writeOnly"] is True
+    one_time_responses = {
+        "OAuthReplaceConflictData": ("replacePlanToken",),
+        "OAuthLoginFlowData": ("flowSecret",),
+        "OAuthImportPreviewData": ("importSecret",),
+        "OAuthDeletionPlanData": ("planToken",),
+        "OAuthQuotaResetPlanData": ("planToken",),
+    }
+    for schema, fields in one_time_responses.items():
+        for field in fields:
+            assert "writeOnly" not in schemas[schema]["properties"][field]
     assert "writeOnly" not in schemas["OAuthLoginFlowData"]["properties"]["flowId"]
     assert "writeOnly" not in schemas["OAuthImportPreviewData"]["properties"]["importId"]
+    import_encoding = schemas["PreviewOAuthImportRequest"]["properties"]["payloadEncoding"]
+    assert import_encoding["enum"] == ["json", "base64"]
+    assert import_encoding["default"] == "json"
+    assert schemas["PreviewOAuthImportRequest"]["properties"]["payload"]["maxLength"] == 2_000_000
     assert all(schema.get("additionalProperties") is False for schema in schemas.values() if schema.get("type") == "object")
     serialized = json.dumps({key: operations[key] for key in operations}, ensure_ascii=False)
     assert "access-secret-in-storage" not in serialized
     assert "refresh-secret-in-storage" not in serialized
-    conflict_schema = schemas["OAuthReplaceConflictData"]
-    assert conflict_schema["properties"]["replacePlanToken"]["writeOnly"] is True
     assert (
         schemas["ReplaceOAuthDefaultModelsRequest"]["properties"]["models"]["maxItems"]
         == 200
@@ -334,8 +344,9 @@ def test_login_import_invalid_delete_and_quota_plans_are_one_shot(tmp_path):
         assert replay.json()["error"]["code"] == "INVALID_OPERATION_STATE"
 
         candidate = {
-            "provider": "claude", "email": "import@example.test",
-            "access_token": "import-access-secret", "refresh_token": "import-refresh-secret",
+            "provider": "openai", "type": "openai",
+            "email": "import@example.test",
+            "refresh_token": "import-refresh-secret-1234567890",
         }
         preview = request(
             client, "POST", "/oauth/imports/preview",
@@ -349,7 +360,9 @@ def test_login_import_invalid_delete_and_quota_plans_are_one_shot(tmp_path):
             headers,
         )
         assert committed.status_code == 200, committed.text
-        assert committed.json()["data"]["added"] == ["claude:import@example.test"]
+        assert committed.json()["data"]["added"] == [
+            "openai:import@example.test:import-import"
+        ]
         replay_import = request(
             client, "POST", f"/oauth/imports/{preview_data['importId']}/commit",
             {"importSecret": preview_data["importSecret"], "decisions": [{"candidateId": "candidate-1", "action": "overwrite"}]}, headers,
@@ -477,10 +490,10 @@ def test_login_and_import_capabilities_split_public_path_ids_from_body_secrets(t
         previews = []
         for index in range(2):
             candidate = {
-                "provider": "claude",
+                "provider": "openai",
+                "type": "openai",
                 "email": f"split-import-{index}@example.test",
-                "access_token": f"split-import-access-{index}",
-                "refresh_token": f"split-import-refresh-{index}",
+                "refresh_token": f"split-import-refresh-{index}-1234567890",
             }
             preview = request(
                 client,

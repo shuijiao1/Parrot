@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 
 from src.management_control.oauth.models import (
     OAuthAccountFilter,
@@ -146,7 +148,7 @@ class OAuthMutationData(StrictSchema):
 
 class OAuthReplaceConflictData(StrictSchema):
     accountId: str
-    replacePlanToken: str = Field(json_schema_extra={"writeOnly": True})
+    replacePlanToken: str
 
 
 class OAuthIdentityConflictEnvelope(StrictSchema):
@@ -160,7 +162,7 @@ class StartOAuthLoginFlowRequest(StrictSchema):
 
 class OAuthLoginFlowData(StrictSchema):
     flowId: str
-    flowSecret: str = Field(json_schema_extra={"writeOnly": True})
+    flowSecret: str
     provider: OAuthProvider
     authUrl: str | None = None
     instruction: str | None = None
@@ -181,10 +183,42 @@ class CompleteOAuthLoginFlowRequest(StrictSchema):
     replacePlanToken: SecretStr | None = Field(default=None, json_schema_extra={"writeOnly": True})
 
 
+_MAX_IMPORT_ENCODED_PAYLOAD_CHARS = 2_000_000
+_MAX_IMPORT_DECODED_PAYLOAD_BYTES = 1_500_000
+
+
 class PreviewOAuthImportRequest(StrictSchema):
     format: Literal["openai", "cpa", "sub2api"]
-    payload: SecretStr = Field(min_length=1, max_length=2_000_000, json_schema_extra={"writeOnly": True})
+    payloadEncoding: Literal["json", "base64"] = "json"
+    payload: SecretStr = Field(
+        min_length=1,
+        max_length=_MAX_IMPORT_ENCODED_PAYLOAD_CHARS,
+        json_schema_extra={"writeOnly": True},
+    )
     filename: str | None = Field(default=None, max_length=255)
+
+    @field_validator("payload")
+    @classmethod
+    def validate_encoded_payload(cls, value: SecretStr, info):
+        if info.data.get("payloadEncoding") == "base64":
+            cls._decode_base64(value.get_secret_value())
+        return value
+
+    @staticmethod
+    def _decode_base64(value: str) -> bytes:
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("payload must be valid base64") from exc
+        if len(decoded) > _MAX_IMPORT_DECODED_PAYLOAD_BYTES:
+            raise ValueError("decoded payload exceeds the 1500000 byte limit")
+        return decoded
+
+    def parser_payload(self) -> str | bytes:
+        value = self.payload.get_secret_value()
+        if self.payloadEncoding == "json":
+            return value
+        return self._decode_base64(value)
 
 
 class OAuthImportCandidateData(StrictSchema):
@@ -203,7 +237,7 @@ class OAuthImportProblemData(StrictSchema):
 
 class OAuthImportPreviewData(StrictSchema):
     importId: str
-    importSecret: str = Field(json_schema_extra={"writeOnly": True})
+    importSecret: str
     candidates: list[OAuthImportCandidateData]
     errors: list[OAuthImportProblemData]
     expiresAt: datetime
@@ -231,7 +265,7 @@ class InvalidOAuthDeletionPlanRequest(StrictSchema):
 
 
 class OAuthDeletionPlanData(StrictSchema):
-    planToken: str = Field(json_schema_extra={"writeOnly": True})
+    planToken: str
     accountIds: list[str]
     expiresAt: datetime
     revision: str
@@ -250,7 +284,7 @@ class OAuthQuotaResetPlanRequest(StrictSchema):
 
 
 class OAuthQuotaResetPlanData(StrictSchema):
-    planToken: str = Field(json_schema_extra={"writeOnly": True})
+    planToken: str
     accountId: str
     provider: OAuthProvider
     creditCount: int | None = None

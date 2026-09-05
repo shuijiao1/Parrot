@@ -40,6 +40,42 @@ _validate_import_time_isolation()
 
 import pytest
 
+
+def _normalize_loaded_auto_codex_profile() -> None:
+    """Keep synthetic loaded configs on the production current-profile path.
+
+    Some domain fixtures replace ``config._cache`` with a deepcopy of
+    ``DEFAULT_CONFIG`` after pytest fixture setup.  The Python defaults
+    intentionally omit mutable Codex version/profile values, because production
+    fills them via ``_normalize_openai_oauth_config`` while loading config.json.
+    Re-run that same normalizer before the test call when such a synthetic cache
+    still has auto-update enabled; pinned/fail-closed fixtures remain untouched.
+    """
+    import sys
+
+    config_module = sys.modules.get("src.config")
+    if config_module is None:
+        return
+    current = getattr(config_module, "_cache", None)
+    if not isinstance(current, dict):
+        return
+    provider = current.get("openaiOAuth")
+    if not isinstance(provider, dict):
+        return
+    if provider.get("codexProfileAutoUpdate", True) is not True:
+        return
+    if provider.get("codexCliVersion") and provider.get("codexProtocolProfile"):
+        return
+    config_module._normalize_openai_oauth_config(current, current)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_call(item):
+    # This hook runs after fixture setup, including fixtures that install a
+    # synthetic config cache, but before production code under test is called.
+    _normalize_loaded_auto_codex_profile()
+
+
 _ORIG_TO_THREAD = asyncio.to_thread
 _ORIG_SOCKET = socket.socket
 _ORIG_GETADDRINFO = socket.getaddrinfo

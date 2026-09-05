@@ -150,7 +150,7 @@ def _catalog(item: CatalogRecord) -> CatalogData:
     )
 
 
-_INVENTORY_EXAMPLE = {"modelId": "claude-sonnet-4-5", "family": "anthropic", "provider": "claude", "channelId": "oauth:example", "accountId": "oauth:example", "outboundModel": "claude-sonnet-4-5", "revision": "rev_example"}
+_INVENTORY_EXAMPLE = {"modelId": "claude-sonnet-4-5", "family": "anthropic", "provider": "claude", "channelId": "oauth:claude:example", "accountId": "claude:example", "outboundModel": "claude-sonnet-4-5", "revision": "rev_example"}
 _METADATA_EXAMPLE = {"modelId": "claude-sonnet-4-5", "target": "anthropic/claude-sonnet-4-5", "providerId": "anthropic", "catalogModelId": "claude-sonnet-4-5", "scope": "global", "scopeId": None, "outboundModel": None, "source": "manual", "authority": "models.dev", "effective": {"contextWindow": 200000, "reasoningEfforts": [], "inputModalities": [], "outputModalities": []}, "raw": {"contextWindow": 200000, "reasoningEfforts": [], "inputModalities": [], "outputModalities": []}, "revision": "rev_example"}
 _CATALOG_EXAMPLE = {"key": "anthropic/claude-sonnet-4-5", "modelId": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5", "providerId": "anthropic", "providerName": "Anthropic", "metadata": {"contextWindow": 200000, "reasoningEfforts": [], "inputModalities": [], "outputModalities": []}, "revision": "rev_example"}
 _OPERATION_EXAMPLE = {"id": "op_example", "kind": "model_metadata.sync", "status": "queued", "progress": None, "createdAt": "2026-01-02T03:04:05Z", "startedAt": None, "finishedAt": None, "result": None, "error": None, "cancellable": False}
@@ -216,29 +216,33 @@ def list_model_metadata(
     )
 
 
-@router.get(
-    "/model-metadata/{modelId}",
-    operation_id="getModelMetadata",
+@router.post(
+    "/model-metadata/actions/sync",
+    operation_id="syncModelMetadata",
     tags=["management-model-metadata"],
-    response_model=ModelMetadataEnvelope,
-    responses={**_success(200, _METADATA_EXAMPLE), **management_error_responses(*_RESOURCE_ERRORS)},
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=MetadataOperationEnvelope,
+    responses={**_success(202, _OPERATION_EXAMPLE), **management_error_responses(*_RESOURCE_ERRORS, ManagementErrorCode.OPERATION_ALREADY_RUNNING, ManagementErrorCode.DEPENDENCY_UNAVAILABLE, ManagementErrorCode.STATE_CONFLICT)},
 )
-def get_model_metadata(
-    model_id: Annotated[str, Path(alias="modelId", max_length=500)],
+def sync_model_metadata(
+    body: MetadataSyncRequest,
     request: Request,
-    context: ReadContext,
+    context: WriteContext,
     control: Annotated[MappingControl, Depends(get_metadata_control)],
-    scope_id: Annotated[str | None, Query(alias="scopeId", min_length=1, max_length=500)] = None,
-) -> ModelMetadataEnvelope:
-    reject_unknown_query_parameters(request, {"scopeId"})
-    return ModelMetadataEnvelope(
-        data=_metadata(control.get_metadata(context, model_id, scope_id=scope_id)),
-        meta=_meta(request),
+) -> MetadataOperationEnvelope:
+    reject_unknown_query_parameters(request)
+    operation = control.start_metadata_sync(
+        context,
+        scope=body.scope.value,
+        provider_id=body.providerId,
+        account_id=body.accountId,
+        channel_id=body.channelId,
     )
+    return MetadataOperationEnvelope(data=_operation(operation), meta=_meta(request))
 
 
 @router.put(
-    "/model-metadata/{modelId}/binding",
+    "/model-metadata/{modelId:path}/binding",
     operation_id="putModelMetadataBinding",
     tags=["management-model-metadata"],
     response_model=ModelMetadataEnvelope,
@@ -267,7 +271,7 @@ def put_model_metadata_binding(
 
 
 @router.delete(
-    "/model-metadata/{modelId}/binding",
+    "/model-metadata/{modelId:path}/binding",
     operation_id="deleteModelMetadataBinding",
     tags=["management-model-metadata"],
     status_code=204,
@@ -294,29 +298,25 @@ def delete_model_metadata_binding(
     return Response(status_code=204)
 
 
-@router.post(
-    "/model-metadata/actions/sync",
-    operation_id="syncModelMetadata",
+@router.get(
+    "/model-metadata/{modelId:path}",
+    operation_id="getModelMetadata",
     tags=["management-model-metadata"],
-    status_code=status.HTTP_202_ACCEPTED,
-    response_model=MetadataOperationEnvelope,
-    responses={**_success(202, _OPERATION_EXAMPLE), **management_error_responses(*_RESOURCE_ERRORS, ManagementErrorCode.OPERATION_ALREADY_RUNNING, ManagementErrorCode.DEPENDENCY_UNAVAILABLE, ManagementErrorCode.STATE_CONFLICT)},
+    response_model=ModelMetadataEnvelope,
+    responses={**_success(200, _METADATA_EXAMPLE), **management_error_responses(*_RESOURCE_ERRORS)},
 )
-def sync_model_metadata(
-    body: MetadataSyncRequest,
+def get_model_metadata(
+    model_id: Annotated[str, Path(alias="modelId", max_length=500)],
     request: Request,
-    context: WriteContext,
+    context: ReadContext,
     control: Annotated[MappingControl, Depends(get_metadata_control)],
-) -> MetadataOperationEnvelope:
-    reject_unknown_query_parameters(request)
-    operation = control.start_metadata_sync(
-        context,
-        scope=body.scope.value,
-        provider_id=body.providerId,
-        account_id=body.accountId,
-        channel_id=body.channelId,
+    scope_id: Annotated[str | None, Query(alias="scopeId", min_length=1, max_length=500)] = None,
+) -> ModelMetadataEnvelope:
+    reject_unknown_query_parameters(request, {"scopeId"})
+    return ModelMetadataEnvelope(
+        data=_metadata(control.get_metadata(context, model_id, scope_id=scope_id)),
+        meta=_meta(request),
     )
-    return MetadataOperationEnvelope(data=_operation(operation), meta=_meta(request))
 
 
 @router.get(

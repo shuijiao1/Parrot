@@ -50,6 +50,24 @@ class PagedEnvelope(StrictSchema, Generic[PageT]):
     meta: PagedResponseMeta
 
 
+class RevisionedResponseMeta(ResponseMeta):
+    revision: str
+
+
+class RevisionedPagedResponseMeta(PagedResponseMeta):
+    revision: str
+
+
+class RevisionedCollectionEnvelope(StrictSchema, Generic[PageT]):
+    data: list[PageT]
+    meta: RevisionedResponseMeta
+
+
+class RevisionedPagedEnvelope(StrictSchema, Generic[PageT]):
+    data: list[PageT]
+    meta: RevisionedPagedResponseMeta
+
+
 class ListenerSummary(StrictSchema):
     host: str
     port: int = Field(ge=0, le=65535)
@@ -80,6 +98,15 @@ class OverviewData(StrictSchema):
     }]})
 
 
+class ChannelCooldownData(StrictSchema):
+    model: str
+    errorCount: int = Field(ge=0)
+    state: Literal["active", "permanent"]
+    until: datetime | None = None
+    quota: bool
+    message: str | None = None
+
+
 class ChannelStatusData(StrictSchema):
     id: str
     name: str
@@ -87,6 +114,15 @@ class ChannelStatusData(StrictSchema):
     type: str
     enabled: bool
     disabledReason: str | None = None
+    health: Literal[
+        "disabled", "permanentCooldown", "quotaCooldown", "cooldown",
+        "healthy", "degraded", "unhealthy", "unknown",
+    ]
+    recentSuccessRate: float | None = Field(default=None, ge=0, le=100)
+    cooldownCount: int = Field(ge=0)
+    permanentCooldownCount: int = Field(ge=0)
+    cooldowns: list[ChannelCooldownData]
+    problemReasons: list[str]
 
 
 class FastestChannelData(StrictSchema):
@@ -149,6 +185,7 @@ class ConcurrencyData(StrictSchema):
     channels: list[ChannelConcurrencyRowData]
     apiKeyTotals: ApiKeyLimiterTotalsData
     apiKeys: list[ApiKeyConcurrencyRowData]
+    revision: str
 
 
 class RuntimeStatusData(StrictSchema):
@@ -164,7 +201,10 @@ class RuntimeStatusData(StrictSchema):
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "channels": [], "problemChannels": [],
         "fastestByFamily": {"anthropic": [], "openai": []}, "quotaWarnings": [],
-        "concurrency": {"channelTotals": {}, "channels": [], "apiKeyTotals": {}, "apiKeys": []},
+        "concurrency": {
+            "channelTotals": {}, "channels": [], "apiKeyTotals": {}, "apiKeys": [],
+            "revision": "rev_concurrency",
+        },
         "cooldownSummary": {"active": 0, "permanent": 0},
         "affinitySummary": {"server": 0, "client": 0},
         "database": {"status": "healthy"}, "revision": "rev_example",
@@ -178,9 +218,11 @@ class BackgroundJobData(StrictSchema):
     nextRunAt: datetime | None = None
     status: Literal["running", "succeeded", "failed", "unknown", "disabled"]
     error: str | None = None
+    revision: str
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "id": "walCheckpoint", "intervalSeconds": None, "lastRunAt": None,
         "nextRunAt": None, "status": "unknown", "error": None,
+        "revision": "rev_example",
     }]})
 
 
@@ -191,9 +233,11 @@ class CooldownData(StrictSchema):
     state: Literal["active", "permanent"]
     until: datetime | None = None
     message: str | None = None
+    revision: str
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "channelId": "api:example", "model": "example-model", "errorCount": 2,
         "state": "active", "until": "2026-01-02T03:04:05Z", "message": None,
+        "revision": "rev_example",
     }]})
 
 
@@ -241,8 +285,10 @@ class StatsSummaryData(StrictSchema):
 class StatsBreakdownData(StrictSchema):
     key: str
     metrics: StatsMetricData
+    revision: str
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "key": "example", "metrics": {"total": 10, "successCount": 9},
+        "revision": "rev_example",
     }]})
 
 
@@ -273,9 +319,11 @@ class RecentCallData(StrictSchema):
     model: str | None = None
     channelId: str | None = None
     durationMilliseconds: float | None = None
+    revision: str
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "id": "request-example", "status": "success", "createdAt": "2026-01-02T03:04:05Z",
         "model": "example-model", "channelId": "api:example", "durationMilliseconds": 1200,
+        "revision": "rev_example",
     }]})
 
 
@@ -388,12 +436,14 @@ class LogBodyKindCountData(StrictSchema):
 
 
 class LogBodyPagedResponseMeta(PagedResponseMeta):
+    revision: str
     kindCounts: list[LogBodyKindCountData] = Field(
         description="Counts after search and before itemKind filtering and page slicing",
     )
 
 
 class LogBodyItemData(StrictSchema):
+    revision: str
     id: str | None = None
     seq: int = Field(ge=1)
     kind: str
@@ -406,6 +456,7 @@ class LogBodyItemData(StrictSchema):
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "id": "item_1", "seq": 1, "kind": "user", "title": "user",
         "summary": "input", "text": "hello", "raw": "hello", "size": 5, "meta": {},
+        "revision": "rev_example",
     }]})
 
 
@@ -415,11 +466,13 @@ class LogBodyPagedEnvelope(StrictSchema):
 
 
 class RawLogBodyData(StrictSchema):
+    revision: str
     logId: str
     kind: Literal["request", "response"]
     body: JsonValue
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "logId": "request-example", "kind": "request", "body": {"model": "example"},
+        "revision": "rev_example",
     }]})
 
 
@@ -470,9 +523,11 @@ class MediaArtifactData(StrictSchema):
     sizeBytes: int = Field(ge=0)
     mediaType: Literal["image", "video"]
     expiresAt: datetime | None = None
+    revision: str
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "id": "artifact_1_example", "fileName": "image.png", "contentType": "image/png",
         "sizeBytes": 2048, "mediaType": "image", "expiresAt": None,
+        "revision": "rev_example",
     }]})
 
 
@@ -508,7 +563,7 @@ class RetentionPlanCreate(StrictSchema):
 
 
 class RetentionPlanData(StrictSchema):
-    id: str
+    planId: str
     state: Literal["prepared", "committed", "cancelled"]
     days: int = Field(ge=1)
     cutoff: datetime
@@ -524,7 +579,7 @@ class RetentionPlanData(StrictSchema):
     revision: str
     operationId: str | None = None
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
-        "id": "plan_example", "state": "prepared", "days": 30,
+        "planId": "plan_example", "state": "prepared", "days": 30,
         "cutoff": "2026-01-02T03:04:05Z", "expiresAt": "2026-01-02T03:14:05Z",
         "affectedRows": 10, "affectedFiles": 1, "affectedBytes": 2048,
         "scannedRows": 100, "scannedFiles": 2, "scannedBytes": 4096,

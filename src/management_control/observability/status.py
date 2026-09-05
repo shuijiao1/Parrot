@@ -129,7 +129,16 @@ class StatusControl:
         }
 
     def api_concurrency_snapshot(self, context: ManagementContext) -> dict[str, Any]:
-        return camelize(self.concurrency_snapshot(context))
+        data = camelize(self.concurrency_snapshot(context))
+        # ``oldestWaitSeconds`` is a display age derived from the current clock.
+        # It must not make an otherwise unchanged limiter resource acquire a new
+        # revision every second.
+        revision_value = copy.deepcopy(data)
+        for row in revision_value.get("apiKeys", []):
+            if isinstance(row, dict):
+                row.pop("oldestWaitSeconds", None)
+        data["revision"] = revision_for(revision_value)
+        return data
 
     def channel_concurrency_totals(self, context: ManagementContext) -> dict[str, Any]:
         require(context)
@@ -211,6 +220,25 @@ class StatusControl:
         row = self.state_db.quota_load(account_key)
         return copy.deepcopy(row) if row else None
 
+    def _management_quota_rows_by_key(
+        self, context: ManagementContext,
+    ) -> dict[str, dict[str, Any]]:
+        """Index stored quota rows by their actual key for Management views.
+
+        ``quota_load()`` intentionally retains a legacy email fallback used by
+        Telegram.  Public Management projections must instead bind only the
+        canonical live account key to an exact stored row.
+        """
+        require(context)
+        rows: dict[str, dict[str, Any]] = {}
+        for row in self.state_db.quota_load_all():
+            if not isinstance(row, dict):
+                continue
+            stored_key = str(row.get("account_key") or "")
+            if stored_key:
+                rows[stored_key] = copy.deepcopy(row)
+        return rows
+
     def refresh_telegram_quota(self, context: ManagementContext, account_keys: list[str]) -> None:
         """Preserve the frozen TG status refresh; API snapshots never call this."""
         require(context)
@@ -219,7 +247,13 @@ class StatusControl:
     def overview(self, context: ManagementContext) -> dict[str, Any]:
         require(context)
         cfg = self.config.get()
-        channels = list(self.registry.all_channels())
+        # ChannelControl exposes only registry resources of type ``api``.  Keep
+        # overview counts on that same authority instead of counting OAuth
+        # channels a second time.
+        channels = [
+            channel for channel in self.registry.all_channels()
+            if getattr(channel, "type", None) == "api"
+        ]
         accounts = list(self.oauth_manager.list_accounts())
         api_keys = cfg.get("apiKeys") or {}
         now = datetime.fromtimestamp(self._now(), tz=_BJT)
@@ -235,12 +269,28 @@ class StatusControl:
             lifetime = lifetime.get("overall") if isinstance(lifetime, dict) and "overall" in lifetime else lifetime
         except Exception:
             lifetime = {}
+        try:
+            quota_rows_by_key = self._management_quota_rows_by_key(context)
+        except RuntimeError:
+            quota_rows_by_key = {}
         quota_hot = 0
-        for row in self.state_db.quota_load_all():
-            if any(float(row.get(key) or 0) >= 80 for key in (
+        for account in accounts:
+            account_key = str(self.oauth_manager.get_account_key(account) or "")
+            if not account_key:
+                continue
+            row = quota_rows_by_key.get(account_key)
+            if not isinstance(row, dict):
+                continue
+            values = [row.get(key) for key in (
                 "five_hour_util", "seven_day_util", "thirty_day_util",
-                "sonnet_util", "opus_util", "codex_primary_used_pct", "codex_secondary_used_pct",
-            )):
+                "sonnet_util", "opus_util", "codex_primary_used_pct",
+                "codex_secondary_used_pct",
+            )]
+            try:
+                values.append(self.oauth_manager.fable_display_from_quota_row(row)[0])
+            except (AttributeError, TypeError, ValueError):
+                pass
+            if any(value is not None and float(value) >= 80 for value in values):
                 quota_hot += 1
         listeners = cfg.get("listen") or {}
         data = {
@@ -260,37 +310,113 @@ class StatusControl:
             "lifetime": camelize(sanitize_credentials(_plain(lifetime or {}))),
             "activeAlerts": camelize(sanitize_credentials(_plain(self.status_monitor.snapshot_active()))),
         }
-        data["revision"] = revision_for(data)
+        # Uptime is a clock-derived display value, not a resource mutation.
+        data["revision"] = revision_for({
+            key: value for key, value in data.items() if key != "uptimeSeconds"
+        })
         return data
 
-    @staticmethod
-    def _channel_record(channel: Any) -> dict[str, Any]:
+    def _channel_record(
+        self,
+        channel: Any,
+        cooldowns: list[dict[str, Any]],
+        performance: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        raw_enabled = bool(getattr(channel, "enabled", False))
+        disabled_reason = sanitize_credentials(getattr(channel, "disabled_reason", None))
+        rates = [
+            int(row.get("recent_success_count") or 0)
+            / int(row.get("recent_requests") or 0) * 100
+            for row in performance
+            if int(row.get("recent_requests") or 0) > 0
+        ]
+        recent_rate = min(rates) if rates else None
+        cooldown_rows: list[dict[str, Any]] = []
+        for row in sorted(cooldowns, key=lambda item: str(item.get("model") or "")):
+            until = int(row.get("cooldown_until") or 0)
+            # ``message`` is the existing explicit public reason contract.  Do
+            # not fall back to the cooldown store's free-form last_error_message.
+            message = row.get("message")
+            cooldown_rows.append({
+                "model": str(row.get("model") or ""),
+                "errorCount": int(row.get("error_count") or 0),
+                "state": "permanent" if until == -1 else "active",
+                "until": None if until == -1 else utc_datetime(until / 1000),
+                "quota": bool(self.quota_errors.active_quota_cooldown(row)),
+                "message": sanitize_credentials(message),
+            })
+
+        if not raw_enabled:
+            health = "disabled"
+        elif any(row["state"] == "permanent" for row in cooldown_rows):
+            health = "permanentCooldown"
+        elif cooldown_rows and all(row["quota"] for row in cooldown_rows):
+            health = "quotaCooldown"
+        elif cooldown_rows:
+            health = "cooldown"
+        elif recent_rate is None:
+            health = "unknown"
+        elif recent_rate >= 80:
+            health = "healthy"
+        elif recent_rate >= 50:
+            health = "degraded"
+        else:
+            health = "unhealthy"
+
+        problem_reasons: list[str] = []
+        if not raw_enabled:
+            problem_reasons.append(str(disabled_reason or "disabled"))
+        elif disabled_reason:
+            problem_reasons.append(str(disabled_reason))
+        for row in cooldown_rows:
+            reason = str(row.get("message") or row["state"])
+            if reason not in problem_reasons:
+                problem_reasons.append(reason)
+        if health in {"degraded", "unhealthy"} and health not in problem_reasons:
+            problem_reasons.append(health)
+
         return {
             "id": str(getattr(channel, "key", "")),
             "name": str(getattr(channel, "display_name", "") or getattr(channel, "name", "") or getattr(channel, "key", "")),
             "protocol": str(getattr(channel, "protocol", "") or "unknown"),
             "type": str(getattr(channel, "type", "") or "unknown"),
-            "enabled": bool(getattr(channel, "enabled", False)),
-            "disabledReason": sanitize_credentials(getattr(channel, "disabled_reason", None)),
+            "enabled": bool(raw_enabled and not disabled_reason),
+            "disabledReason": disabled_reason,
+            "health": health,
+            "recentSuccessRate": recent_rate,
+            "cooldownCount": len(cooldown_rows),
+            "permanentCooldownCount": sum(row["state"] == "permanent" for row in cooldown_rows),
+            "cooldowns": cooldown_rows,
+            "problemReasons": problem_reasons,
         }
 
     def runtime_status(self, context: ManagementContext) -> dict[str, Any]:
         require(context)
         channels = list(self.registry.all_channels())
-        channel_rows = [self._channel_record(channel) for channel in channels]
-        by_key = {row["id"]: row for row in channel_rows}
         cooldowns = copy.deepcopy(self.cooldown.active_entries())
-        problem_ids = {
-            row["id"] for row in channel_rows
-            if not row["enabled"] or row["disabledReason"]
-        }
-        problem_ids.update(str(row.get("channel_key") or "") for row in cooldowns)
+        performance = copy.deepcopy(self.scorer.snapshot())
+        cooldowns_by_key: dict[str, list[dict[str, Any]]] = {}
+        for row in cooldowns:
+            cooldowns_by_key.setdefault(str(row.get("channel_key") or ""), []).append(row)
+        performance_by_key: dict[str, list[dict[str, Any]]] = {}
+        for row in performance:
+            performance_by_key.setdefault(str(row.get("channel_key") or ""), []).append(row)
+        channel_rows = [
+            self._channel_record(
+                channel,
+                cooldowns_by_key.get(str(getattr(channel, "key", "")), []),
+                performance_by_key.get(str(getattr(channel, "key", "")), []),
+            )
+            for channel in channels
+        ]
+        by_key = {row["id"]: row for row in channel_rows}
+        problem_ids = {row["id"] for row in channel_rows if row["problemReasons"]}
         cooldown_pairs = {
             (str(row.get("channel_key") or ""), str(row.get("model") or ""))
             for row in cooldowns
         }
         fastest: dict[str, list[dict[str, Any]]] = {"anthropic": [], "openai": []}
-        for stat in self.scorer.snapshot():
+        for stat in performance:
             key = str(stat.get("channel_key") or "")
             channel = by_key.get(key)
             if not channel or not channel["enabled"] or channel["disabledReason"]:
@@ -313,7 +439,7 @@ class StatusControl:
         for values in fastest.values():
             values.sort(key=lambda item: item["score"])
             del values[5:]
-        concurrency = camelize(self.concurrency_snapshot(context))
+        concurrency = self.api_concurrency_snapshot(context)
         data = {
             "channels": channel_rows,
             "problemChannels": [by_key[key] for key in sorted(problem_ids) if key in by_key],
@@ -330,14 +456,19 @@ class StatusControl:
             },
             "database": camelize(sanitize_credentials(self._database_status())),
         }
-        data["revision"] = revision_for(data)
+        revision_value = copy.deepcopy(data)
+        for row in (revision_value.get("concurrency") or {}).get("apiKeys", []):
+            if isinstance(row, dict):
+                row.pop("oldestWaitSeconds", None)
+        data["revision"] = revision_for(revision_value)
         return data
 
     def _quota_warning_records(self, context: ManagementContext) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
+        quota_rows_by_key = self._management_quota_rows_by_key(context)
         for account in self.oauth_accounts(context):
             key = str(self.oauth_manager.get_account_key(account) or "")
-            row = self.quota_row(context, key)
+            row = quota_rows_by_key.get(key)
             if not row:
                 continue
             metrics = []
@@ -376,7 +507,12 @@ class StatusControl:
                 "errorCount": int(row.get("error_count") or 0),
                 "state": "permanent" if until == -1 else "active",
                 "until": None if until == -1 else utc_datetime(until / 1000),
-                "message": sanitize_credentials(str(row.get("message") or "")) or None,
+                # Preserve an explicit public reason, but never fall back to
+                # the cooldown store's free-form last_error_message.
+                "message": (
+                    sanitize_credentials(str(row["message"]))
+                    if row.get("message") is not None else None
+                ),
             })
         return page_slice(normalized, page=page, page_size=page_size)
 

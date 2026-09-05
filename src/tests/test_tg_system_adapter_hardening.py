@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from src.management_control.observability import RetentionControl
 from src.management_control.observability.common import telegram_context
 from src.management_control.system.telegram_retention import TelegramRetentionAdapter
 from src.telegram import states
@@ -89,10 +90,20 @@ def test_tg_retention_unrepresentable_cutoff_reaches_frozen_renderer(monkeypatch
     assert pending["plan"]["cutoff"] == 10.0**100
     edits = [call for call in env.capture.calls if call["method"] == "editMessageText"]
     assert "时间不可表示" in edits[-1]["payload"]["text"]
-    assert not hasattr(sm._retention_control, "control")
+    assert isinstance(sm._retention_control.control, RetentionControl)
 
 
 def test_tg_retention_extend_and_apply_exceptions_preserve_baseline_order(monkeypatch):
+    body_env = SystemEnv(_case("TG-SYS-05.001-menu-toggle-busy"), monkeypatch)
+
+    def fail_body_write(_mutator):
+        raise RuntimeError("body-authority-failed")
+
+    monkeypatch.setattr(sm.config, "update", fail_body_write)
+    with pytest.raises(RuntimeError, match="^body-authority-failed$"):
+        sm._toggle_log_store_bodies(42, 100, "cb-toggle")
+    assert body_env.capture.calls == []
+
     extend_env = SystemEnv(_case("TG-SYS-05.004-extend"), monkeypatch)
     states.set_state(42, "sys_retention_days")
 
@@ -132,9 +143,9 @@ def test_tg_retention_progress_is_isolated_per_concurrent_call():
             progress({"phase": "item_start", "item": {"month": plan["tag"]}})
             return {"ok": True, "tag": plan["tag"]}
 
-    adapter = TelegramRetentionAdapter(
-        module=FakeLogDb(), config_module=SimpleNamespace(),
-    )
+    control = RetentionControl(log_db=FakeLogDb(), config=SimpleNamespace())
+    adapter = TelegramRetentionAdapter(control)
+    assert adapter.control is control
     received = {"A": [], "B": []}
     results = {}
     failures: list[BaseException] = []

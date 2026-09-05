@@ -44,12 +44,13 @@ async def test_cancel_outer_retry_update_aborts_unstarted_http_to_ws_stream(
         proxy_bytes,
         start_time,
         start_monotonic,
+        translator_ctx,
         timing,
         round_timeouts,
     ):
         del (
             deadline_ts, first_wait, idle_timeout, start_time, start_monotonic,
-            timing, round_timeouts,
+            translator_ctx, timing, round_timeouts,
         )
         assert upstream_ws_arg is upstream_ws
         assert tracker_arg is tracker
@@ -82,7 +83,7 @@ async def test_cancel_outer_retry_update_aborts_unstarted_http_to_ws_stream(
         affinity_hit=0,
         translator_ctx=None,
         body={"model": "m", "stream": True},
-        identity_state=failover.ConfuseState(),
+        identity_state=failover.ProtocolIdentityMap(),
         client_key=None,
         proxy_name="proxy-a",
         proxy_bytes=proxy_bytes,

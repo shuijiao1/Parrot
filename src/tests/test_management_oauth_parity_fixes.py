@@ -210,10 +210,10 @@ def test_import_and_invalid_delete_recheck_and_mutate_inside_one_batch_cas():
     control, backend = build_control()
     candidates = [
         {
-            "provider": "claude",
+            "provider": "openai",
+            "type": "openai",
             "email": f"batch-{index}@example.test",
-            "access_token": f"access-{index}",
-            "refresh_token": f"refresh-{index}",
+            "refresh_token": f"refresh-{index}-12345678901234567890",
         }
         for index in range(2)
     ]
@@ -239,7 +239,9 @@ def test_import_and_invalid_delete_recheck_and_mutate_inside_one_batch_cas():
         )
     assert stale_import.value.code is ManagementErrorCode.REVISION_CONFLICT
     assert all(
-        backend.get_account(f"claude:batch-{index}@example.test") is None
+        backend.get_account(
+            f"openai:batch-{index}@example.test:import-batch-{index}"
+        ) is None
         for index in range(2)
     )
     assert backend.get_account(concurrent_id) is not None

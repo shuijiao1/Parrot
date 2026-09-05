@@ -53,6 +53,7 @@ EXPECTED_CASE_IDS = {
         "TG-STATUS-01.unknown-callback",
     },
 }
+FROZEN_VERSION = "0.31.13"
 EXPECTED_CALLBACK_PATTERNS = {
     "TG-MAIN-01": {"menu:main"},
     "TG-HELP-01": {"menu:help"},
@@ -83,10 +84,19 @@ def _actual(
 
 
 @pytest.fixture(autouse=True)
-def _reset_globals():
+def _reset_globals(monkeypatch):
     states.clear_all()
     ui.configure("fake-main-status-token", [42])
     ui._session = None
+    monkeypatch.setattr(main_menu, "__version__", FROZEN_VERSION)
+    monkeypatch.setattr(
+        help_menu,
+        "_HELP_TEXT",
+        help_menu._HELP_TEXT.replace(
+            f"Parrot v{help_menu.__version__} ·",
+            f"Parrot v{FROZEN_VERSION} ·",
+        ),
+    )
     yield
     states.clear_all()
     ui._session = None

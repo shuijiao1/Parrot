@@ -179,7 +179,7 @@ def replace_channel_order(
 
 
 @router.get(
-    "/load-balancing/model-orders/{modelId}",
+    "/load-balancing/model-orders/{modelId:path}",
     operation_id="getModelChannelOrder",
     tags=["management-load-balancing"],
     response_model=OrderEnvelope,
@@ -198,7 +198,7 @@ def get_model_channel_order(
 
 
 @router.put(
-    "/load-balancing/model-orders/{modelId}",
+    "/load-balancing/model-orders/{modelId:path}",
     operation_id="replaceModelChannelOrder",
     tags=["management-load-balancing"],
     response_model=OrderEnvelope,
@@ -220,7 +220,7 @@ def replace_model_channel_order(
 
 
 @router.delete(
-    "/load-balancing/model-orders/{modelId}",
+    "/load-balancing/model-orders/{modelId:path}",
     operation_id="deleteModelChannelOrder",
     tags=["management-load-balancing"],
     status_code=204,

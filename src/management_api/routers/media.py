@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 
 from src.management_auth import Capability
 from src.management_control import ManagementContext, ManagementErrorCode
+from src.management_control.observability.common import revision_for
 from src.management_control.observability import (
     MediaAction,
     MediaLogQuery,
@@ -23,13 +24,42 @@ from ..schemas.observability import (
     MediaArtifactData,
     MediaLogData,
     MediaLogDetailData,
-    PagedEnvelope,
+    RevisionedCollectionEnvelope,
+    RevisionedPagedEnvelope,
+    RevisionedPagedResponseMeta,
+    RevisionedResponseMeta,
     Rfc3339UtcDateTime,
 )
 from ._observability import controls, meta, paged_meta, reject_unknown_query
 
 
 router = APIRouter(prefix="/media-logs", tags=["management-media"])
+
+
+def _revisioned(model_type, value):
+    raw = dict(value)
+    supplied = raw.pop("revision", None)
+    public = {
+        name: raw[name]
+        for name in model_type.model_fields
+        if name != "revision" and name in raw
+    }
+    public["revision"] = supplied or revision_for(public)
+    return model_type.model_validate(public)
+
+
+def _revisioned_page_meta(request: Request, result, values) -> RevisionedPagedResponseMeta:
+    base = paged_meta(request, result).model_dump()
+    snapshot = {
+        "data": [value.model_dump(mode="json", exclude={"revision"}) for value in values],
+        "page": result.page,
+        "pageSize": result.page_size,
+        "total": result.total,
+        "hasNext": result.has_next,
+    }
+    return RevisionedPagedResponseMeta(**base, revision=revision_for(snapshot))
+
+
 _ERRORS = management_error_responses(
     ManagementErrorCode.SESSION_REQUIRED, ManagementErrorCode.SESSION_EXPIRED,
     ManagementErrorCode.CAPABILITY_DENIED, ManagementErrorCode.VALIDATION_FAILED,
@@ -39,7 +69,7 @@ _ERRORS = management_error_responses(
 
 @router.get(
     "", operation_id="listMediaLogs",
-    response_model=PagedEnvelope[MediaLogData], responses=_ERRORS,
+    response_model=RevisionedPagedEnvelope[MediaLogData], responses=_ERRORS,
 )
 def list_media_logs(
     request: Request,
@@ -54,7 +84,7 @@ def list_media_logs(
     descending: Annotated[bool, Query()] = True,
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 50,
-) -> PagedEnvelope[MediaLogData]:
+) -> RevisionedPagedEnvelope[MediaLogData]:
     reject_unknown_query(request, (
         "status", "provider", "model", "action", "startedAt", "endedAt",
         "sort", "descending", "page", "pageSize",
@@ -65,21 +95,33 @@ def list_media_logs(
         actions=tuple(action or ()), started_at=started_at, ended_at=ended_at,
         sort=sort, descending=descending, page=page, page_size=page_size,
     ))
-    return PagedEnvelope(data=[MediaLogData.model_validate(item) for item in result.items], meta=paged_meta(request, result))
+    values = [_revisioned(MediaLogData, item) for item in result.items]
+    return RevisionedPagedEnvelope(
+        data=values, meta=_revisioned_page_meta(request, result, values),
+    )
 
 
 @router.get(
     "/{mediaLogId}/artifacts", operation_id="listMediaArtifacts",
-    response_model=DataEnvelope[list[MediaArtifactData]], responses=_ERRORS,
+    response_model=RevisionedCollectionEnvelope[MediaArtifactData], responses=_ERRORS,
 )
 def list_media_artifacts(
     request: Request,
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
     media_log_id: Annotated[str, Path(alias="mediaLogId", min_length=1, max_length=128)],
-) -> DataEnvelope[list[MediaArtifactData]]:
+) -> RevisionedCollectionEnvelope[MediaArtifactData]:
     reject_unknown_query(request, ())
-    values = controls(request).media.artifacts(context, media_log_id)
-    return DataEnvelope(data=[MediaArtifactData.model_validate(item) for item in values], meta=meta(request))
+    values = [
+        _revisioned(MediaArtifactData, item)
+        for item in controls(request).media.artifacts(context, media_log_id)
+    ]
+    public = [value.model_dump(mode="json", exclude={"revision"}) for value in values]
+    return RevisionedCollectionEnvelope(
+        data=values,
+        meta=RevisionedResponseMeta(
+            **meta(request), revision=revision_for({"mediaLogId": media_log_id, "data": public}),
+        ),
+    )
 
 
 @router.get(

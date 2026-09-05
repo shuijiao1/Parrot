@@ -60,6 +60,7 @@ def body_paged_meta(request: Request, result) -> LogBodyPagedResponseMeta:
         total=result.total,
         hasNext=result.has_next,
         kindCounts=list(result.kind_counts),
+        revision=result.revision,
     )
 
 

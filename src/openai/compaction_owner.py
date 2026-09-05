@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .. import state_db
+from .codex_identity import (
+    LogicalSession,
+    RequestIdentityContext,
+    owner_digest_for_workspace,
+    uuid7,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -75,22 +81,15 @@ def _workspace(ch: Any) -> str:
 
 
 def owner_identity(ch: Any) -> str:
-    """Canonical account boundary: workspace when known, auth account key otherwise.
-
-    A refresh-derived workspace is copied onto the live channel before a request is
-    dispatched.  Workspace-only canonical identity therefore survives the old
-    channel key, registry rebuilds and canonical key migration, while retaining
-    strict workspace isolation.
-    """
+    """Return the canonical OAuth owner digest; unknown workspaces have no owner."""
     if not is_openai_oauth_channel(ch):
         return ""
     workspace = _workspace(ch)
-    boundary = f"workspace:{workspace}" if workspace else f"account:{getattr(ch, 'account_key', '')}"
-    return _digest_identity({"provider": "openai", "boundary": boundary})
+    return owner_digest_for_workspace(workspace) if workspace else ""
 
 
 def _legacy_identities(ch: Any) -> set[str]:
-    """Identities emitted by the initial owner algorithm, for in-place adoption."""
+    """Legacy key/workspace and v0.31.13 boundary identities, for unique adoption."""
     if not is_openai_oauth_channel(ch):
         return set()
     account_key = str(getattr(ch, "account_key", ""))
@@ -100,10 +99,20 @@ def _legacy_identities(ch: Any) -> set[str]:
     # deliberately unchanged.  Rebuilt channels use openai:<email>:<workspace>.
     if workspace and account_key.endswith(f":{workspace}"):
         keys.add(account_key[:-(len(workspace) + 1)])
-    return {
+    aliases = {
         _digest_identity({"provider": "openai", "account_key": key, "workspace": ws})
         for key in keys for ws in ({workspace, ""} if workspace else {""})
     }
+    # The published version used a canonical boundary hash, between the initial
+    # key/workspace algorithm and today's owner digest. Keep both migrations.
+    boundaries = {f"account:{key}" for key in keys}
+    if workspace:
+        boundaries.add(f"workspace:{workspace}")
+    aliases.update(
+        _digest_identity({"provider": "openai", "boundary": boundary})
+        for boundary in boundaries
+    )
+    return aliases
 
 
 def identity_aliases(ch: Any) -> set[str]:
@@ -111,8 +120,78 @@ def identity_aliases(ch: Any) -> set[str]:
     return ({identity} if identity else set()) | _legacy_identities(ch)
 
 
+def _request_scope(identity: str, values: tuple[Any, ...]) -> tuple[str, str]:
+    model = ""
+    logical_session_id = ""
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        model = model or str(value.get("model") or "").strip()
+        contexts = value.get("_codex_identity_contexts")
+        context = contexts.get(identity) if isinstance(contexts, dict) else None
+        if isinstance(context, RequestIdentityContext):
+            logical_session_id = context.logical_session.session_id
+    return model, logical_session_id
+
+
+def _request_context(
+    identity: str, values: tuple[Any, ...]
+) -> tuple[int, dict[str, Any], RequestIdentityContext] | None:
+    for index, value in enumerate(values):
+        if not isinstance(value, dict):
+            continue
+        contexts = value.get("_codex_identity_contexts")
+        context = contexts.get(identity) if isinstance(contexts, dict) else None
+        if isinstance(context, RequestIdentityContext):
+            return index, value, context
+    return None
+
+
+def advance_confirmed_compaction_window(
+    ch: Any,
+    values: tuple[Any, ...],
+    response_refs: list[CompactionRef],
+) -> bool:
+    """Advance only for a successful response scoped to this owner/session/model.
+
+    Callers invoke this from their already-established response success boundary.
+    The durable transaction makes duplicate/concurrent processing idempotent.
+    """
+    identity = owner_identity(ch)
+    scoped = _request_context(identity, values)
+    if not identity or scoped is None or not response_refs:
+        return False
+    request_index, request, context = scoped
+    logical = context.logical_session
+    if not logical.durable or logical.owner_digest != identity:
+        return False
+    model = str(request.get("model") or "").strip()
+    if not model:
+        return False
+    for response in values[request_index + 1:]:
+        if not isinstance(response, dict):
+            continue
+        response_model = str(response.get("model") or "").strip()
+        if response_model and response_model != model:
+            return False
+    result = state_db.codex_compaction_confirm_and_advance_window(
+        logical.owner_digest,
+        logical.downstream_principal_digest,
+        logical.downstream_anchor_digest,
+        expected_window_number=logical.window_number,
+        context_window_id=uuid7(),
+        model=model,
+        logical_session_id=logical.session_id,
+        refs=[(ref.compaction_id, ref.content_digest) for ref in response_refs],
+    )
+    row = result.get("logical_session") if isinstance(result, dict) else None
+    if isinstance(row, dict):
+        context.logical_session = LogicalSession.from_row(row, durable=True)
+    return bool(isinstance(result, dict) and result.get("advanced"))
+
+
 def persist_observed(ch: Any, *values: Any) -> int:
-    """Persist complete compactions only after this OAuth owner succeeded."""
+    """Persist compaction ownership and close a confirmed response window."""
     identity = owner_identity(ch)
     if not identity:
         return 0
@@ -123,12 +202,25 @@ def persist_observed(ch: Any, *values: Any) -> int:
             if ref not in seen:
                 refs.append(ref)
                 seen.add(ref)
+    scoped = _request_context(identity, values)
+    response_refs: list[CompactionRef] = []
+    if scoped is not None:
+        request_index = scoped[0]
+        response_seen: set[CompactionRef] = set()
+        for value in values[request_index + 1:]:
+            for ref in complete_refs(value):
+                if ref not in response_seen:
+                    response_refs.append(ref)
+                    response_seen.add(ref)
+    model, logical_session_id = _request_scope(identity, values)
     aliases = identity_aliases(ch)
     for ref in refs:
         state_db.compaction_owner_upsert(
             ref.compaction_id, ref.content_digest, str(ch.key), identity,
-            compatible_identities=aliases,
+            compatible_identities=aliases, model=model or None,
+            logical_session_id=logical_session_id or None,
         )
+    advance_confirmed_compaction_window(ch, values, response_refs)
     return len(refs)
 
 

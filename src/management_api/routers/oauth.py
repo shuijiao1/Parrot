@@ -311,7 +311,7 @@ def preview_oauth_import(
     result = control.preview_import(
         context,
         format=body.format,
-        payload=body.payload.get_secret_value(),
+        payload=body.parser_payload(),
         filename=body.filename or "",
     )
     return DataEnvelope(

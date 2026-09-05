@@ -50,11 +50,26 @@ class FakeLogDb:
         value = cfg or self.config.value
         return dict(value.get("logRetention") or {"mode": "forever", "days": None})
 
-    def recent_logs_count(self):
+    def management_logs_count(self):
         return 12
 
     def retention_cleanup_busy(self):
         return False
+
+    def update_retention_settings(
+        self, *, mode, days, log_store_bodies,
+        expected_policy, expected_log_store_bodies,
+    ):
+        self.authority_calls.append(("settings", mode, days, log_store_bodies))
+
+        def mutate(cfg):
+            if mode is not None:
+                cfg["logRetention"] = {"mode": mode, "days": days}
+            if log_store_bodies is not None:
+                cfg["logStoreBodies"] = log_store_bodies
+
+        self.config.update(mutate)
+        return {"ok": True}
 
     def set_retention_forever(self):
         self.authority_calls.append(("forever", None))
@@ -134,14 +149,14 @@ def test_production_runtime_owns_observability_audit_for_api_mutations(tmp_path)
     assert plan_response.status_code == 201, plan_response.text
     plan = plan_response.json()["data"]
     committed = client.post(
-        f"/api/management/v1/logs/retention/plans/{plan['id']}/commit",
+        f"/api/management/v1/logs/retention/plans/{plan['planId']}/commit",
         headers={**auth, "If-Match": plan["revision"]},
     )
     second_plan = client.post(
         "/api/management/v1/logs/retention/plans", json={"days": 60}, headers=auth,
     ).json()["data"]
     cancelled = client.delete(
-        f"/api/management/v1/logs/retention/plans/{second_plan['id']}", headers=auth,
+        f"/api/management/v1/logs/retention/plans/{second_plan['planId']}", headers=auth,
     )
     assert committed.status_code == 202, committed.text
     assert cancelled.status_code == 204
@@ -217,7 +232,8 @@ def test_retention_control_policy_only_prepare_commit_terminal_replay_and_actor_
         expected_revision=before["revision"],
     )
     assert updated["days"] == 90 and updated["logStoreBodies"] is False
-    assert db.authority_calls == [("extend", 90)]
+    assert db.authority_calls == [("settings", "days", 90, False)]
+    assert config.updates == 1
     assert db.apply_calls == []
     with pytest.raises(ManagementError) as stale:
         control.update_settings(
@@ -301,14 +317,14 @@ def test_retention_safe_policy_changes_use_authoritative_apis_and_validate_patch
         expected_revision=current["revision"],
     )
     assert extended["days"] == 60
-    assert db.authority_calls == [("extend", 60)]
+    assert db.authority_calls == [("settings", "days", 60, None)]
 
     forever = control.update_settings(
         ctx, mode=RetentionMode.FOREVER, days=None, log_store_bodies=None,
         expected_revision=extended["revision"],
     )
     assert forever["mode"] == "forever" and forever["days"] is None
-    assert db.authority_calls[-1] == ("forever", None)
+    assert db.authority_calls[-1] == ("settings", "forever", None, None)
 
     updates = config.updates
     same = control.update_settings(
@@ -319,8 +335,8 @@ def test_retention_safe_policy_changes_use_authoritative_apis_and_validate_patch
     assert config.updates == updates
 
     config.value["logRetention"] = {"mode": "days", "days": 30}
-    original_extend = db.extend_retention_days
-    db.extend_retention_days = lambda _days: (_ for _ in ()).throw(RuntimeError("db unavailable"))
+    original_update = db.update_retention_settings
+    db.update_retention_settings = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("db unavailable"))
     with pytest.raises(ManagementError) as unavailable:
         control.update_settings(
             ctx, mode=RetentionMode.DAYS, days=60, log_store_bodies=None,
@@ -328,7 +344,7 @@ def test_retention_safe_policy_changes_use_authoritative_apis_and_validate_patch
         )
     assert unavailable.value.code is ManagementErrorCode.DEPENDENCY_UNAVAILABLE
     assert unavailable.value.retryable is True
-    db.extend_retention_days = original_extend
+    db.update_retention_settings = original_update
     config.value["logRetention"] = {"mode": "forever", "days": None}
 
     for kwargs, path in (

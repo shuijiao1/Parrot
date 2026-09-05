@@ -17,6 +17,7 @@ from src.management_control.context import ManagementContext
 from src.management_control.errors import ManagementError, ManagementErrorCode
 
 from . import inspector
+from ._log_errors import map_historical_log_errors
 from .common import (
     PageResult,
     camelize,
@@ -85,6 +86,7 @@ class LogBodyPageResult:
     page_size: int
     total: int
     kind_counts: tuple[dict[str, Any], ...]
+    revision: str
 
     @property
     def has_next(self) -> bool:
@@ -101,20 +103,21 @@ class LogsControl:
         require(context)
         started_at, ended_at = normalize_utc_range(query.started_at, query.ended_at)
         query = replace(query, started_at=started_at, ended_at=ended_at)
-        rows, total = self.log_db.management_logs_page(
-            statuses=[item.value for item in query.statuses] or None,
-            api_keys=list(query.api_keys) or None,
-            models=list(query.models) or None,
-            channel_keys=list(query.channels) or None,
-            protocols=[item.value for item in query.protocols] or None,
-            query=query.query,
-            started_at=(query.started_at.timestamp() if query.started_at is not None else None),
-            ended_at=(query.ended_at.timestamp() if query.ended_at is not None else None),
-            sort=query.sort.value,
-            descending=query.descending,
-            page=query.page,
-            page_size=query.page_size,
-        )
+        with map_historical_log_errors():
+            rows, total = self.log_db.management_logs_page(
+                statuses=[item.value for item in query.statuses] or None,
+                api_keys=list(query.api_keys) or None,
+                models=list(query.models) or None,
+                channel_keys=list(query.channels) or None,
+                protocols=[item.value for item in query.protocols] or None,
+                query=query.query,
+                started_at=(query.started_at.timestamp() if query.started_at is not None else None),
+                ended_at=(query.ended_at.timestamp() if query.ended_at is not None else None),
+                sort=query.sort.value,
+                descending=query.descending,
+                page=query.page,
+                page_size=query.page_size,
+            )
         billing = self.log_db.costs_for_logs(rows)
         return PageResult(
             tuple(
@@ -205,13 +208,15 @@ class LogsControl:
 
     def filter_options(self, context: ManagementContext) -> dict[str, Any]:
         require(context)
-        result = copy.deepcopy(self.log_db.management_log_filter_options())
+        with map_historical_log_errors():
+            result = copy.deepcopy(self.log_db.management_log_filter_options())
         result["revision"] = revision_for(result)
         return result
 
     def detail(self, context: ManagementContext, log_id: str) -> dict[str, Any]:
         require(context)
-        raw = self.log_db.log_detail(log_id)
+        with map_historical_log_errors():
+            raw = self.log_db.management_log_detail(log_id)
         if not raw or not raw.get("log"):
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         detail = raw.get("detail") or {}
@@ -234,35 +239,39 @@ class LogsControl:
         require(context)
         return copy.deepcopy(self.log_db.log_detail(log_id))
 
-    def _raw_body(self, context: ManagementContext, log_id: str, kind: LogBodyKind) -> Any:
+    def _body_snapshot(self, context: ManagementContext, log_id: str, kind: LogBodyKind) -> tuple[Any, str]:
         require(context, Capability.LOG_BODY_READ)
-        raw = self.log_db.log_detail(log_id)
+        with map_historical_log_errors():
+            raw = self.log_db.management_log_detail(log_id)
         if not raw or not raw.get("log"):
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         detail = raw.get("detail") or {}
         value = detail.get("request_body" if kind is LogBodyKind.REQUEST else "response_body")
         if value is None or value == "":
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
-        return value
+        return value, self._list_record(raw["log"])["revision"]
 
     @staticmethod
-    def _sanitize_raw(value: Any) -> Any:
+    def _body_item_record(item: dict, log_id: str, kind: LogBodyKind, source_revision: str) -> dict:
+        result = camelize(item)
+        result["id"] = f"item_{int(result.get('seq') or 0)}"
+        result["revision"] = revision_for({
+            "logId": log_id, "kind": kind.value,
+            "itemId": result["id"], "sourceRevision": source_revision,
+        })
+        return result
+
+    @staticmethod
+    def _raw_business_body(value: Any) -> Any:
+        """Return the stored business body without generic credential rewriting."""
+
         if isinstance(value, (dict, list)):
-            return sanitize_credentials(value)
+            return copy.deepcopy(value)
         text = str(value)
         try:
-            parsed = json.loads(text)
+            return json.loads(text)
         except Exception:
-            return sanitize_credentials(text)
-        return sanitize_credentials(parsed)
-
-    @classmethod
-    def _sanitize_parser_input(cls, value: Any) -> Any:
-        """Sanitize bodies without changing a SQLite text row into a dict input."""
-        clean = cls._sanitize_raw(value)
-        if isinstance(value, str) and isinstance(clean, (dict, list)):
-            return json.dumps(clean, ensure_ascii=False)
-        return clean
+            return text
 
     def body_items(
         self,
@@ -276,10 +285,12 @@ class LogsControl:
         page: int,
         page_size: int,
     ) -> LogBodyPageResult:
-        raw = self._raw_body(context, log_id, kind)
-        clean = self._sanitize_parser_input(raw)
-        parsed = inspector.parse_request_body(clean) if kind is LogBodyKind.REQUEST else inspector.parse_response_body(clean)
-        searched = inspector.filter_items(parsed, query)
+        raw, source_revision = self._body_snapshot(context, log_id, kind)
+        parser = (
+            inspector.parse_request_body
+            if kind is LogBodyKind.REQUEST else inspector.parse_response_body
+        )
+        searched = inspector.filter_items(parser(raw), query)
         counts: dict[str, int] = {}
         for item in searched:
             item_type = str(item.get("kind") or "")
@@ -290,11 +301,15 @@ class LogsControl:
         items = inspector.sort_items(items, sort.value)
         result = page_slice(items, page=page, page_size=page_size)
         return LogBodyPageResult(
-            tuple(camelize(sanitize_credentials(item)) for item in result.items),
+            tuple(self._body_item_record(item, log_id, kind, source_revision) for item in result.items),
             page,
             page_size,
             result.total,
             tuple({"kind": key, "count": counts[key]} for key in sorted(counts)),
+            revision_for({
+                "logId": log_id, "kind": kind.value, "sourceRevision": source_revision,
+                "query": query, "sort": sort.value, "itemKind": item_kind,
+            }),
         )
 
     def body_item(
@@ -305,23 +320,29 @@ class LogsControl:
         kind: LogBodyKind,
         item_id: str,
     ) -> dict[str, Any]:
-        raw = self._raw_body(context, log_id, kind)
-        clean = self._sanitize_parser_input(raw)
-        items = inspector.parse_request_body(clean) if kind is LogBodyKind.REQUEST else inspector.parse_response_body(clean)
+        raw, source_revision = self._body_snapshot(context, log_id, kind)
+        parser = (
+            inspector.parse_request_body
+            if kind is LogBodyKind.REQUEST else inspector.parse_response_body
+        )
+        items = parser(raw)
         try:
             seq = int(item_id.removeprefix("item_"))
         except (TypeError, ValueError):
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         for item in items:
             if int(item.get("seq") or 0) == seq:
-                result = camelize(sanitize_credentials(item))
-                result["id"] = f"item_{seq}"
-                return result
+                return self._body_item_record(item, log_id, kind, source_revision)
         raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
 
     def raw_body(self, context: ManagementContext, log_id: str, *, kind: LogBodyKind) -> dict[str, Any]:
-        raw = self._raw_body(context, log_id, kind)
-        return {"logId": log_id, "kind": kind.value, "body": self._sanitize_raw(raw)}
+        raw, source_revision = self._body_snapshot(context, log_id, kind)
+        return {
+            "logId": log_id, "kind": kind.value, "body": self._raw_business_body(raw),
+            "revision": revision_for({
+                "logId": log_id, "kind": kind.value, "sourceRevision": source_revision,
+            }),
+        }
 
     def log_store_bodies(self, context: ManagementContext) -> bool:
         require(context)

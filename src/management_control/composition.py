@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from src.management_auth import ManagementStateStore
+
 from .apikey import ApiKeyControl
 from .auxiliary import (
     AuxiliaryControls,
@@ -73,6 +75,7 @@ def build_management_controls(
     audit_sink: AuditSink,
     operations: OperationStore,
     operation_registry: OperationRegistry,
+    state_store: ManagementStateStore,
 ) -> ManagementControls:
     """Construct and fully bind one lifecycle's production Control graph."""
 
@@ -84,6 +87,7 @@ def build_management_controls(
         xai_media=XaiMediaControl(audit_sink=audit_sink),
     )
     auxiliary.bind_operations(operations, operation_registry)
+    retention = RetentionControl(audit_sink=audit_sink)
     return ManagementControls(
         audit_sink=audit_sink,
         operations=operations,
@@ -94,7 +98,7 @@ def build_management_controls(
             operation_store=operations,
             audit_sink=audit_sink,
         ),
-        api_keys=ApiKeyControl(audit_sink=audit_sink),
+        api_keys=ApiKeyControl(audit_sink=audit_sink, provenance_store=state_store),
         mapping=MappingControl(
             audit_sink=audit_sink,
             operation_store=operations,
@@ -109,7 +113,7 @@ def build_management_controls(
             stats=StatsControl(audit_sink=audit_sink),
             logs=LogsControl(),
             media=MediaControl(),
-            retention=RetentionControl(audit_sink=audit_sink),
+            retention=retention,
         ),
         system=SystemNetworkControls(
             settings=SettingsControl(audit_sink=audit_sink),
@@ -120,6 +124,6 @@ def build_management_controls(
             ),
         ),
         system_runtime=SystemRuntimeControl(audit_sink=audit_sink),
-        telegram_retention=TelegramRetentionAdapter(),
+        telegram_retention=TelegramRetentionAdapter(retention),
         auxiliary=auxiliary,
     )

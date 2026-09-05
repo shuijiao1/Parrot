@@ -210,7 +210,7 @@ async def test_http_to_ws_proxy_record_cancellation_terminalizes_all_once(monkey
         return logs.record_proxy_attempt(*args, **kwargs)
 
     async def build_request(*_args, **_kwargs):
-        return "wss://unit.invalid", {}, "{}", None, failover.ConfuseState(), None
+        return "wss://unit.invalid", {}, "{}", None, failover.ProtocolIdentityMap(), None
 
     monkeypatch.setattr(failover, "OpenAIOAuthChannel", OAuthChannel)
     monkeypatch.setattr(failover.log_db, "record_retry_attempt", logs.record_retry_attempt)

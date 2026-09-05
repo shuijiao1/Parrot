@@ -7,14 +7,16 @@ from fastapi import APIRouter, Body, Depends, Header, Path, Query, Request
 from src.management_auth import Capability
 from src.management_control import ManagementContext, ManagementErrorCode
 from src.management_control.observability import StatsBreakdownQuery, StatsDimension, StatsPeriod, StatsSort
+from src.management_control.observability.common import revision_for
 
 from ..dependencies import require_capability
 from ..error_mapping import management_error_responses
 from ..schemas import DataEnvelope
 from ..schemas.observability import (
     ModelStatsData,
-    PagedEnvelope,
     RecentCallData,
+    RevisionedPagedEnvelope,
+    RevisionedPagedResponseMeta,
     StatsBreakdownData,
     StatsSummaryData,
     TelegramStatsPreferencesData,
@@ -24,6 +26,32 @@ from ._observability import controls, meta, paged_meta, reject_unknown_query
 
 
 router = APIRouter(tags=["management-stats"])
+
+
+def _revisioned(model_type, value):
+    raw = dict(value)
+    supplied = raw.pop("revision", None)
+    public = {
+        name: raw[name]
+        for name in model_type.model_fields
+        if name != "revision" and name in raw
+    }
+    public["revision"] = supplied or revision_for(public)
+    return model_type.model_validate(public)
+
+
+def _revisioned_page_meta(request: Request, result, values) -> RevisionedPagedResponseMeta:
+    base = paged_meta(request, result).model_dump()
+    snapshot = {
+        "data": [value.model_dump(mode="json", exclude={"revision"}) for value in values],
+        "page": result.page,
+        "pageSize": result.page_size,
+        "total": result.total,
+        "hasNext": result.has_next,
+    }
+    return RevisionedPagedResponseMeta(**base, revision=revision_for(snapshot))
+
+
 _READ_ERRORS = management_error_responses(
     ManagementErrorCode.SESSION_REQUIRED, ManagementErrorCode.SESSION_EXPIRED,
     ManagementErrorCode.CAPABILITY_DENIED, ManagementErrorCode.VALIDATION_FAILED,
@@ -52,7 +80,7 @@ def get_stats_summary(
 
 @router.get(
     "/stats/breakdown", operation_id="getStatsBreakdown",
-    response_model=PagedEnvelope[StatsBreakdownData], responses=_READ_ERRORS,
+    response_model=RevisionedPagedEnvelope[StatsBreakdownData], responses=_READ_ERRORS,
 )
 def get_stats_breakdown(
     request: Request,
@@ -63,13 +91,16 @@ def get_stats_breakdown(
     descending: Annotated[bool, Query()] = True,
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 50,
-) -> PagedEnvelope[StatsBreakdownData]:
+) -> RevisionedPagedEnvelope[StatsBreakdownData]:
     reject_unknown_query(request, ("dimension", "period", "sort", "descending", "page", "pageSize"))
     result = controls(request).stats.breakdown(context, StatsBreakdownQuery(
         dimension=dimension, period=period, sort=sort, descending=descending,
         page=page, page_size=page_size,
     ))
-    return PagedEnvelope(data=[StatsBreakdownData.model_validate(item) for item in result.items], meta=paged_meta(request, result))
+    values = [_revisioned(StatsBreakdownData, item) for item in result.items]
+    return RevisionedPagedEnvelope(
+        data=values, meta=_revisioned_page_meta(request, result, values),
+    )
 
 
 @router.get(
@@ -89,27 +120,29 @@ def get_model_stats(
 
 @router.get(
     "/stats/recent-calls", operation_id="listRecentCalls",
-    response_model=PagedEnvelope[RecentCallData], responses=_READ_ERRORS,
+    response_model=RevisionedPagedEnvelope[RecentCallData], responses=_READ_ERRORS,
 )
 def list_recent_calls(
     request: Request,
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=200)] = 50,
-) -> PagedEnvelope[RecentCallData]:
+) -> RevisionedPagedEnvelope[RecentCallData]:
     reject_unknown_query(request, ("page", "pageSize"))
     result = controls(request).stats.recent_calls(context, page=page, page_size=page_size)
     values = []
     for row in result.items:
-        values.append(RecentCallData(
-            id=str(row.get("request_id") or row.get("id") or ""),
-            status=str(row.get("status") or "unknown"),
-            createdAt=row.get("created_at"),
-            model=row.get("requested_model") or row.get("final_model"),
-            channelId=row.get("final_channel_key"),
-            durationMilliseconds=row.get("duration_ms") or row.get("total_time_ms"),
-        ))
-    return PagedEnvelope(data=values, meta=paged_meta(request, result))
+        values.append(_revisioned(RecentCallData, {
+            "id": str(row.get("request_id") or row.get("id") or ""),
+            "status": str(row.get("status") or "unknown"),
+            "createdAt": row.get("created_at"),
+            "model": row.get("requested_model") or row.get("final_model"),
+            "channelId": row.get("final_channel_key"),
+            "durationMilliseconds": row.get("duration_ms") or row.get("total_time_ms"),
+        }))
+    return RevisionedPagedEnvelope(
+        data=values, meta=_revisioned_page_meta(request, result, values),
+    )
 
 
 @router.get(

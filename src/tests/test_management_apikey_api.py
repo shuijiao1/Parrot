@@ -46,7 +46,7 @@ class FakeNotifier:
         return True
 
 
-def build_app(tmp_path, *, initial_config=None):
+def build_app(tmp_path, *, initial_config=None, generated=None):
     store = ManagementStateStore(str(tmp_path / "management-apikey.db"), clock=time.time)
     sessions = SessionService(
         store,
@@ -81,8 +81,9 @@ def build_app(tmp_path, *, initial_config=None):
     )
     control, config_store, limiter, _ = make_control(
         initial_config,
-        generated=Sequence(["ccp-" + "r" * 48]),
+        generated=generated or Sequence(["ccp-" + "r" * 48]),
         tokens=Sequence(["plan-public", "plan-secret"]),
+        provenance_store=store,
     )
     app = FastAPI()
     app.state.management_runtime = runtime

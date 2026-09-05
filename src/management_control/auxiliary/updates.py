@@ -30,6 +30,7 @@ from .common import (
     rfc3339_utc,
     string_list,
 )
+from .update_failure_log import sanitize_update_failure_log
 
 
 STAGE_IDLE = "idle"
@@ -117,6 +118,7 @@ class _ActivationPlan:
     target_version: str
     expires_at: datetime
     revision: str | None = None
+    client_revision: str | None = None
     ready: bool = False
     consumed: bool = False
 
@@ -208,11 +210,6 @@ Clock = Callable[[], datetime]
 
 def _actor_key(context: ManagementContext) -> str:
     return context.actor.session_id or context.actor.subject_id
-
-
-def _sanitize_log(value: str) -> str:
-    """Bound failure-log size while preserving its ordinary text verbatim."""
-    return str(value or "")[-3500:]
 
 
 class UpdateControl:
@@ -476,7 +473,7 @@ class UpdateControl:
 
     def failure_log(self, context: ManagementContext) -> UpdateFailureLog:
         require(context, Capability.LOG_BODY_READ)
-        content = _sanitize_log(self._updates.failure_log())
+        content = sanitize_update_failure_log(self._updates.failure_log())
         audit(self._audit_sink, context, action="updates.failure-log.read", target="update-failure-log")
         return UpdateFailureLog(content=content, revision=revision_for({"content": content}))
 
@@ -710,38 +707,42 @@ class UpdateControl:
                         message_code=f"UPDATE_{stage.upper()}",
                     )
 
-            self._updates.set_progress(progress)
             try:
-                ok, _detail = self._updates.stage(str(payload["version"]))
-            except Exception:
-                ok = False
-            finally:
-                self._updates.set_progress(None)
-            if not ok:
-                fail()
-                return
-            try:
+                # The updater owns one process-wide progress callback.  Keep callback
+                # install, stage, cleanup, and authoritative state confirmation under
+                # the same lock used by the Telegram direct adapter.
                 with self._lock:
+                    self._updates.set_progress(progress)
+                    try:
+                        ok, _detail = self._updates.stage(str(payload["version"]))
+                    except Exception:
+                        ok = False
+                    finally:
+                        self._updates.set_progress(None)
+                    if not ok:
+                        raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE)
                     state = self._state_without_auth()
                     digest = str(payload["planDigest"])
                     plan = self._plans.get(digest)
                     if plan is None or plan.actor_key != str(payload["actorKey"]):
                         raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
-                    if state.stage != STAGE_STAGED:
+                    if state.stage != STAGE_STAGED or state.target_version != plan.target_version:
                         raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
                     self._retire_plan(self._active_plan_digest)
                     plan.revision = state.revision
+                    plan.client_revision = state.revision
+                    plan.expires_at = self._clock() + self._plan_ttl
                     plan.ready = True
                     self._active_plan_digest = digest
                     expires_at = rfc3339_utc(plan.expires_at)
-                store.succeed(
-                    operation_id,
-                    {
-                        "stagedVersion": payload["version"],
-                        "expectedRevision": state.revision,
-                        "expiresAt": expires_at,
-                    },
-                )
+                    store.succeed(
+                        operation_id,
+                        {
+                            "stagedVersion": payload["version"],
+                            "expectedRevision": state.revision,
+                            "expiresAt": expires_at,
+                        },
+                    )
             except Exception:
                 fail()
 
@@ -804,22 +805,25 @@ class UpdateControl:
                 plan.consumed = True
                 raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
             current = self._state_without_auth()
-            if current.stage != STAGE_STAGED:
+            if current.stage != STAGE_STAGED or current.target_version != plan.target_version:
                 raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
-            ensure_revision(expected_revision, current.revision)
+            # A synchronous restart guard may update only the staged message/revision.
+            # The original response revision remains valid solely with this still-live,
+            # actor-bound plan; the plan itself always tracks authoritative state.
+            if expected_revision not in {current.revision, plan.client_revision}:
+                ensure_revision(expected_revision, current.revision)
             ensure_revision(plan.revision, current.revision)
             plan.consumed = True
             try:
                 operation = self._operation_registry.create(
                     context,
                     kind=self.ACTIVATE_KIND,
-                    payload={"targetVersion": plan.target_version},
+                    payload={"targetVersion": plan.target_version, "planDigest": digest},
                     cancellable=False,
                 )
             except Exception:
                 plan.consumed = False
                 raise
-            self._active_plan_digest = None
             self._idempotency[idempotency_key] = (digest, operation.id)
             self._idempotency.move_to_end(idempotency_key)
             while len(self._idempotency) > 500:
@@ -827,10 +831,44 @@ class UpdateControl:
         audit(self._audit_sink, context, action="updates.activate", target=operation.id, result="queued")
         return operation
 
-    def _start_activate(self, operation_id: str, _context: ManagementContext, _payload: Any) -> None:
+    def _rearm_failed_activation(self, digest: str, target_version: str) -> bool:
+        """Restore only the same still-staged plan after a synchronous rejection."""
+        plan = self._plans.get(digest)
+        if plan is None or self._active_plan_digest != digest or not plan.consumed:
+            return False
+        try:
+            state = self._state_without_auth()
+        except Exception:
+            self._retire_plan(digest)
+            return False
+        if state.stage != STAGE_STAGED or state.target_version != target_version:
+            self._retire_plan(digest)
+            return False
+        plan.revision = state.revision
+        plan.expires_at = self._clock() + self._plan_ttl
+        plan.ready = True
+        plan.consumed = False
+        return True
+
+    def _start_activate(self, operation_id: str, _context: ManagementContext, payload: Any) -> None:
         store = self._operation_store
         if store is None:
             raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY, retryable=True)
+        digest = str(payload["planDigest"])
+        target_version = str(payload["targetVersion"])
+
+        def finish_success() -> None:
+            try:
+                store.update_progress(
+                    operation_id,
+                    current=2,
+                    total=2,
+                    message_code="UPDATE_HEALTH_VERIFIED",
+                )
+                store.succeed(operation_id, {"activated": True})
+            except ManagementError:
+                # Orderly owner shutdown may already have interrupted the record.
+                return
 
         def run() -> None:
             store.mark_running(operation_id)
@@ -840,29 +878,38 @@ class UpdateControl:
                 total=2,
                 message_code="UPDATE_RESTARTING",
             )
-            try:
-                ok, _detail = self._updates.activate()
-            except Exception:
-                ok = False
-            if not ok:
-                store.fail(
-                    operation_id,
-                    code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
-                    message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value,
-                    retryable=True,
-                )
-                return
+            with self._lock:
+                plan = self._plans.get(digest)
+                if plan is None or self._active_plan_digest != digest or not plan.consumed:
+                    store.fail_if_active(
+                        operation_id,
+                        code=ManagementErrorCode.INVALID_OPERATION_STATE,
+                        retryable=False,
+                    )
+                    return
+                try:
+                    ok, _detail = self._updates.activate()
+                except Exception:
+                    ok = False
+                if not ok:
+                    retryable = self._rearm_failed_activation(digest, target_version)
+                    try:
+                        store.fail(
+                            operation_id,
+                            code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                            message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value,
+                            retryable=retryable,
+                        )
+                    except ManagementError:
+                        self._retire_plan(digest)
+                    return
+                # Restart acceptance is irreversible for this plan, but is not success.
+                self._retire_plan(digest)
             if self._updates.activation_is_terminal():
-                store.update_progress(
-                    operation_id,
-                    current=2,
-                    total=2,
-                    message_code="UPDATE_HEALTH_VERIFIED",
-                )
-                store.succeed(operation_id, {"activated": True})
-            # Production intentionally stays RUNNING until process shutdown marks the
-            # in-memory operation interrupted. The restarted process/health endpoint
-            # is authoritative; returning success here would be false success.
+                finish_success()
+            # Production acceptance is not completion. Release this worker and
+            # let owner shutdown interrupt the Operation; the new process's
+            # health/rollback and a new Session are the recovery authority.
 
         if self._scheduler is not None:
             self._scheduler(run, "management-update-activate")

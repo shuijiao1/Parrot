@@ -440,13 +440,117 @@ def rename_runtime_channel_state(old_channel_key:str,new_channel_key:str,*,old_a
                 bucket[new_account_key]=target
     get_store()._mutate_many(domains,op,strict=False)
 
+def codex_identity_tombstone_load(owner_digest:str):return _get("codex_identity_tombstones",owner_digest)
+def codex_identity_tombstone_load_all():return _all("codex_identity_tombstones")
+def codex_identity_tombstone_claim(owner_digest:str,installation_id:str,generation_version:int,*,created_at:str)->dict:
+    """Atomically claim the one installation allowed for a canonical OAuth owner."""
+    owner=str(owner_digest or ""); installation=str(installation_id or "")
+    if not owner.startswith("sha256:") or not installation:raise ValueError("invalid Codex identity tombstone")
+    def op(d):
+        old=d.get(owner)
+        if old:
+            if old.get("installation_id")!=installation:raise ValueError("Codex owner tombstone installation conflict")
+            return old
+        for row in d.values():
+            if row.get("owner_digest")!=owner and row.get("installation_id")==installation:
+                raise ValueError("Codex installation is already bound to another owner")
+        row={"owner_digest":owner,"installation_id":installation,"generation_version":int(generation_version),"created_at":str(created_at or "")}
+        d[owner]=row;return row
+    return _mut("codex_identity_tombstones",op,strict=True)
+def codex_identity_tombstone_delete(owner_digest:str)->bool:
+    return bool(_mut("codex_identity_tombstones",lambda d:d.pop(owner_digest,None) is not None,strict=True))
+
+def _codex_logical_key(owner_digest:str,principal_digest:str,anchor_digest:str)->str:
+    return _key(owner_digest,principal_digest,anchor_digest)
+def codex_logical_session_load(owner_digest:str,principal_digest:str,anchor_digest:str):
+    return _get("codex_logical_sessions",_codex_logical_key(owner_digest,principal_digest,anchor_digest))
+def codex_logical_session_load_all():return _all("codex_logical_sessions")
+def codex_logical_session_resolve(candidate:dict[str,Any])->dict:
+    """Atomic insert-if-absent for one durable logical-session mapping."""
+    owner=str(candidate.get("owner_digest") or ""); principal=str(candidate.get("downstream_principal_digest") or ""); anchor=str(candidate.get("downstream_anchor_digest") or "")
+    if not all(value.startswith("sha256:") for value in (owner,principal,anchor)):
+        raise ValueError("Codex logical-session keys must be digests")
+    key=_codex_logical_key(owner,principal,anchor); ts=now_ms()
+    def op(d):
+        old=d.get(key)
+        if old:
+            row=dict(old);row["last_used_at"]=ts;d[key]=row;return row
+        row=dict(candidate);row["last_used_at"]=ts;d[key]=row;return row
+    return _mut("codex_logical_sessions",op,strict=True)
+def codex_logical_session_advance_window(owner_digest:str,principal_digest:str,anchor_digest:str,*,expected_window_number:int,context_window_id:str)->dict:
+    key=_codex_logical_key(owner_digest,principal_digest,anchor_digest); ts=now_ms()
+    def op(d):
+        old=d.get(key)
+        if not old:raise KeyError("Codex logical session not found")
+        if int(old.get("window_number") or 0)!=int(expected_window_number):raise ValueError("Codex logical-session window CAS conflict")
+        row=dict(old);row["window_number"]=int(expected_window_number)+1;row["context_window_id"]=context_window_id;row["last_used_at"]=ts;d[key]=row;return row
+    return _mut("codex_logical_sessions",op,strict=True)
+def codex_logical_session_delete_owner(owner_digest:str)->int:
+    def op(d):
+        keys=[key for key,row in d.items() if row.get("owner_digest")==owner_digest]
+        for key in keys:d.pop(key,None)
+        return len(keys)
+    return _mut("codex_logical_sessions",op,strict=True)
+
+def codex_compaction_confirm_and_advance_window(owner_digest:str,principal_digest:str,anchor_digest:str,*,expected_window_number:int,context_window_id:str,model:str,logical_session_id:str,refs:list[tuple[str,str]])->dict:
+    """Atomically mark a confirmed compaction response and advance its window once."""
+    session_key=_codex_logical_key(owner_digest,principal_digest,anchor_digest)
+    ref_keys=[_key(compaction_id,content_digest) for compaction_id,content_digest in refs]
+    if not ref_keys:raise ValueError("confirmed compaction requires at least one reference")
+    ts=now_ms()
+    def op(data):
+        sessions=data["codex_logical_sessions"]; owners=data["codex_compaction_owners"]
+        old=sessions.get(session_key)
+        if not old:raise KeyError("Codex logical session not found")
+        if old.get("owner_digest")!=owner_digest or old.get("session_id")!=logical_session_id:
+            raise ValueError("confirmed compaction logical-session scope conflict")
+        rows=[]
+        for ref_key in ref_keys:
+            row=owners.get(ref_key)
+            if not row:raise KeyError("confirmed compaction owner row not found")
+            if row.get("owner_identity")!=owner_digest:
+                raise ValueError("confirmed compaction owner scope conflict")
+            if row.get("logical_session_id")!=logical_session_id:
+                raise ValueError("confirmed compaction logical-session scope conflict")
+            if row.get("model")!=model:
+                raise ValueError("confirmed compaction model scope conflict")
+            rows.append(row)
+        if all(row.get("window_advanced_to") is not None for row in rows):
+            return {"advanced":False,"logical_session":dict(old)}
+        if int(old.get("window_number") or 0)!=int(expected_window_number):
+            raise ValueError("Codex logical-session window CAS conflict")
+        advanced=dict(old)
+        advanced["window_number"]=int(expected_window_number)+1
+        advanced["context_window_id"]=context_window_id
+        advanced["last_used_at"]=ts
+        sessions[session_key]=advanced
+        for ref_key,row in zip(ref_keys,rows):
+            marked=dict(row)
+            marked["window_advanced_from"]=int(expected_window_number)
+            marked["window_advanced_to"]=int(expected_window_number)+1
+            marked["window_advanced_at"]=ts
+            owners[ref_key]=marked
+        return {"advanced":True,"logical_session":advanced}
+    return get_store()._mutate_many(("codex_logical_sessions","codex_compaction_owners"),op,strict=True)
+
 def compaction_owner_load(compaction_id:str,content_digest:str):return _get("codex_compaction_owners",_key(compaction_id,content_digest))
-def compaction_owner_upsert(compaction_id:str,content_digest:str,owner_key:str,owner_identity:str,*,used_at:int|None=None,compatible_identities:set[str]|None=None)->dict:
+def compaction_owner_upsert(compaction_id:str,content_digest:str,owner_key:str,owner_identity:str,*,used_at:int|None=None,compatible_identities:set[str]|None=None,model:str|None=None,logical_session_id:str|None=None)->dict:
     ts=used_at if used_at is not None else now_ms(); key=_key(compaction_id,content_digest)
     def op(d):
         old=d.get(key)
         if old and old.get("owner_identity")!=owner_identity and old.get("owner_identity") not in (compatible_identities or set()):raise ValueError("compaction owner conflict")
-        row=dict(old or {"compaction_id":compaction_id,"content_digest":content_digest,"created_at":ts});row.update(owner_key=owner_key,owner_identity=owner_identity,last_used=ts);d[key]=row;return row
+        if old and model and old.get("model") and old.get("model")!=model:raise ValueError("compaction model scope conflict")
+        if old and logical_session_id and old.get("logical_session_id") and old.get("logical_session_id")!=logical_session_id:raise ValueError("compaction logical-session scope conflict")
+        row=dict(old or {"compaction_id":compaction_id,"content_digest":content_digest,"created_at":ts});row.update(owner_key=owner_key,owner_identity=owner_identity,last_used=ts)
+        if model:row["model"]=model
+        if logical_session_id:row["logical_session_id"]=logical_session_id
+        d[key]=row;return row
+    return _mut("codex_compaction_owners",op,strict=True)
+def compaction_owner_delete_owner(owner_identity:str)->int:
+    def op(d):
+        keys=[key for key,row in d.items() if row.get("owner_identity")==owner_identity]
+        for key in keys:d.pop(key,None)
+        return len(keys)
     return _mut("codex_compaction_owners",op,strict=True)
 
 # Explicit durable interfaces used by updater/checker/status monitor.

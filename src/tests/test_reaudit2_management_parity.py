@@ -22,8 +22,14 @@ from src.management_api.routers import apikey, auxiliary_support, channels
 FAKE_MANAGEMENT_KEY = "pmk_" + "K" * 64
 
 
-def _legacy_without_management() -> dict:
+def _normalized_default_config() -> dict:
     value = copy.deepcopy(config.DEFAULT_CONFIG)
+    config._normalize_openai_oauth_config(value, value)
+    return value
+
+
+def _legacy_without_management() -> dict:
+    value = _normalized_default_config()
     value.pop("management")
     return value
 
@@ -48,7 +54,7 @@ def test_p01_missing_management_key_is_generated_once_and_persisted(tmp_path, mo
 
 def test_p01_existing_management_key_is_unchanged_without_write(tmp_path, monkeypatch):
     path = tmp_path / "config.json"
-    existing = copy.deepcopy(config.DEFAULT_CONFIG)
+    existing = _normalized_default_config()
     existing["management"]["managementKey"] = FAKE_MANAGEMENT_KEY
     path.write_text(json.dumps(existing), encoding="utf-8")
     monkeypatch.setattr(config, "CONFIG_PATH", str(path))

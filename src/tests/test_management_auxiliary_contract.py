@@ -296,7 +296,7 @@ def test_openapi_has_exact_auxiliary_operations_typed_schemas_and_examples(tmp_p
     assert "top-secret" not in serialized
     schemas = document["components"]["schemas"]
     assert schemas["ActivateStagedUpdateRequest"]["properties"]["planToken"]["writeOnly"] is True
-    assert schemas["StageUpdateOperationData"]["properties"]["activationPlanToken"]["writeOnly"] is True
+    assert "writeOnly" not in schemas["StageUpdateOperationData"]["properties"]["activationPlanToken"]
     assert "502" in operations["checkForUpdates"]["responses"]
 
     def is_date_time(property_schema):

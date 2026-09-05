@@ -360,14 +360,14 @@ def test_metadata_selectors_are_strict_and_never_mutate_on_rejection(
 
 
 @pytest.mark.parametrize(
-    "scope,selector_field,scope_id",
+    "scope,selector_field,scope_id,public_scope_id",
     [
-        ("oauth", "accountId", "oauth:valid-account"),
-        ("api", "channelId", "api:valid-channel"),
+        ("oauth", "accountId", "oauth:valid-account", "valid-account"),
+        ("api", "channelId", "api:valid-channel", "api:valid-channel"),
     ],
 )
 def test_valid_scoped_binding_put_and_delete_remain_supported(
-    domain_client, monkeypatch, scope, selector_field, scope_id,
+    domain_client, monkeypatch, scope, selector_field, scope_id, public_scope_id,
 ):
     client, _runtime, admin, *_ = domain_client
     selected = model_pricing.catalog_models()[0]
@@ -390,7 +390,7 @@ def test_valid_scoped_binding_put_and_delete_remain_supported(
     assert created.status_code == 200, created.text
     data = created.json()["data"]
     assert data["scope"] == scope
-    assert data["scopeId"] == scope_id
+    assert data["scopeId"] == public_scope_id
     assert data["outboundModel"] == "current-outbound"
 
     deleted = client.delete(

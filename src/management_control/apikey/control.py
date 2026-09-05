@@ -15,7 +15,13 @@ from typing import Any, Mapping
 
 from src import apikey_limiter, config, log_db
 from src.channel import registry
-from src.management_auth import AuthMethod, Capability, CapabilityDenied, authorize
+from src.management_auth import (
+    AuthMethod,
+    Capability,
+    CapabilityDenied,
+    ManagementStateStore,
+    authorize,
+)
 from src.management_control.context import AuditSink, ManagementContext, audit_record
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
 
@@ -65,6 +71,7 @@ class ApiKeyControl:
         self,
         *,
         config_store: Any = config,
+        provenance_store: ManagementStateStore | None = None,
         limiter: Any = apikey_limiter,
         statistics: Any = log_db,
         model_registry: Any = registry,
@@ -74,6 +81,7 @@ class ApiKeyControl:
         generated_secret_factory: Any | None = None,
     ) -> None:
         self._config = config_store
+        self._provenance_store = provenance_store
         self._limiter = limiter
         self._stats = statistics
         self._models = model_registry
@@ -298,6 +306,7 @@ class ApiKeyControl:
             }
 
         self._config.update(mutate)
+        self._save_provenance(name, secret, mode.value)
         item = self._current_view(name)
         self._record(context, "apikey.create", name)
         return ApiKeySecretResult(api_key=item, secret=secret)
@@ -393,6 +402,7 @@ class ApiKeyControl:
             keys.pop(key_id, None)
 
         self._config.update(mutate)
+        self._forget_provenance(key_id)
         self._limiter.forget_key(key_id)
         self._record(context, "apikey.delete", key_id)
 
@@ -579,6 +589,7 @@ class ApiKeyControl:
                 entry["source"] = source.value
             keys[key_id] = entry
         self._config.update(mutate)
+        self._save_provenance(key_id, secret, source.value)
 
     def _validated_plan(
         self, context: ManagementContext, key_id: str, plan_id: str, token: str,
@@ -657,7 +668,7 @@ class ApiKeyControl:
             name=name,
             order=order,
             enabled=entry.get("enabled") is not False,
-            source=self._provenance(entry),
+            source=self._provenance(name, entry),
             masked_hint=self._masked(secret),
             allow_images=bool(entry.get("allowImages")),
             allow_videos=bool(entry.get("allowVideos")),
@@ -726,12 +737,49 @@ class ApiKeyControl:
             return {}
         return {str(name): cls._normalize_entry(raw) for name, raw in value.items() if cls._normalize_entry(raw).get("key")}
 
-    @staticmethod
-    def _provenance(entry: Mapping[str, Any]) -> ApiKeyProvenance:
+    def _provenance(self, key_id: str, entry: Mapping[str, Any]) -> ApiKeyProvenance:
+        source = entry.get("source")
+        if source not in {ApiKeyProvenance.CUSTOM.value, ApiKeyProvenance.GENERATED.value}:
+            source = None
+            if self._provenance_store is not None:
+                try:
+                    source = self._provenance_store.get_api_key_provenance(
+                        key_id=key_id,
+                        secret_fingerprint=self._provenance_fingerprint(
+                            key_id, str(entry.get("key") or ""),
+                        ),
+                    )
+                except Exception:
+                    pass
+        return ApiKeyProvenance(source or ApiKeyProvenance.UNKNOWN.value)
+
+    def _save_provenance(self, key_id: str, secret: str, source: str) -> None:
+        if self._provenance_store is not None:
+            try:
+                self._provenance_store.set_api_key_provenance(
+                    key_id=key_id,
+                    secret_fingerprint=self._provenance_fingerprint(key_id, secret),
+                    source=source,
+                )
+            except Exception:
+                # Auxiliary provenance must not turn a successful business write
+                # into failure. A record for an older secret will not match.
+                pass
+
+    def _forget_provenance(self, key_id: str) -> None:
+        if self._provenance_store is None:
+            return
         try:
-            return ApiKeyProvenance(str(entry.get("source") or "unknown"))
-        except ValueError:
-            return ApiKeyProvenance.UNKNOWN
+            self._provenance_store.forget_api_key_provenance(key_id=key_id)
+        except Exception:
+            # Deletion already succeeded; provenance cleanup is best-effort.
+            return
+
+    @staticmethod
+    def _provenance_fingerprint(key_id: str, secret: str) -> str:
+        payload = b"parrot:api-key-provenance:v1\0" + str(key_id).encode("utf-8")
+        payload += b"\0" + str(secret).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
     @staticmethod
     def _normalize_entry(raw: Any) -> dict:

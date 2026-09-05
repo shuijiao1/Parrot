@@ -29,6 +29,7 @@ from .contracts import (
 )
 from .default_models import OAuthDefaultModelsControlMixin
 from .flows import OAuthFlowService
+from .imports import OAuthImportControlMixin
 from .legacy_ops import OAuthLegacyOperationsControlMixin
 from .models import (
     CchMode,
@@ -38,11 +39,6 @@ from .models import (
     OAuthAccountSort,
     OAuthAccountSummary,
     OAuthDeletionPlan,
-    OAuthImportCandidate,
-    OAuthImportCommitResult,
-    OAuthImportDecision,
-    OAuthImportPreview,
-    OAuthImportProblem,
     OAuthLocalStats,
     OAuthLoginFlow,
     OAuthModel,
@@ -78,6 +74,7 @@ def _page(items: list, spec: PageSpec) -> tuple[list, PageMeta]:
 class OAuthControl(
     OAuthAccountOrchestrationControlMixin,
     OAuthAccountMutationControlMixin,
+    OAuthImportControlMixin,
     OAuthCompatibilityControlMixin,
     OAuthDefaultModelsControlMixin,
     OAuthLegacyOperationsControlMixin,
@@ -383,109 +380,6 @@ class OAuthControl(
             ) from exc
         self._audit(context, "oauth.login.start", provider.value)
         return flow
-
-    @audit_failures("oauth.import.preview", target="oauthImport")
-    def preview_import(
-        self, context: ManagementContext, *, format: str, payload: str, filename: str = "",
-    ) -> OAuthImportPreview:
-        self._require(context, Capability.SECRETS_WRITE)
-        if format not in {"openai", "cpa", "sub2api"}:
-            raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
-        problems: list[OAuthImportProblem] = []
-        try:
-            entries = self.backend.parse_import(format, payload, filename=filename)
-        except Exception as exc:
-            entries = []
-            problems.append(OAuthImportProblem(index=None, code="PARSE_FAILED", message=type(exc).__name__))
-        candidates = []
-        safe_entries = []
-        for index, entry in enumerate(entries):
-            try:
-                identity = self.backend.account_id(entry)
-                existing = self.backend.find_exact_identity(entry)
-            except Exception:
-                problems.append(OAuthImportProblem(index=index, code="INVALID_CANDIDATE", message="Candidate is invalid"))
-                continue
-            candidate_id = f"candidate-{index + 1}"
-            safe_entries.append({"candidate_id": candidate_id, "entry": copy.deepcopy(entry)})
-            candidates.append(
-                OAuthImportCandidate(
-                    candidate_id=candidate_id,
-                    provider=OAuthProvider(self.backend.provider_of(entry)),
-                    identity=sanitize_text(identity),
-                    display_name=sanitize_text(entry.get("label") or entry.get("email") or identity),
-                    conflict_account_id=existing[0] if existing else None,
-                )
-            )
-        expected_accounts = copy.deepcopy(self.backend.list_accounts())
-        import_id, import_secret, plan = self._import_plans.create_split(
-            actor_subject_id=context.actor.subject_id,
-            kind="import",
-            revision=_revision(expected_accounts),
-            payload={
-                "candidates": tuple(safe_entries),
-                "expected_accounts": expected_accounts,
-            },
-        )
-        return OAuthImportPreview(
-            import_id=import_id,
-            import_secret=import_secret,
-            candidates=tuple(candidates),
-            errors=tuple(problems),
-            expires_at=plan.expires_at,
-        )
-
-    @audit_failures("oauth.import.commit", target="oauthImport")
-    def commit_import(
-        self,
-        context: ManagementContext,
-        import_id: str,
-        import_secret: str,
-        decisions: Iterable[OAuthImportDecision],
-    ) -> OAuthImportCommitResult:
-        self._require(context, Capability.SECRETS_WRITE)
-        plan = self._import_plans.inspect_parts(
-            import_id,
-            import_secret,
-            actor_subject_id=context.actor.subject_id,
-            kind="import",
-        )
-        candidates = tuple(plan.payload["candidates"])
-        choices = {decision.candidate_id: decision.action for decision in decisions}
-        valid_ids = {item["candidate_id"] for item in candidates}
-        if set(choices) != valid_ids or any(
-            action not in {"keep", "overwrite"} for action in choices.values()
-        ):
-            raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
-        for item in candidates:
-            self._ensure_legacy_identity_safe(item["entry"])
-        self._import_plans.consume_parts(
-            import_id,
-            import_secret,
-            actor_subject_id=context.actor.subject_id,
-            kind="import",
-        )
-        outcome = self.backend.commit_import_conditional(
-            copy.deepcopy(plan.payload["expected_accounts"]), candidates, choices,
-        )
-        if outcome.get("status") == "revision_conflict":
-            raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
-        if outcome.get("status") != "committed":
-            raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
-        added = tuple(str(item) for item in outcome.get("added") or ())
-        replaced = tuple(str(item) for item in outcome.get("replaced") or ())
-        skipped = tuple(str(item) for item in outcome.get("skipped") or ())
-        affected = set(added) | set(replaced)
-        started: set[str] = set()
-        for item in candidates:
-            account_id = self.backend.account_id(item["entry"])
-            if account_id in affected and account_id not in started:
-                # Frozen import commits start model discovery, but do not run the
-                # interactive login usage/quota follow-up for every imported row.
-                self._start_post_save_model_sync(account_id)
-                started.add(account_id)
-        self._audit(context, "oauth.import.commit", import_id)
-        return OAuthImportCommitResult(added, replaced, skipped)
 
     def list_invalid_accounts(self, context: ManagementContext, *, page: PageSpec) -> OAuthAccountPage:
         return self.list_accounts(context, account_filter=OAuthAccountFilter.INVALID, page=page)

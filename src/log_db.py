@@ -13,6 +13,7 @@
 """
 
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import cmp_to_key
 from pathlib import Path
 from typing import Any, Literal
 
@@ -865,6 +867,121 @@ def retention_policy(cfg: dict | None = None) -> dict[str, Any]:
     if days < 1:
         return {"mode": _RETENTION_MODE_FOREVER, "days": None}
     return {"mode": _RETENTION_MODE_DAYS, "days": days}
+
+
+def update_retention_settings(
+    *,
+    mode: str | None = None,
+    days: Any = None,
+    log_store_bodies: bool | None = None,
+    expected_policy: dict[str, Any] | None = None,
+    expected_log_store_bodies: bool | None = None,
+) -> dict[str, Any]:
+    """Atomically persist a safe retention-policy/body-storage patch.
+
+    The retention lock serializes this mutation with plan application.  Both
+    fields are applied to one ``config.update`` candidate so a persistence
+    failure cannot publish either half.  Destructive policy transitions remain
+    exclusive to ``plan_retention`` / ``apply_retention_plan``.
+    """
+
+    if mode not in {None, _RETENTION_MODE_FOREVER, _RETENTION_MODE_DAYS}:
+        raise RetentionPlanError("日志留存模式无效")
+    if mode == _RETENTION_MODE_FOREVER and days is not None:
+        raise RetentionPlanError("永久保留模式不能设置保留天数")
+    target_days = _require_retention_days(days) if mode == _RETENTION_MODE_DAYS else None
+    if log_store_bodies is not None and not isinstance(log_store_bodies, bool):
+        raise RetentionPlanError("日志正文保存设置必须是布尔值")
+
+    if not _retention_lock.acquire(blocking=False):
+        return {"ok": False, "error": "busy", "reason": "已有日志留存清理正在执行，请完成后再修改。"}
+    try:
+        before = config.get()
+        before_policy = retention_policy(before)
+        before_bodies = before.get("logStoreBodies", True) is not False
+        if expected_policy is not None:
+            normalized_expected = retention_policy({"logRetention": expected_policy})
+            if normalized_expected != before_policy:
+                return {
+                    "ok": False,
+                    "error": "revision_conflict",
+                    "reason": "日志留存设置在保存前已被修改",
+                }
+        if expected_log_store_bodies is not None and bool(expected_log_store_bodies) != before_bodies:
+            return {
+                "ok": False,
+                "error": "revision_conflict",
+                "reason": "日志正文保存设置在保存前已被修改",
+            }
+
+        target_policy = before_policy if mode is None else {
+            "mode": mode,
+            "days": target_days if mode == _RETENTION_MODE_DAYS else None,
+        }
+        dangerous = (
+            before_policy["mode"] == _RETENTION_MODE_FOREVER
+            and target_policy["mode"] == _RETENTION_MODE_DAYS
+        ) or (
+            before_policy["mode"] == _RETENTION_MODE_DAYS
+            and target_policy["mode"] == _RETENTION_MODE_DAYS
+            and int(target_policy["days"]) < int(before_policy["days"])
+        )
+        if dangerous:
+            return {
+                "ok": False,
+                "error": "plan_required",
+                "reason": "缩短日志留存期必须先扫描并确认清理计划",
+            }
+
+        target_bodies = before_bodies if log_store_bodies is None else log_store_bodies
+        policy_changed = target_policy != before_policy
+        bodies_changed = target_bodies != before_bodies
+        if not policy_changed and not bodies_changed:
+            return {
+                "ok": True,
+                "changed": False,
+                "policy": before_policy,
+                "log_store_bodies": before_bodies,
+            }
+
+        stale = False
+
+        def mutate(candidate: dict[str, Any]) -> None:
+            nonlocal stale
+            live_policy = retention_policy(candidate)
+            live_bodies = candidate.get("logStoreBodies", True) is not False
+            if live_policy != before_policy or live_bodies != before_bodies:
+                stale = True
+                raise RetentionPlanError("日志留存设置在保存前已被修改")
+            if policy_changed:
+                candidate["logRetention"] = dict(target_policy)
+            if bodies_changed:
+                candidate["logStoreBodies"] = target_bodies
+
+        try:
+            saved = config.update(mutate)
+        except RetentionPlanError as exc:
+            if stale:
+                return {"ok": False, "error": "revision_conflict", "reason": str(exc)}
+            return {"ok": False, "error": "persist_failed", "reason": f"保存日志留存设置失败：{exc}"}
+        except Exception as exc:
+            return {"ok": False, "error": "persist_failed", "reason": f"保存日志留存设置失败：{exc}"}
+
+        if policy_changed:
+            if target_policy["mode"] == _RETENTION_MODE_FOREVER:
+                global _last_retention_cleanup_key
+                with _retention_auto_lock:
+                    _last_retention_cleanup_key = None
+            else:
+                _mark_retention_cleanup(int(target_policy["days"]), time.time())
+        return {
+            "ok": True,
+            "changed": True,
+            "policy": retention_policy(saved),
+            "log_store_bodies": saved.get("logStoreBodies", True) is not False,
+        }
+    finally:
+        _retention_lock.release()
 
 
 def set_retention_forever() -> dict[str, Any]:
@@ -5354,15 +5471,27 @@ def _management_logs_where(
     protocols: list[str] | None,
     started_at: float | None,
     ended_at: float | None,
+    available_columns: set[str] | None = None,
 ) -> tuple[str, list[Any]]:
-    """Build the trusted structured predicate for the Management log list."""
+    """Build the trusted structured predicate for the Management log list.
+
+    Historical databases are opened read-only and may predate nullable fields
+    such as ``ingress_protocol``.  A filter on an absent field cannot match that
+    month; it must not trigger a migration or silently broaden the predicate.
+    """
 
     conditions: list[str] = []
     values: list[Any] = []
 
+    def has_column(column: str) -> bool:
+        return available_columns is None or column in available_columns
+
     def add_values(column: str, raw_values: list[str] | None) -> None:
         normalized = [str(value) for value in (raw_values or []) if str(value)]
         if not normalized:
+            return
+        if not has_column(column):
+            conditions.append("0")
             return
         conditions.append(f"{column} IN ({','.join('?' for _ in normalized)})")
         values.extend(normalized)
@@ -5371,20 +5500,33 @@ def _management_logs_where(
     add_values("api_key_name", api_keys)
     normalized_models = [str(value) for value in (models or []) if str(value)]
     if normalized_models:
-        placeholders = ",".join("?" for _ in normalized_models)
-        conditions.append(
-            f"(requested_model IN ({placeholders}) OR final_model IN ({placeholders}))"
-        )
-        values.extend(normalized_models)
-        values.extend(normalized_models)
+        model_columns = [
+            column for column in ("requested_model", "final_model")
+            if has_column(column)
+        ]
+        if not model_columns:
+            conditions.append("0")
+        else:
+            placeholders = ",".join("?" for _ in normalized_models)
+            conditions.append("(" + " OR ".join(
+                f"{column} IN ({placeholders})" for column in model_columns
+            ) + ")")
+            for _column in model_columns:
+                values.extend(normalized_models)
     add_values("final_channel_key", channel_keys)
     add_values("ingress_protocol", protocols)
     if started_at is not None:
-        conditions.append("created_at>=?")
-        values.append(float(started_at))
+        if has_column("created_at"):
+            conditions.append("created_at>=?")
+            values.append(float(started_at))
+        else:
+            conditions.append("0")
     if ended_at is not None:
-        conditions.append("created_at<=?")
-        values.append(float(ended_at))
+        if has_column("created_at"):
+            conditions.append("created_at<=?")
+            values.append(float(ended_at))
+        else:
+            conditions.append("0")
     return (("WHERE " + " AND ".join(conditions)) if conditions else ""), values
 
 
@@ -5510,31 +5652,50 @@ def _management_text_matches(row: dict[str, Any], query: str) -> bool:
     )
 
 
-def management_logs_page(
-    *,
-    statuses: list[str] | None = None,
-    api_keys: list[str] | None = None,
-    models: list[str] | None = None,
-    channel_keys: list[str] | None = None,
-    protocols: list[str] | None = None,
-    query: str | None = None,
-    started_at: float | None = None,
-    ended_at: float | None = None,
-    sort: str = "createdAt",
-    descending: bool = True,
-    page: int = 1,
-    page_size: int = 50,
-) -> tuple[list[dict], int]:
-    """Return one exact Management page with structured work pushed into SQL.
+def _management_log_sources() -> list[tuple[str, str | None, bool]]:
+    """Return every retained strict monthly log file and the live current DB.
 
-    A random public page still uses one final SQL LIMIT/OFFSET.  Free text keeps
-    Python's Unicode ``casefold`` semantics and streams one already-filtered,
-    already-sorted cursor in bounded batches so no complete candidate set is
-    materialized and no repeated OFFSET scans occur.
+    The ``None`` path is only a compatibility seam for isolated in-memory tests
+    that replace ``_get_conn`` before calling ``init``.  Production paths always
+    use strict, validated ``YYYY-MM.db`` names from ``_monthly_log_files``.
     """
 
-    conn = _get_conn()
+    if _log_dir is None:
+        return [("", None, True)]
+    current = _db_ref_for_timestamp()
+    sources = [
+        (month, path, path == current.path)
+        for month, path in _monthly_log_files()
+    ]
+    if not any(path == current.path for _month, path, _live in sources):
+        sources.append((current.month, current.path, True))
+    return sorted(sources, key=lambda item: item[0])
+
+
+def _open_management_log_source(
+    source: tuple[str, str | None, bool],
+) -> tuple[sqlite3.Connection, bool]:
+    _month, path, live = source
+    if live or path is None:
+        return _get_conn(), False
+    return _open_readonly(path), True
+
+
+def _management_query_parts(
+    conn: sqlite3.Connection,
+    *,
+    statuses: list[str] | None,
+    api_keys: list[str] | None,
+    models: list[str] | None,
+    channel_keys: list[str] | None,
+    protocols: list[str] | None,
+    started_at: float | None,
+    ended_at: float | None,
+    sort: str,
+    descending: bool,
+) -> tuple[str, list[Any], str, str]:
     conn.create_collation("PARROT_CASEFOLD", _casefold_collation)
+    columns = _table_columns(conn, "request_log")
     where, values = _management_logs_where(
         statuses=statuses,
         api_keys=api_keys,
@@ -5543,9 +5704,10 @@ def management_logs_page(
         protocols=protocols,
         started_at=started_at,
         ended_at=ended_at,
+        available_columns=columns,
     )
     projection = _compatible_recent_cols(conn)
-    candidate_tie_order = _management_candidate_tie_order(
+    tie_order = _management_candidate_tie_order(
         conn,
         projection=projection,
         statuses=statuses,
@@ -5554,13 +5716,41 @@ def management_logs_page(
         channel_keys=channel_keys,
     )
     order = _management_logs_order(
-        sort,
-        bool(descending),
-        candidate_tie_order=candidate_tie_order,
+        sort, bool(descending), candidate_tie_order=tie_order,
     )
-    size = max(1, int(page_size or 50))
-    offset = max(0, (max(1, int(page or 1)) - 1) * size)
+    return where, values, projection, order
 
+
+def _management_logs_page_one(
+    conn: sqlite3.Connection,
+    *,
+    statuses: list[str] | None,
+    api_keys: list[str] | None,
+    models: list[str] | None,
+    channel_keys: list[str] | None,
+    protocols: list[str] | None,
+    query: str | None,
+    started_at: float | None,
+    ended_at: float | None,
+    sort: str,
+    descending: bool,
+    size: int,
+    offset: int,
+) -> tuple[list[dict], int]:
+    """Keep the frozen one-month query plan and page boundaries unchanged."""
+
+    where, values, projection, order = _management_query_parts(
+        conn,
+        statuses=statuses,
+        api_keys=api_keys,
+        models=models,
+        channel_keys=channel_keys,
+        protocols=protocols,
+        started_at=started_at,
+        ended_at=ended_at,
+        sort=sort,
+        descending=descending,
+    )
     if not query:
         count_row = conn.execute(
             f"SELECT COUNT(*) AS n FROM request_log {where}", values,
@@ -5594,18 +5784,315 @@ def management_logs_page(
     return page_rows, matched
 
 
-def management_log_filter_options() -> dict[str, list[dict[str, Any]]]:
-    """Aggregate every current-store filter option without loading log rows."""
+def _management_stream(cursor: sqlite3.Cursor):
+    """Yield a sorted SQLite cursor with bounded Python memory."""
 
-    conn = _get_conn()
+    while True:
+        batch = cursor.fetchmany(_MANAGEMENT_TEXT_BATCH_SIZE)
+        if not batch:
+            return
+        for row in batch:
+            yield _sanitize_request_timing(row)
+
+
+def _management_scalar_compare(left: Any, right: Any) -> int:
+    try:
+        return (left > right) - (left < right)
+    except TypeError:
+        a = str(left or "")
+        b = str(right or "")
+        return (a > b) - (a < b)
+
+
+def _management_merge_value(row: dict[str, Any], sort: str) -> Any:
+    if sort == "status":
+        return str(row.get("status") or "")
+    if sort == "latency":
+        return row.get("total_time_ms") or 0
+    if sort == "model":
+        return str(
+            row.get("requested_model") or row.get("final_model") or ""
+        ).casefold()
+    return row.get("created_at") or 0
+
+
+def _management_merge_compare(
+    left: tuple[dict[str, Any], str],
+    right: tuple[dict[str, Any], str],
+    *,
+    sort: str,
+    descending: bool,
+) -> int:
+    """Compare heads from per-month frozen orders for a global stable merge."""
+
+    left_row, left_month = left
+    right_row, right_month = right
+    primary = _management_scalar_compare(
+        _management_merge_value(left_row, sort),
+        _management_merge_value(right_row, sort),
+    )
+    if primary:
+        return -primary if descending else primary
+    if sort != "createdAt":
+        created = _management_scalar_compare(
+            left_row.get("created_at") or 0,
+            right_row.get("created_at") or 0,
+        )
+        if created:
+            return -created
+    # Separate monthly rowids can collide.  The month is a deterministic final
+    # cross-file tie-break; within each file the cursor retains the exact frozen
+    # planner-derived id/index order.
+    month_order = _management_scalar_compare(left_month, right_month)
+    return -month_order
+
+
+def _management_text_projection(conn: sqlite3.Connection) -> str:
+    columns = _table_columns(conn, "request_log")
+    if "request_id" not in columns:
+        raise sqlite3.OperationalError("request_log.request_id is required")
+    return ", ".join(
+        name if name in columns else f"NULL AS {name}"
+        for name in (
+            "request_id", "requested_model", "final_model",
+            "final_channel_key", "api_key_name", "error_message",
+        )
+    )
+
+
+def _management_count_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    statuses: list[str] | None,
+    api_keys: list[str] | None,
+    models: list[str] | None,
+    channel_keys: list[str] | None,
+    protocols: list[str] | None,
+    query: str | None,
+    started_at: float | None,
+    ended_at: float | None,
+) -> int:
+    columns = _table_columns(conn, "request_log")
+    where, values = _management_logs_where(
+        statuses=statuses,
+        api_keys=api_keys,
+        models=models,
+        channel_keys=channel_keys,
+        protocols=protocols,
+        started_at=started_at,
+        ended_at=ended_at,
+        available_columns=columns,
+    )
+    if not query:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM request_log {where}", values,
+        ).fetchone()
+        return int(row["n"] or 0) if row else 0
+    cursor = conn.execute(
+        f"SELECT {_management_text_projection(conn)} FROM request_log {where}",
+        values,
+    )
+    total = 0
+    while True:
+        batch = cursor.fetchmany(_MANAGEMENT_TEXT_BATCH_SIZE)
+        if not batch:
+            return total
+        total += sum(
+            1 for row in batch if _management_text_matches(dict(row), query)
+        )
+
+
+def management_logs_count(
+    *,
+    statuses: list[str] | None = None,
+    api_keys: list[str] | None = None,
+    models: list[str] | None = None,
+    channel_keys: list[str] | None = None,
+    protocols: list[str] | None = None,
+    query: str | None = None,
+    started_at: float | None = None,
+    ended_at: float | None = None,
+) -> int:
+    """Count matching Management logs across all strict retained month DBs."""
+
+    total = 0
+    for source in _management_log_sources():
+        conn, close = _open_management_log_source(source)
+        try:
+            total += _management_count_on_conn(
+                conn,
+                statuses=statuses,
+                api_keys=api_keys,
+                models=models,
+                channel_keys=channel_keys,
+                protocols=protocols,
+                query=query,
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+        except sqlite3.Error as exc:
+            month, _path, live = source
+            if live:
+                raise
+            raise HistoricalLogError(
+                f"management log count failed for {month}.db: {exc}"
+            ) from exc
+        finally:
+            if close:
+                conn.close()
+    return total
+
+
+def management_logs_page(
+    *,
+    statuses: list[str] | None = None,
+    api_keys: list[str] | None = None,
+    models: list[str] | None = None,
+    channel_keys: list[str] | None = None,
+    protocols: list[str] | None = None,
+    query: str | None = None,
+    started_at: float | None = None,
+    ended_at: float | None = None,
+    sort: str = "createdAt",
+    descending: bool = True,
+    page: int = 1,
+    page_size: int = 50,
+) -> tuple[list[dict], int]:
+    """Return a globally sorted Management page across retained month DBs.
+
+    Structured counts remain SQL aggregates.  Each month supplies at most the
+    requested global prefix for ordinary pages, and a heap merges those sorted
+    cursors.  Unicode free-text search must inspect all matching candidates to
+    report an exact total, but does so in bounded batches without materializing
+    the complete result set in Python.
+    """
+
+    size = max(1, int(page_size or 50))
+    offset = max(0, (max(1, int(page or 1)) - 1) * size)
+    sources = _management_log_sources()
+    if len(sources) == 1:
+        source = sources[0]
+        conn, close = _open_management_log_source(source)
+        try:
+            return _management_logs_page_one(
+                conn,
+                statuses=statuses,
+                api_keys=api_keys,
+                models=models,
+                channel_keys=channel_keys,
+                protocols=protocols,
+                query=query,
+                started_at=started_at,
+                ended_at=ended_at,
+                sort=sort,
+                descending=descending,
+                size=size,
+                offset=offset,
+            )
+        except sqlite3.Error as exc:
+            month, _path, live = source
+            if live:
+                raise
+            raise HistoricalLogError(
+                f"management log page failed for {month}.db: {exc}"
+            ) from exc
+        finally:
+            if close:
+                conn.close()
+
+    opened: list[tuple[sqlite3.Connection, bool]] = []
+    heap: list[tuple[Any, int, dict[str, Any], str, Any]] = []
+    key_factory = cmp_to_key(lambda left, right: _management_merge_compare(
+        left, right, sort=sort, descending=bool(descending),
+    ))
+    total = 0
+    serial = 0
+    target = offset + size
+    try:
+        for source in sources:
+            month, _path, _live = source
+            conn, close = _open_management_log_source(source)
+            opened.append((conn, close))
+            where, values, projection, order = _management_query_parts(
+                conn,
+                statuses=statuses,
+                api_keys=api_keys,
+                models=models,
+                channel_keys=channel_keys,
+                protocols=protocols,
+                started_at=started_at,
+                ended_at=ended_at,
+                sort=sort,
+                descending=descending,
+            )
+            parameters = list(values)
+            limit = ""
+            if not query:
+                count_row = conn.execute(
+                    f"SELECT COUNT(*) AS n FROM request_log {where}", values,
+                ).fetchone()
+                total += int(count_row["n"] or 0) if count_row else 0
+                limit = " LIMIT ?"
+                parameters.append(target)
+            cursor = conn.execute(
+                f"SELECT {projection} FROM request_log {where} "
+                f"ORDER BY {order}{limit}",
+                parameters,
+            )
+            stream = iter(_management_stream(cursor))
+            first = next(stream, None)
+            if first is not None:
+                serial += 1
+                heapq.heappush(
+                    heap,
+                    (key_factory((first, month)), serial, first, month, stream),
+                )
+
+        matched = 0
+        page_rows: list[dict] = []
+        while heap:
+            _key, _seq, row, month, stream = heapq.heappop(heap)
+            if not query or _management_text_matches(row, query):
+                if offset <= matched < target:
+                    page_rows.append(row)
+                matched += 1
+            following = next(stream, None)
+            if following is not None:
+                serial += 1
+                heapq.heappush(
+                    heap,
+                    (key_factory((following, month)), serial, following, month, stream),
+                )
+            if not query and matched >= target:
+                break
+        return page_rows, matched if query else total
+    except sqlite3.Error as exc:
+        raise HistoricalLogError(f"management log page failed: {exc}") from exc
+    finally:
+        for conn, close in opened:
+            if close:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+
+def _management_filter_options_on_conn(
+    conn: sqlite3.Connection,
+) -> dict[str, dict[str, int]]:
+    columns = _table_columns(conn, "request_log")
+    if "request_id" not in columns:
+        raise sqlite3.OperationalError("request_log.request_id is required")
     fields = {
         "apiKeys": "api_key_name",
         "channels": "final_channel_key",
         "statuses": "status",
         "protocols": "ingress_protocol",
     }
-    result: dict[str, list[dict[str, Any]]] = {}
+    result: dict[str, dict[str, int]] = {name: {} for name in fields}
     for public, column in fields.items():
+        if column not in columns:
+            continue
         rows = conn.execute(
             f"""SELECT {column} AS value, COUNT(*) AS count
                   FROM request_log
@@ -5613,33 +6100,75 @@ def management_log_filter_options() -> dict[str, list[dict[str, Any]]]:
                  GROUP BY {column}
                  ORDER BY count DESC, value ASC"""
         ).fetchall()
-        result[public] = [
-            {"value": str(row["value"]), "count": int(row["count"] or 0)}
-            for row in rows
-        ]
+        result[public] = {
+            str(row["value"]): int(row["count"] or 0) for row in rows
+        }
 
-    model_rows = conn.execute(
-        """SELECT value, SUM(count) AS count
-             FROM (
-               SELECT requested_model AS value, COUNT(*) AS count
-                 FROM request_log
-                WHERE requested_model IS NOT NULL AND requested_model!=''
-                GROUP BY requested_model
-               UNION ALL
-               SELECT final_model AS value, COUNT(*) AS count
-                 FROM request_log
-                WHERE final_model IS NOT NULL AND final_model!=''
-                  AND (requested_model IS NULL OR requested_model='' OR final_model!=requested_model)
-                GROUP BY final_model
-             )
-            GROUP BY value
-            ORDER BY count DESC, value ASC"""
-    ).fetchall()
-    result["models"] = [
-        {"value": str(row["value"]), "count": int(row["count"] or 0)}
-        for row in model_rows
-    ]
+    model_queries: list[str] = []
+    if "requested_model" in columns:
+        model_queries.append(
+            "SELECT requested_model AS value, COUNT(*) AS count "
+            "FROM request_log WHERE requested_model IS NOT NULL "
+            "AND requested_model!='' GROUP BY requested_model"
+        )
+    if "final_model" in columns:
+        distinct_from_requested = (
+            " AND (requested_model IS NULL OR requested_model='' "
+            "OR final_model!=requested_model)"
+            if "requested_model" in columns else ""
+        )
+        model_queries.append(
+            "SELECT final_model AS value, COUNT(*) AS count "
+            "FROM request_log WHERE final_model IS NOT NULL "
+            f"AND final_model!=''{distinct_from_requested} GROUP BY final_model"
+        )
+    result["models"] = {}
+    if model_queries:
+        model_rows = conn.execute(
+            "SELECT value, SUM(count) AS count FROM ("
+            + " UNION ALL ".join(model_queries)
+            + ") GROUP BY value ORDER BY count DESC, value ASC"
+        ).fetchall()
+        result["models"] = {
+            str(row["value"]): int(row["count"] or 0) for row in model_rows
+        }
     return result
+
+
+def management_log_filter_options() -> dict[str, list[dict[str, Any]]]:
+    """Aggregate filter option counts across every retained strict month DB."""
+
+    aggregate: dict[str, dict[str, int]] = {
+        "apiKeys": {}, "channels": {}, "statuses": {}, "protocols": {},
+        "models": {},
+    }
+    for source in _management_log_sources():
+        conn, close = _open_management_log_source(source)
+        try:
+            partial = _management_filter_options_on_conn(conn)
+            for public, values in partial.items():
+                target = aggregate[public]
+                for value, count in values.items():
+                    target[value] = target.get(value, 0) + count
+        except sqlite3.Error as exc:
+            month, _path, live = source
+            if live:
+                raise
+            raise HistoricalLogError(
+                f"management log filter options failed for {month}.db: {exc}"
+            ) from exc
+        finally:
+            if close:
+                conn.close()
+    return {
+        public: [
+            {"value": value, "count": count}
+            for value, count in sorted(
+                values.items(), key=lambda item: (-item[1], item[0]),
+            )
+        ]
+        for public, values in aggregate.items()
+    }
 
 
 def recent_logs(
@@ -5763,6 +6292,157 @@ def log_detail(request_id: str) -> dict:
         "local_web_log": [dict(r) for r in local_web_rows],
         "billing_attempts": effective_billing,
     }
+
+
+def _empty_log_detail() -> dict[str, Any]:
+    return {
+        "log": None,
+        "detail": None,
+        "retry_chain": [],
+        "proxy_chain": [],
+        "local_web_log": [],
+        "billing_attempts": [],
+    }
+
+
+def _management_historical_log_detail(
+    conn: sqlite3.Connection,
+    request_id: str,
+) -> dict[str, Any] | None:
+    """Read one exact historical ID without migrating the sealed month."""
+
+    tables = _existing_tables(conn)
+    if "request_log" not in tables:
+        raise sqlite3.OperationalError("request_log table is required")
+    log_row = conn.execute(
+        "SELECT * FROM request_log WHERE request_id=?", (request_id,),
+    ).fetchone()
+    if log_row is None:
+        return None
+
+    detail_row = None
+    if "request_detail" in tables:
+        detail_columns = _table_columns(conn, "request_detail")
+        if "request_id" not in detail_columns:
+            raise sqlite3.OperationalError("request_detail.request_id is required")
+        detail_projection = ", ".join(
+            name if name in detail_columns else f"NULL AS {name}"
+            for name in ("request_headers", "request_body", "response_body")
+        )
+        detail_row = conn.execute(
+            f"SELECT {detail_projection} FROM request_detail WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+
+    chain_rows: list[sqlite3.Row] = []
+    if "retry_chain" in tables:
+        retry_columns = _table_columns(conn, "retry_chain")
+        if "request_id" not in retry_columns:
+            raise sqlite3.OperationalError("retry_chain.request_id is required")
+        retry_order = "attempt_order ASC" if "attempt_order" in retry_columns else "rowid ASC"
+        chain_rows = conn.execute(
+            f"SELECT * FROM retry_chain WHERE request_id=? ORDER BY {retry_order}",
+            (request_id,),
+        ).fetchall()
+        if not chain_rows and dict(log_row).get("final_channel_key") == "compact-rescue":
+            chain_rows = conn.execute(
+                "SELECT * FROM retry_chain WHERE request_id LIKE ? "
+                f"ORDER BY request_id ASC, {retry_order}",
+                (request_id + ":%",),
+            ).fetchall()
+
+    proxy_rows: list[sqlite3.Row] = []
+    if "proxy_chain" in tables:
+        proxy_columns = _table_columns(conn, "proxy_chain")
+        if "request_id" not in proxy_columns:
+            raise sqlite3.OperationalError("proxy_chain.request_id is required")
+        proxy_order = []
+        if "attempt_order" in proxy_columns:
+            proxy_order.append("attempt_order ASC")
+        proxy_order.append("id ASC" if "id" in proxy_columns else "rowid ASC")
+        proxy_rows = conn.execute(
+            "SELECT * FROM proxy_chain WHERE request_id=? ORDER BY "
+            + ", ".join(proxy_order),
+            (request_id,),
+        ).fetchall()
+
+    local_web_rows: list[sqlite3.Row] = []
+    if "local_web_log" in tables:
+        local_columns = _table_columns(conn, "local_web_log")
+        if "request_id" not in local_columns:
+            raise sqlite3.OperationalError("local_web_log.request_id is required")
+        local_order = []
+        if "round_no" in local_columns:
+            local_order.append("round_no ASC")
+        local_order.append("id ASC" if "id" in local_columns else "rowid ASC")
+        local_web_rows = conn.execute(
+            "SELECT * FROM local_web_log WHERE request_id=? ORDER BY "
+            + ", ".join(local_order),
+            (request_id,),
+        ).fetchall()
+
+    billing_rows: list[sqlite3.Row] = []
+    if "upstream_attempt_usage" in tables:
+        billing_columns = _table_columns(conn, "upstream_attempt_usage")
+        if "root_request_id" not in billing_columns:
+            raise sqlite3.OperationalError(
+                "upstream_attempt_usage.root_request_id is required"
+            )
+        billing_order = []
+        if "settled_at" in billing_columns:
+            billing_order.append("settled_at ASC")
+        billing_order.append("id ASC" if "id" in billing_columns else "rowid ASC")
+        billing_rows = conn.execute(
+            "SELECT * FROM upstream_attempt_usage WHERE root_request_id=? ORDER BY "
+            + ", ".join(billing_order),
+            (request_id,),
+        ).fetchall()
+
+    rendered_log = _sanitize_request_timing(log_row)
+    rendered_detail = dict(detail_row) if detail_row else None
+    rendered_log["response_body"] = (
+        rendered_detail["response_body"] if rendered_detail is not None else None
+    )
+    return {
+        "log": rendered_log,
+        "detail": rendered_detail,
+        "retry_chain": [_sanitize_retry_timing(row) for row in chain_rows],
+        "proxy_chain": [_sanitize_proxy_timing(row) for row in proxy_rows],
+        "local_web_log": [dict(row) for row in local_web_rows],
+        "billing_attempts": [_effective_attempt_row(row) for row in billing_rows],
+    }
+
+
+def management_log_detail(request_id: str) -> dict[str, Any]:
+    """Find one exact Management log ID across strict retained month DBs.
+
+    ``log_detail`` intentionally remains current-month-only for the frozen
+    Telegram adapter.  This separate entry point gives Management detail/body
+    routes historical reach without changing TG navigation semantics.
+    """
+
+    for source in reversed(_management_log_sources()):
+        month, _path, live = source
+        conn, close = _open_management_log_source(source)
+        try:
+            if live:
+                value = log_detail(request_id)
+                if value.get("log") is not None:
+                    return value
+            else:
+                value = _management_historical_log_detail(conn, request_id)
+                if value is not None:
+                    return value
+        except sqlite3.Error as exc:
+            if live:
+                raise
+            raise HistoricalLogError(
+                f"management log detail failed for {month}.db: {exc}"
+            ) from exc
+        finally:
+            if close:
+                conn.close()
+    return _empty_log_detail()
 
 
 def _iter_month_conns(since_ts: float):

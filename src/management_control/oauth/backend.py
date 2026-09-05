@@ -14,7 +14,7 @@ from src.oauth import antigravity as antigravity_provider
 from src.oauth import cursor as cursor_provider
 from src.oauth import openai as openai_provider
 from src.oauth import xai as xai_provider
-from src.oauth.openai_import import parse_openai_import_payload
+from src.oauth.openai_import import OpenAIImportCandidate, parse_openai_import_payload
 
 
 _FAMILY_CONFIG_PATHS = {
@@ -658,7 +658,9 @@ class OAuthBackend:
     async def discover_models(self, url: str, token: str) -> list[str]:
         return await discover_models(url, token)
 
-    def parse_import(self, kind: str, payload, *, filename: str = "") -> list[dict]:
+    def parse_import(
+        self, kind: str, payload, *, filename: str = "",
+    ) -> list[OpenAIImportCandidate]:
         return parse_openai_import_payload(kind, payload, filename=filename)
 
     def cursor_catalog_records(self, account: dict) -> list[dict]:

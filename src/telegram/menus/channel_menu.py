@@ -159,7 +159,10 @@ def _control_update(name: str, patch: dict, chat_id: int = 0):
         )
     try:
         return _CONTROL.update_channel(
-            _ctx(chat_id), f"api:{name}", ChannelUpdateCommand(**kwargs)
+            _ctx(chat_id),
+            f"api:{name}",
+            ChannelUpdateCommand(**kwargs),
+            telegram_compatibility=True,
         )
     except ManagementError as exc:
         if exc.code.value == "RESOURCE_NOT_FOUND":

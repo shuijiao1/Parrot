@@ -103,13 +103,13 @@ def fake_controls() -> ObservabilityControls:
     }
     item = {
         "seq": 1, "kind": "user", "title": "user", "summary": "input",
-        "text": "hello", "raw": "hello", "size": 5, "meta": {},
+        "text": "hello", "raw": "hello", "size": 5, "meta": {}, "revision": "rev_item",
     }
     logs.body_items.return_value = LogBodyPageResult(
-        (item,), 1, 50, 1, ({"kind": "user", "count": 1},),
+        (item,), 1, 50, 1, ({"kind": "user", "count": 1},), "rev_body_page",
     )
     logs.body_item.return_value = {**item, "id": "item_1"}
-    logs.raw_body.return_value = {"logId": "req-1", "kind": "request", "body": {"model": "example"}}
+    logs.raw_body.return_value = {"logId": "req-1", "kind": "request", "body": {"model": "example"}, "revision": "rev_raw"}
 
     media = Mock()
     media.list_logs.return_value = _page([{

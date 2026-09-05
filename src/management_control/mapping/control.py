@@ -17,6 +17,10 @@ from src.management_control.context import AuditSink, ManagementContext
 from src.management_control.errors import ManagementError, ManagementErrorCode
 from src.management_control.models.common import DomainControl, ListPage, stable_revision
 from src.management_control.operations import OperationStore
+from src.management_control.routing_account_ids import (
+    oauth_account_id_from_channel_key,
+    oauth_channel_key_from_account_id,
+)
 from src.oauth_ids import provider_from_channel_key
 
 
@@ -292,7 +296,10 @@ class MappingControl(DomainControl):
                 family=channel_family,
                 provider=channel_provider,
                 channel_id=item.scope_key,
-                account_id=item.scope_key if item.scope_type == "oauth" else None,
+                account_id=(
+                    oauth_account_id_from_channel_key(item.scope_key)
+                    if item.scope_type == "oauth" else None
+                ),
                 outbound_model=item.outbound_model,
                 revision=revision,
             ))
@@ -327,13 +334,17 @@ class MappingControl(DomainControl):
         scope_id: str | None = None,
     ) -> MetadataRecord:
         if binding is None:
+            public_scope_id = (
+                oauth_account_id_from_channel_key(scope_id)
+                if scope == "oauth" and scope_id is not None else scope_id
+            )
             return MetadataRecord(
                 model_id=model_id,
                 target=None,
                 provider_id=None,
                 catalog_model_id=None,
                 scope=scope,
-                scope_id=scope_id,
+                scope_id=public_scope_id,
                 outbound_model=None,
                 source="none",
                 authority="none",
@@ -342,15 +353,21 @@ class MappingControl(DomainControl):
                 revision=revision,
             )
         raw = model_pricing.catalog_model(binding.target) or {}
+        binding_scope = "global" if binding.scope_key is None else (
+            "oauth" if binding.scope_key.startswith("oauth:") else "api"
+        )
+        public_scope_id = (
+            oauth_account_id_from_channel_key(binding.scope_key)
+            if binding_scope == "oauth" and binding.scope_key is not None
+            else binding.scope_key
+        )
         return MetadataRecord(
             model_id=model_id,
             target=binding.target,
             provider_id=binding.provider_id,
             catalog_model_id=binding.catalog_model_id,
-            scope="global" if binding.scope_key is None else (
-                "oauth" if binding.scope_key.startswith("oauth:") else "api"
-            ),
-            scope_id=binding.scope_key,
+            scope=binding_scope,
+            scope_id=public_scope_id,
             outbound_model=binding.outbound_model,
             source=binding.source,
             authority=binding.authority,
@@ -380,18 +397,18 @@ class MappingControl(DomainControl):
                 raise self._validation(
                     "scopeId", "NOT_ALLOWED", "global scope does not accept scopeId"
                 )
-            requested_scope = self._scope_resource_type(
+            internal_scope_id, requested_scope = self._scope_resource(
                 scope_id, expected_scope=scope,
             )
             current_outbound = {
                 item.client_visible_model: item.outbound_model
                 for item in inventory
-                if item.scope_key == scope_id
+                if item.scope_key == internal_scope_id
             }
             models = set(current_outbound)
             models.update(
                 item.client_visible_model for item in bindings
-                if item.scope_key == scope_id
+                if item.scope_key == internal_scope_id
             )
             for model_id in sorted(models, key=str.casefold):
                 outbound_model = current_outbound.get(model_id)
@@ -399,12 +416,12 @@ class MappingControl(DomainControl):
                 if outbound_model is not None:
                     binding = model_metadata.resolve_binding(
                         model_id,
-                        scope_key=scope_id,
+                        scope_key=internal_scope_id,
                         outbound_model=outbound_model,
                     )
                 records.append(self._metadata_record(
                     model_id, binding, revision,
-                    scope=requested_scope, scope_id=scope_id,
+                    scope=requested_scope, scope_id=internal_scope_id,
                 ))
         else:
             records.extend(
@@ -453,12 +470,13 @@ class MappingControl(DomainControl):
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         requested_scope = "global"
         outbound_model = None
+        internal_scope_id = scope_id
         if scope_id:
-            requested_scope = self._scope_resource_type(scope_id)
+            internal_scope_id, requested_scope = self._scope_resource(scope_id)
             match = next(
                 (
                     item for item in inventory
-                    if item.scope_key == scope_id
+                    if item.scope_key == internal_scope_id
                     and item.client_visible_model == model_id
                 ),
                 None,
@@ -468,7 +486,7 @@ class MappingControl(DomainControl):
             outbound_model = match.outbound_model
         binding = model_metadata.resolve_binding(
             model_id,
-            scope_key=scope_id,
+            scope_key=internal_scope_id,
             outbound_model=outbound_model,
         )
         return self._metadata_record(
@@ -476,16 +494,35 @@ class MappingControl(DomainControl):
             binding,
             self._metadata_revision(inventory),
             scope=requested_scope,
-            scope_id=scope_id,
+            scope_id=internal_scope_id,
         )
 
     @staticmethod
-    def _scope_resource_type(
+    def _scope_resource(
         scope_id: str,
         *,
         expected_scope: str | None = None,
-    ) -> str:
-        channel = registry.get_channel(scope_id)
+    ) -> tuple[str, str]:
+        oauth_key = oauth_channel_key_from_account_id(scope_id)
+        if expected_scope == "api":
+            candidates = (scope_id,)
+        elif expected_scope == "oauth":
+            candidates = (
+                (scope_id,) if oauth_key == scope_id else (oauth_key, scope_id)
+            )
+        elif oauth_key == scope_id:
+            candidates = (scope_id,)
+        else:
+            # Canonical OAuth account IDs must resolve before any coincidentally
+            # named API channel when the generic scopeId selector is used.
+            candidates = (oauth_key, scope_id)
+        channel = None
+        internal_scope_id = scope_id
+        for candidate in candidates:
+            channel = registry.get_channel(candidate)
+            if channel is not None:
+                internal_scope_id = candidate
+                break
         if channel is None:
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         actual_scope = str(getattr(channel, "type", "") or "")
@@ -497,7 +534,7 @@ class MappingControl(DomainControl):
             raise MappingControl._validation(
                 "scopeId", "SCOPE_TYPE_MISMATCH", "scopeId type does not match scope"
             )
-        return actual_scope
+        return internal_scope_id, actual_scope
 
     @staticmethod
     def _scope_key(
@@ -531,8 +568,10 @@ class MappingControl(DomainControl):
         field = "accountId" if scope == "oauth" else "channelId"
         if not value:
             raise MappingControl._validation(field, "REQUIRED", f"{field} is required")
-        MappingControl._scope_resource_type(value, expected_scope=scope)
-        return value
+        internal_scope_id, _ = MappingControl._scope_resource(
+            value, expected_scope=scope,
+        )
+        return internal_scope_id
 
     def put_binding(
         self,
@@ -707,10 +746,18 @@ class MappingControl(DomainControl):
         self._write(context)
         if self._operation_store is None:
             raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY)
+        account_scope_key = (
+            oauth_channel_key_from_account_id(account_id)
+            if scope == "account" and account_id is not None else account_id
+        )
+        public_account_id = (
+            oauth_account_id_from_channel_key(account_scope_key)
+            if scope == "account" and account_scope_key is not None else account_id
+        )
         fingerprint = stable_revision({
             "scope": scope,
             "providerId": provider_id,
-            "accountId": account_id,
+            "accountId": public_account_id,
             "channelId": channel_id,
         })
         replay = self._idempotent_replay(
@@ -740,7 +787,10 @@ class MappingControl(DomainControl):
                     selected.append(item)
             inventory = selected
         elif scope == "account":
-            inventory = [item for item in inventory if item.scope_key == account_id and item.scope_type == "oauth"]
+            inventory = [
+                item for item in inventory
+                if item.scope_key == account_scope_key and item.scope_type == "oauth"
+            ]
         elif scope == "channel":
             inventory = [item for item in inventory if item.scope_key == channel_id and item.scope_type == "api"]
         if scope != "full" and not inventory:

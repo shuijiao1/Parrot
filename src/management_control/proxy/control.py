@@ -15,6 +15,10 @@ from src.management_control.context import AuditSink, ManagementContext
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
 from src.management_control.models.common import DomainControl, ListPage, stable_revision
 from src.management_control.operations import OperationStore
+from src.management_control.routing_account_ids import (
+    oauth_account_id_from_channel_key,
+    oauth_channel_key_from_account_id,
+)
 from src.proxy import manager as proxy_manager
 from src.proxy.connector import _mask_url, parse_proxy_url
 from src.proxy.ss2022 import ss_family_label
@@ -323,11 +327,14 @@ class ProxyControl(DomainControl):
             if value == target:
                 references.append(f"routing.{key}")
             elif isinstance(value, Mapping):
-                references.extend(
-                    f"routing.{key}.{child}"
-                    for child, child_target in value.items()
-                    if child_target == target
-                )
+                for child, child_target in value.items():
+                    if child_target != target:
+                        continue
+                    public_child = (
+                        oauth_account_id_from_channel_key(child)
+                        if key == "accounts" else child
+                    )
+                    references.append(f"routing.{key}.{public_child}")
         return references
 
     @staticmethod
@@ -523,7 +530,10 @@ class ProxyControl(DomainControl):
             default=str(routing.get("default") or "direct"),
             direct_fallback=bool(routing.get("directFallback", False)),
             functions=functions,
-            accounts=dict(routing.get("accounts") or {}),
+            accounts={
+                oauth_account_id_from_channel_key(key): target
+                for key, target in (routing.get("accounts") or {}).items()
+            },
             channels=dict(routing.get("channels") or {}),
             models=dict(routing.get("models") or {}),
             revision=revision,
@@ -551,6 +561,22 @@ class ProxyControl(DomainControl):
     ) -> ProxyRoutingRecord:
         actual = self._write(context)
         self._check_revision(expected_revision, self._revision())
+        normalized_patch = dict(patch)
+        if "accounts" in patch:
+            normalized_accounts: dict[str, Any] = {}
+            public_ids: dict[str, str] = {}
+            for account_id, target in (patch.get("accounts") or {}).items():
+                channel_key = oauth_channel_key_from_account_id(account_id)
+                if channel_key in normalized_accounts:
+                    raise self._validation(
+                        f"accounts.{account_id}",
+                        "DUPLICATE_ACCOUNT_ID",
+                        f"duplicates accountId {public_ids[channel_key]}",
+                    )
+                normalized_accounts[channel_key] = target
+                public_ids[channel_key] = account_id
+            normalized_patch["accounts"] = normalized_accounts
+        patch = normalized_patch
         for field in ("default",):
             if field in patch:
                 self._validate_target(patch[field], field)

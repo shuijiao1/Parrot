@@ -62,7 +62,7 @@ def test_update_all_operations_prepare_commit_polling_and_replay(tmp_path):
         failure_log = client.get(BASE + "/updates/failure-log", headers=headers)
         assert failure_log.status_code == 200
         assert failure_log.json()["data"]["content"] == (
-            "api_token=top-secret\nhealth failed"
+            "api_token=***\nhealth failed"
         )
 
         stage_headers = {**headers, "Idempotency-Key": "stage-0.32.0"}

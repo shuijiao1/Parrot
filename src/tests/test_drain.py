@@ -1,10 +1,20 @@
 import asyncio
 import signal
 
+import pytest
 import uvicorn
 
 from src import drain
 import server as parrot_server
+
+
+@pytest.fixture(autouse=True)
+def isolated_drain_state():
+    drain.reset_for_tests()
+    try:
+        yield
+    finally:
+        drain.reset_for_tests()
 
 
 def test_drain_waits_for_active_lease_then_finishes():

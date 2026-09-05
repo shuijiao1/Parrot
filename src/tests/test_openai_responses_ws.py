@@ -17,6 +17,7 @@ import os
 import socket
 import sys
 import time
+import uuid
 from types import SimpleNamespace
 from typing import Any
 
@@ -95,6 +96,12 @@ def _setup(m):
         },
         "channels": [],
         "oauthAccounts": [],
+        "openaiOAuth": {
+            "codexCliVersion": "0.153.4",
+            "codexProtocolProfile": "rust-v0.153.4",
+            "forceCodexCLI": True,
+            "isolateSessionId": True,
+        },
         "network": {"routing": {"default": "direct"}},
         "timeouts": {"connect": 5, "firstByte": 5, "idle": 10, "total": 30},
         "concurrency": {"queueWaitSeconds": 1},
@@ -404,12 +411,17 @@ class ClockedOAuthHttpStreamWs(FakeOAuthHttpStreamWs):
 def _make_oauth_channel_for_failover(m, *, name="oauth@example.com"):
     account = {
         "email": name, "provider": "openai",
+        "workspace_id": f"ws-{name}", "chatgpt_account_id": f"ws-{name}",
         "access_token": "tok", "refresh_token": "rt",
         "expired": "2999-01-01T00:00:00Z",
         "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
     }
-    m["config"]._cache.setdefault("oauthAccounts", [])[:] = [dict(account)]
     ch = m["OpenAIOAuthChannel"](account)
+    m["config"]._cache.setdefault("oauthAccounts", [])[:] = [account]
     with m["registry"]._lock:
         m["registry"]._channels = {ch.key: ch}
     return ch
@@ -787,19 +799,39 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
 ):
     cfg = _setup(m)
     cfg["openaiOAuth"] = {
-        "codexCliVersion": "0.150.1",
+        "codexCliVersion": "0.153.4",
+        "codexProtocolProfile": "rust-v0.153.4",
         "forceCodexCLI": True,
         "isolateSessionId": True,
     }
     ch = m["OpenAIOAuthChannel"]({
         "email": "u@example.com",
         "provider": "openai",
+        "workspace_id": "ws-u", "chatgpt_account_id": "ws-u",
         "accountKey": "openai:u@example.com",
         "accessToken": "tok",
         "refreshToken": "rt",
         "expiresAt": 9999999999,
         "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
     })
+    cfg["oauthAccounts"] = [ch.codex_account_identity and {
+        **{
+            "email": "u@example.com", "provider": "openai",
+            "workspace_id": "ws-u", "chatgpt_account_id": "ws-u",
+            "accessToken": "tok", "refreshToken": "rt",
+            "models": ["test-model"],
+            "account_model_catalog": {
+                "schema": 1,
+                "models": [{"id": "test-model", "useResponsesLite": False}],
+            },
+        },
+        "codexIdentity": ch.codex_account_identity.as_config(),
+        "codexDeviceInstallationId": ch.codex_device_installation_id,
+    }]
     with m["registry"]._lock:
         m["registry"]._channels = {ch.key: ch}
 
@@ -815,7 +847,6 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
             {"type": "message", "role": "user", "content": "hello"},
         ],
         "stream": True,
-        "temperature": 0.9,
         "service_tier": service_tier,
         "prompt_cache_key": "shared-anchor",
         "client_metadata": {"a": "b"},
@@ -834,8 +865,12 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
         assert headers["authorization"] == "Bearer tok"
         assert headers["OpenAI-Beta"] == "responses_websockets=2026-02-06"
         assert headers["x-codex-routing-hint"] == f"model=test-model;tier={service_tier}"
-        assert headers["version"] == "0.150.1"
-        assert headers["User-Agent"].startswith("codex_cli_rs/0.150.1 ")
+        assert headers["version"] == "0.153.4"
+        assert headers["User-Agent"].startswith("codex_cli_rs/0.153.4 ")
+        lowered = {str(key).lower() for key in headers}
+        assert "accept" not in lowered
+        assert "content-type" not in lowered
+        assert "x-openai-internal-codex-responses-lite" not in lowered
         assert headers["session-id"] == headers["thread-id"]
         # Codex CLI only uses hyphenated session-id; underscore variants must not be sent.
         assert "session_id" not in headers
@@ -856,12 +891,23 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
         {"type": "compaction", "id": "cmp_downstream_in", "encrypted_content": "downstream-in-cipher"},
         {"type": "message", "role": "user", "content": "hello"},
     ]
-    assert upstream_first["client_metadata"] == {"a": "b"}
-    # Frame and handshake identities share the same isolated session anchor.
+    metadata = upstream_first["client_metadata"]
+    turn_metadata = json.loads(metadata["x-codex-turn-metadata"])
+    assert metadata["a"] == "b"
+    assert metadata["x-codex-installation-id"] == ch.codex_device_installation_id
+    assert metadata["session_id"] == captured["headers"]["session-id"]
+    assert metadata["thread_id"] == captured["headers"]["thread-id"]
+    assert metadata["turn_id"] == turn_metadata["turn_id"]
+    assert metadata["x-codex-window-id"] == captured["headers"]["x-codex-window-id"]
+    assert turn_metadata["installation_id"] == ch.codex_device_installation_id
+    assert "prompt_cache_key" not in turn_metadata
+    # Frame and handshake identities are projections of one authoritative snapshot.
     assert upstream_first["prompt_cache_key"] == captured["headers"]["session-id"]
     assert upstream_first["prompt_cache_key"] != "shared-anchor"
     assert captured["headers"]["session-id"] != "shared-anchor"
-    assert "temperature" not in upstream_first
+    assert uuid.UUID(metadata["session_id"]).version == 7
+    assert uuid.UUID(metadata["turn_id"]).version == 7
+    assert uuid.UUID(turn_metadata["context_window_id"]).version == 7
     assert not ws.close_calls
     for value in (
         {"input": [{"type": "compaction", "id": "cmp_downstream_in", "encrypted_content": "downstream-in-cipher"}]},
@@ -1443,12 +1489,29 @@ async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypa
     ch = m["OpenAIOAuthChannel"]({
         "email": "quota@example.com",
         "provider": "openai",
+        "workspace_id": "ws-quota", "chatgpt_account_id": "ws-quota",
         "accountKey": "openai:quota@example.com",
         "accessToken": "tok",
         "refreshToken": "rt",
         "expiresAt": 9999999999,
         "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
     })
+    m["config"]._cache["oauthAccounts"] = [{
+        "email": "quota@example.com", "provider": "openai",
+        "workspace_id": "ws-quota", "chatgpt_account_id": "ws-quota",
+        "accessToken": "tok", "refreshToken": "rt",
+        "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
+        "codexIdentity": ch.codex_account_identity.as_config(),
+        "codexDeviceInstallationId": ch.codex_device_installation_id,
+    }]
     with m["registry"]._lock:
         m["registry"]._channels = {ch.key: ch}
 
@@ -1456,7 +1519,7 @@ async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypa
         return "tok"
 
     recorded = []
-    def fake_record(channel, response):
+    def fake_record(channel, response, translator_ctx=None):
         recorded.append({
             "channel": channel.key,
             "headers": dict(response.headers),
@@ -1552,28 +1615,53 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
         "accountKey": "openai:x@example.com", "accessToken": "tok",
         "refreshToken": "rt", "expiresAt": 9999999999,
         "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
     })
     codex_mapped = m["responses_ws"]._map_ws_create_frame_for_upstream({
         "type": "response.create", "model": "test-model", "input": "hello",
-        "stream": True, "generate": False, "temperature": 1, "background": False,
+        "stream": True, "generate": False, "background": False,
         "unknown_provider_field": "drop", "_api_key_name": "internal",
     }, "test-model", channel=oauth)
     assert codex_mapped["store"] is False
     assert codex_mapped["stream"] is True
     assert codex_mapped["generate"] is False
     assert codex_mapped["input"] == [{"type": "message", "role": "user", "content": "hello"}]
-    assert "temperature" not in codex_mapped
     assert "background" not in codex_mapped
     assert "unknown_provider_field" not in codex_mapped
     assert "_api_key_name" not in codex_mapped
     assert "ws_request_header_x_openai_internal_codex_responses_lite" not in codex_mapped.get("client_metadata", {})
 
     codex_lite_mapped = m["responses_ws"]._map_ws_create_frame_for_upstream({
-        "type": "response.create", "model": "gpt-5.6-luna", "input": "hello",
-        "stream": True, "client_metadata": {"a": "b"},
-    }, "gpt-5.6-luna", channel=oauth)
+        "type": "response.create", "model": "gpt-6-astra", "input": "hello",
+        "stream": True, "prompt_cache_key": "astra-map",
+        "client_metadata": {"a": "b"},
+    }, "gpt-6-astra", channel=oauth)
     assert codex_lite_mapped["client_metadata"]["a"] == "b"
     assert codex_lite_mapped["client_metadata"]["ws_request_header_x_openai_internal_codex_responses_lite"] == "true"
+    assert codex_lite_mapped["tool_choice"] == "auto"
+    assert codex_lite_mapped["parallel_tool_calls"] is False
+
+    oauth_catalog_false = m["OpenAIOAuthChannel"]({
+        "email": "catalog-false@example.com", "provider": "openai",
+        "accessToken": "tok", "refreshToken": "rt", "expiresAt": 9999999999,
+        "models": ["gpt-6-astra"],
+        "account_model_catalog": {"models": [{
+            "id": "gpt-6-astra", "useResponsesLite": False,
+        }]},
+    })
+    non_lite_mapped = m["responses_ws"]._map_ws_create_frame_for_upstream({
+        "type": "response.create", "model": "gpt-6-astra", "input": "hello",
+        "stream": True,
+        "client_metadata": {
+            "ws_request_header_x_openai_internal_codex_responses_lite": "true",
+        },
+    }, "gpt-6-astra", channel=oauth_catalog_false)
+    assert non_lite_mapped["input"][0]["type"] == "message"
+    assert non_lite_mapped["instructions"] != ""
+    assert "ws_request_header_x_openai_internal_codex_responses_lite" not in non_lite_mapped["client_metadata"]
 
     first_with_previous = m["responses_ws"]._map_ws_create_frame_for_upstream({
         "type": "response.create",
@@ -1604,14 +1692,18 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
     ]
     official_warmup = m["responses_ws"]._map_ws_create_frame_for_upstream({
         "type": "response.create",
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-astra",
         "input": official_prefix,
         "instructions": "",
         "parallel_tool_calls": False,
         "generate": False,
-    }, "gpt-5.6-luna", channel=oauth)
+    }, "gpt-6-astra", channel=oauth)
     assert official_warmup["generate"] is False
     assert official_warmup["input"] == official_prefix
+    assert "instructions" not in official_warmup
+    assert official_warmup["tool_choice"] == "auto"
+    assert official_warmup["parallel_tool_calls"] is False
+    assert official_warmup["reasoning"]["context"] == "all_turns"
     assert sum(
         item.get("type") == "additional_tools"
         for item in official_warmup["input"] if isinstance(item, dict)
@@ -1629,14 +1721,18 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
     }]
     official_incremental = m["responses_ws"]._map_ws_create_frame_for_upstream({
         "type": "response.create",
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-astra",
         "previous_response_id": "resp_lite_warmup",
         "input": lite_delta,
         "instructions": "",
         "parallel_tool_calls": False,
-    }, "gpt-5.6-luna", channel=oauth)
+    }, "gpt-6-astra", channel=oauth)
     assert official_incremental["previous_response_id"] == "resp_lite_warmup"
     assert official_incremental["input"] == lite_delta
+    assert "instructions" not in official_incremental
+    assert official_incremental["tool_choice"] == "auto"
+    assert official_incremental["parallel_tool_calls"] is False
+    assert official_incremental["reasoning"]["context"] == "all_turns"
     assert not any(
         isinstance(item, dict) and (
             item.get("type") == "additional_tools" or item.get("role") == "developer"
@@ -1940,7 +2036,7 @@ def test_responses_upstream_ws_config_default_off(m):
 
 
 @pytest.mark.asyncio
-async def test_http_responses_oauth_ws_identity_confuse_first_frame_and_restores_response(monkeypatch, m):
+async def test_http_responses_oauth_ws_projects_snapshot_and_structurally_restores_response(monkeypatch, m):
     cfg = _setup(m)
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
     cfg.setdefault("oauth", {})["providers"] = {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}
@@ -2008,7 +2104,7 @@ async def test_http_responses_oauth_ws_identity_confuse_first_frame_and_restores
     assert sent["prompt_cache_key"] != "shared-anchor"
     assert cm["x-codex-installation-id"] != "inst-real"
     assert cm["x-codex-window-id"] == f"{sent['prompt_cache_key']}:0"
-    assert tm["prompt_cache_key"] == sent["prompt_cache_key"]
+    assert "prompt_cache_key" not in tm
     assert tm["turn_id"] != "turn-real"
     assert tm["window_id"] == f"{sent['prompt_cache_key']}:0"
     assert "conversation_id" not in {k.lower(): v for k, v in captured["headers"].items()}
@@ -2016,18 +2112,35 @@ async def test_http_responses_oauth_ws_identity_confuse_first_frame_and_restores
     obj = json.loads(resp.body)
     assert obj["prompt_cache_key"] == "shared-anchor"
     assert obj["turn_id"] == "turn-real"
-    assert obj["metadata"]["installation"] == "inst-real"
+    # Non-protocol fields are not globally byte-replaced.
+    assert obj["metadata"]["installation"] == ch.codex_device_installation_id
     assert "shared-anchor" in (m["log_db"].log_detail(rid)["detail"].get("response_body") or "")
 
 
 @pytest.mark.asyncio
-async def test_responses_ws_oauth_pending_visible_identity_restored_before_downstream(monkeypatch, m):
+async def test_responses_ws_oauth_does_not_replace_identity_inside_visible_text(monkeypatch, m):
     cfg = _setup(m)
     cfg["oauth"] = {"providers": {"openai": {"forceCodexCLI": True, "isolateSessionId": True}}}
     ch = m["OpenAIOAuthChannel"]({
         "email": "pending@example.com", "provider": "openai",
+        "workspace_id": "ws-pending", "chatgpt_account_id": "ws-pending",
         "access_token": "tok", "refresh_token": "rt", "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
     })
+    cfg["oauthAccounts"] = [{
+        "email": "pending@example.com", "provider": "openai",
+        "workspace_id": "ws-pending", "chatgpt_account_id": "ws-pending",
+        "access_token": "tok", "refresh_token": "rt", "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
+        "codexIdentity": ch.codex_account_identity.as_config(),
+        "codexDeviceInstallationId": ch.codex_device_installation_id,
+    }]
     with m["registry"]._lock:
         m["registry"]._channels = {ch.key: ch}
 
@@ -2070,9 +2183,11 @@ async def test_responses_ws_oauth_pending_visible_identity_restored_before_downs
     await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
     first_downstream = json.loads(ws.sent_texts[0])
     assert first_downstream["type"] == "response.output_text.delta"
-    assert "raw-pck" in first_downstream["delta"]
-    assert "turn-raw" in first_downstream["delta"]
-    assert "003" not in first_downstream["delta"]  # guard against obvious isolated-session leakage
+    assert "raw-pck" not in first_downstream["delta"]
+    assert "turn-raw" not in first_downstream["delta"]
+    session_id, turn_id = first_downstream["delta"].split("|")
+    assert uuid.UUID(session_id).version == 7
+    assert uuid.UUID(turn_id).version == 7
     assert not ws.close_calls
 
 @pytest.mark.asyncio
@@ -2289,12 +2404,25 @@ async def test_http_responses_oauth_ws_invalid_replay_clears_scope_and_retries(m
     cfg.setdefault("oauth", {})["providers"] = {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}
     ch = _make_oauth_channel_for_failover(m, name="replay-clear@example.com")
     rr = m["reasoning_replay"]
+    from src.openai.codex_identity import resolve_request_identity_context
+    account = cfg["oauthAccounts"][0]
+    replay_context = resolve_request_identity_context(
+        account,
+        {"prompt_cache_key": "anchor", "_api_key_name": "ws-key"},
+    )
+    replay_scope = rr.scope_from_payload(
+        "test-model",
+        {"prompt_cache_key": "anchor"},
+        owner_digest=replay_context.account_identity.owner_digest,
+        logical_session_id=replay_context.logical_session.session_id,
+    )
+    assert replay_scope is not None
     encrypted_content = _valid_encrypted_content(11)
     rr.cache_items(
-        "test-model",
-        "prompt-cache:anchor",
+        replay_scope["model"],
+        replay_scope["session_key"],
         [{"type": "reasoning", "encrypted_content": encrypted_content}],
-        account_key=ch.account_key,
+        account_key=replay_scope["account_key"],
     )
 
     async def fake_token(account_key):
@@ -2330,7 +2458,10 @@ async def test_http_responses_oauth_ws_invalid_replay_clears_scope_and_retries(m
 
     assert resp.status_code == 200
     assert json.loads(resp.body)["output"][0]["content"][0]["text"] == "ok"
-    assert rr.get("test-model", "prompt-cache:anchor", account_key=ch.account_key) == []
+    assert rr.get(
+        replay_scope["model"], replay_scope["session_key"],
+        account_key=replay_scope["account_key"],
+    ) == []
     assert attempts == []
 
     first_payload = json.loads(bad_ws.sent[0])
@@ -3186,6 +3317,70 @@ async def test_responses_ws_accepts_sequential_creates_with_one_ledger_row_each(
         overall["total_output_tokens"] - overall_before["total_output_tokens"],
     ) == (8, 6)
     assert not ws.close_calls
+
+
+@pytest.mark.asyncio
+async def test_oauth_ws_event_turn_state_replays_for_explicit_continuation_and_clears(
+    monkeypatch, m,
+):
+    _setup(m)
+    ch = _make_oauth_channel_for_failover(m, name="turn-life@example.com")
+
+    async def fake_token(_account_key):
+        return "tok"
+
+    first = {
+        "type": "response.create", "model": "test-model", "input": "first",
+        "client_metadata": {"session_id": "native-session", "turn_id": "native-turn"},
+    }
+    continuation = {
+        "type": "response.create", "model": "test-model", "input": "continue",
+        "previous_response_id": "resp_first",
+        "client_metadata": {"session_id": "native-session", "turn_id": "native-turn"},
+    }
+    new_turn = {
+        "type": "response.create", "model": "test-model", "input": "new",
+        "previous_response_id": "resp_second",
+        "client_metadata": {"session_id": "native-session", "turn_id": "native-turn-2"},
+    }
+    ws = SequentialFakeWebSocket(first, continuation, new_turn)
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.metadata", "headers": {
+            "x-codex-turn-state": "sticky-event-token",
+        }},
+        {"type": "response.created", "response": {"id": "resp_first"}},
+        {"type": "response.completed", "response": {
+            "id": "resp_first", "output": [], "usage": {},
+        }},
+        {"type": "response.created", "response": {"id": "resp_second"}},
+        {"type": "response.completed", "response": {
+            "id": "resp_second", "output": [], "usage": {},
+        }},
+        {"type": "response.created", "response": {"id": "resp_third"}},
+        {"type": "response.completed", "response": {
+            "id": "resp_third", "output": [], "usage": {},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    assert len(fake_upstream.sent) == 3
+    wire = [json.loads(frame) for frame in fake_upstream.sent]
+    metadata = [frame["client_metadata"] for frame in wire]
+    turns = [json.loads(item["x-codex-turn-metadata"])["turn_id"] for item in metadata]
+    assert turns[0] == turns[1]
+    assert turns[2] != turns[1]
+    assert turns[0] != "native-turn"
+    assert metadata[1]["x-codex-turn-state"] == "sticky-event-token"
+    assert "x-codex-turn-state" not in metadata[2]
+    assert ch.codex_account_identity.owner_digest not in repr(
+        wire[0]["client_metadata"]["x-codex-turn-metadata"]
+    )
 
 
 @pytest.mark.asyncio

@@ -291,7 +291,7 @@ Content-Type: application/json
 ### 5.3 已知秘密字段与公共输出
 
 - OAuth access/refresh token、API channel key、proxy 密码、TG bot token、management key/session/challenge secret 等**语义明确的 request 字段**标记 `writeOnly`；普通 GET 只返回功能所需的 `configured`，必要时返回既有不可逆 `maskedHint`。
-- 下游 API Key 的新值只在 create/generate/rotate 成功响应中返回一次；之后只能看到名称、前缀提示和状态。其他 secret 若 operation 明确承担创建或轮换，也遵循“一次返回、后续 GET 不主动回显”。
+- 下游 API Key 的新值只在 create/generate/rotate 成功响应中返回一次；之后只能看到名称、前缀提示和状态。其他 secret 若 operation 明确承担创建或轮换，也遵循“一次返回、后续 GET 不主动回显”。一次性交付的响应字段不得标为 `writeOnly`；该标记只用于请求秘密字段，响应继续禁止缓存。
 - 不提供 config dump，不回显提交的 credential，不把已知 secret 放入公共 Operation result 或错误对象。
 - 已知可携带 credential 的 URL 字段必须结构化解析并遮蔽 userinfo 后再输出；不能通过字符串替换声称完成 URL 遮蔽。
 - 公共错误和 Operation 只承载稳定 code、结构化字段及面向调用方的摘要，不主动复制 raw exception 或 credential。这里不要求扫描任意业务文本、转义 JSON、任意嵌套键或递归异常链；此类增强按第 4.6 节处理。
@@ -317,9 +317,16 @@ Content-Type: application/json
 
 Operation store 必须有界、按 session/actor 授权、不持久化秘密；服务重启后未知/中断状态必须明确返回，不得伪装成功。API 轮询 Operation 不改变 TG 的进度消息节奏。
 
+TG 冻结兼容优先：原版同步执行的留存清理及导入后 usage/quota 副作用，继续通过同一 Control 的同步兼容用例保持原时点与异常顺序；不得为套用异步 Operation 改变 TG 既有交互。Management API 留存执行仍返回异步 Operation。
+
 ### 5.5 可发现性
 
 `GET /meta` (`getManagementMetadata`) 返回 API 版本、应用版本、支持的功能摘要、枚举和文档链接；`GET /capabilities` (`getManagementCapabilities`) 返回按领域组织的 provider/preset/protocol/mode/action schema。这里的 capabilities 是客户端可发现的产品能力，不是本轮新增角色体系。每个 route 必须有唯一 `operationId`、tag、request/response schema、enum和已知敏感字段标记。禁止用 `dict[str, Any]` 作为对外主 schema 来逃避合同。
+
+- `/meta.data.features[]` 为 `{id, actionCount}`，`enums[]` 为 `{name, values}`。
+- 两个发现响应均以 `supportedCapabilities` 表达产品 capability vocabulary，以 `principalCapabilities` 表达当前 principal grants。
+- `/capabilities.data.domains[]` 保留 v1 `actions: list[str]`，值为真实 operationId；加法字段 `actionDetails[]: {operationId, method, path}` 与其一一对应。另含 `domain`、`providers[]`、`presets[]`（`providerId/presetId`）、`protocols[]`、`modes[]`、`features[]`。旧 `capabilities` 字段保留为当前 principal grants 的 deprecated 别名；授权读取顶层 `principalCapabilities`，产品支持读取 `supportedCapabilities`。旧枚举名称 `authMethod`、`operationStatus` 保留为真实 schema 枚举的镜像别名。
+- domain/action/enum 来自实际挂载的 Management OpenAPI；Channel catalog 复用 `ChannelControl.get_catalog()`。发现数据不等于 provider 已配置、健康或可联网，也不替代 Control 根据具体请求执行的最终授权。
 
 ---
 
@@ -333,7 +340,7 @@ Operation store 必须有界、按 session/actor 授权、不持久化秘密；�
 | `GET /runtime/cooldowns` | `listCooldowns` | active entries 和冻结/永久状态 |
 | `GET /runtime/concurrency` | `getConcurrencySnapshot` | channel 与 API Key limiter totals/snapshot |
 
-运行时列表是只读快照；不得通过 GET 触发 supplier refresh、清理或 rebuild。北京时间展示由 TG Adapter 完成，API 时间统一为 UTC。
+运行时列表是只读快照；不得通过 GET 触发 supplier refresh、清理或 rebuild。北京时间展示由 TG Adapter 完成，API 时间统一为 UTC。已有 worker 未提供权威 last/next/run/error 遥测的字段如实返回 `unknown`/`null`；本轮不为填满摘要创建第二套 registry、worker 或后台治理。
 
 ---
 
@@ -364,6 +371,8 @@ Operation store 必须有界、按 session/actor 授权、不持久化秘密；�
 | `POST /oauth/invalid-accounts/delete` | `deleteInvalidOAuthAccounts` | plan token 一次性 commit |
 
 OAuth 覆盖不得变成隐式 upsert。Control 的 replace plan/nonce 必须绑定 actor、候选 identity、旧/新 revision、10 分钟以内 TTL，并恒时比较；Telegram 仍保留原有 nonce、state action 和原文案。
+
+导入预览请求的 `payloadEncoding` 可选 `json|base64`，默认 `json` 兼容旧请求；`payload` 为 write-only string。JSON 直接传原文，ZIP bytes 使用标准 Base64，沿同一 preview/commit 路径进入既有 parser，不另建上传系统。编码字符串最多 2,000,000 字符，Base64 解码后最多 1,500,000 bytes，非法编码返回 `422 VALIDATION_FAILED`。TG 批量导入保持整批 usage/save/quota evaluate 完成后先展示进度，再启动模型同步的原时点。
 
 ### 7.3 账号动作与模型
 
