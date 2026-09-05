@@ -8,6 +8,7 @@ import hashlib
 import json
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 from src import (
@@ -27,6 +28,7 @@ from src.channel.compatibility import normalize_mode, normalize_models
 from src.channel.url_utils import detect_suffix_protocol, split_base_url
 from src.management_auth.policy import CapabilityDenied, authorize
 from src.management_auth.principal import Capability
+from src.model_pricing import TICKS_PER_USD
 from src.providers.catalog import PROVIDER_CATALOG
 
 from ..context import AuditSink, ManagementContext, audit_record
@@ -368,7 +370,7 @@ class ChannelControl:
             avg_tps=raw.get("avg_tps"),
             max_tps=raw.get("max_tps"),
             min_tps=raw.get("min_tps"),
-            cost=str(raw.get("cost")) if raw.get("cost") is not None else None,
+            cost=format(Decimal(raw.get("cost_ticks") or 0) / TICKS_PER_USD, "f") if raw.get("costed_success") else None,
         )
 
     def get_channel_detail(self, context: ManagementContext, channel_id: str) -> ChannelDetail:

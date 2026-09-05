@@ -6846,6 +6846,10 @@ def stats_summary(
                  COUNT(*) AS total,
                  SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
                  SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
+                 SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending_count,
+                 SUM(retry_count) AS total_retries,
+                 SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) AS retried_requests,
+                 SUM(CASE WHEN affinity_hit=1 THEN 1 ELSE 0 END) AS affinity_hits,
                  SUM(CASE WHEN status='success' AND cache_read_tokens > 0 THEN 1 ELSE 0 END) AS hit_requests,
                  SUM(CASE WHEN status='success' AND cache_creation_tokens > 0 THEN 1 ELSE 0 END) AS write_requests,
                  SUM(input_tokens + cache_creation_tokens + cache_read_tokens) AS total_prompt_tokens,
@@ -6876,6 +6880,10 @@ def stats_summary(
                  COUNT(*) AS total,
                  SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
                  SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
+                 SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending_count,
+                 SUM(retry_count) AS total_retries,
+                 SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) AS retried_requests,
+                 SUM(CASE WHEN affinity_hit=1 THEN 1 ELSE 0 END) AS affinity_hits,
                  SUM(CASE WHEN status='success' AND cache_read_tokens > 0 THEN 1 ELSE 0 END) AS hit_requests,
                  SUM(CASE WHEN status='success' AND cache_creation_tokens > 0 THEN 1 ELSE 0 END) AS write_requests,
                  SUM(input_tokens + cache_creation_tokens + cache_read_tokens) AS total_prompt_tokens,
@@ -7261,7 +7269,8 @@ def _finalize_overall(agg: dict) -> dict:
 
 
 _GROUP_FIELDS = [
-    "total", "success_count", "error_count",
+    "total", "success_count", "error_count", "pending_count",
+    "total_retries", "retried_requests", "affinity_hits",
     "hit_requests", "write_requests",
     "total_prompt_tokens", "total_output_tokens",
     "total_cache_creation", "total_cache_read",
