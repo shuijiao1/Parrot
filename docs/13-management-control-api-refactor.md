@@ -325,7 +325,7 @@ TG 冻结兼容优先：原版同步执行的留存清理及导入后 usage/quot
 
 - `/meta.data.features[]` 为 `{id, actionCount}`，`enums[]` 为 `{name, values}`。
 - 两个发现响应均以 `supportedCapabilities` 表达产品 capability vocabulary，以 `principalCapabilities` 表达当前 principal grants。
-- `/capabilities.data.domains[]` 包含 `domain`、`actions[]: {operationId, method, path}`、`providers[]`、`presets[]`（`providerId/presetId`）、`protocols[]`、`modes[]`、`features[]`。
+- `/capabilities.data.domains[]` 保留 v1 `actions: list[str]`，值为真实 operationId；加法字段 `actionDetails[]: {operationId, method, path}` 与其一一对应。另含 `domain`、`providers[]`、`presets[]`（`providerId/presetId`）、`protocols[]`、`modes[]`、`features[]`。旧 `capabilities` 字段保留为当前 principal grants 的 deprecated 别名；授权读取顶层 `principalCapabilities`，产品支持读取 `supportedCapabilities`。旧枚举名称 `authMethod`、`operationStatus` 保留为真实 schema 枚举的镜像别名。
 - domain/action/enum 来自实际挂载的 Management OpenAPI；Channel catalog 复用 `ChannelControl.get_catalog()`。发现数据不等于 provider 已配置、健康或可联网，也不替代 Control 根据具体请求执行的最终授权。
 
 ---
@@ -371,6 +371,8 @@ TG 冻结兼容优先：原版同步执行的留存清理及导入后 usage/quot
 | `POST /oauth/invalid-accounts/delete` | `deleteInvalidOAuthAccounts` | plan token 一次性 commit |
 
 OAuth 覆盖不得变成隐式 upsert。Control 的 replace plan/nonce 必须绑定 actor、候选 identity、旧/新 revision、10 分钟以内 TTL，并恒时比较；Telegram 仍保留原有 nonce、state action 和原文案。
+
+导入预览请求的 `payloadEncoding` 可选 `json|base64`，默认 `json` 兼容旧请求；`payload` 为 write-only string。JSON 直接传原文，ZIP bytes 使用标准 Base64，沿同一 preview/commit 路径进入既有 parser，不另建上传系统。编码字符串最多 2,000,000 字符，Base64 解码后最多 1,500,000 bytes，非法编码返回 `422 VALIDATION_FAILED`。TG 批量导入保持整批 usage/save/quota evaluate 完成后先展示进度，再启动模型同步的原时点。
 
 ### 7.3 账号动作与模型
 
