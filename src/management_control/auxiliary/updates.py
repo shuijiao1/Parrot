@@ -956,17 +956,16 @@ class UpdateControl:
                 except Exception:
                     ok = False
                 if not ok:
+                    retryable = self._rearm_failed_activation(digest, target_version)
                     try:
-                        store.update_progress(operation_id, current=1, total=2, message_code="UPDATE_RESTARTING")
+                        store.fail(
+                            operation_id,
+                            code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                            message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value,
+                            retryable=retryable,
+                        )
                     except ManagementError:
                         self._retire_plan(digest)
-                        return
-                    retryable = self._rearm_failed_activation(digest, target_version)
-                    store.fail_if_active(
-                        operation_id,
-                        code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
-                        retryable=retryable,
-                    )
                     return
                 # Restart acceptance is irreversible for this plan, but is not success.
                 self._retire_plan(digest)

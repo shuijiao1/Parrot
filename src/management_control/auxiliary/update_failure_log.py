@@ -24,7 +24,7 @@ _SECRET_FIELD = re.compile(
     r")"
     r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,}\]\r\n]+)",
 )
-_URL = re.compile(r"(?P<url>(?:https?|ssh)://[^\s<>\"']+)")
+_URL = re.compile(r"(?P<url>(?P<scheme>https?|ssh)://[^\s<>\"']+)", re.IGNORECASE)
 
 
 def _mask_field(match: re.Match[str]) -> str:
@@ -48,7 +48,7 @@ def _mask_url(match: re.Match[str]) -> str:
     if not userinfo or not host:
         return raw
     masked = f"{_REDACTION}:{_REDACTION}" if ":" in userinfo else _REDACTION
-    return urlunsplit(parsed._replace(netloc=f"{masked}@{host}"))
+    return urlunsplit(parsed._replace(scheme=match.group("scheme"), netloc=f"{masked}@{host}"))
 
 
 def sanitize_update_failure_log(value: str, *, max_chars: int = 3500) -> str:
