@@ -324,9 +324,56 @@ class StatusAlertControl:
         return rows
 
     @staticmethod
-    def _incident(provider: str, row: dict[str, Any], *, muted: bool, active: bool) -> StatusIncident:
+    def _incident_id(row: dict[str, Any]) -> str:
+        return str(row.get("id") or row.get("incident_id") or "")
+
+    @classmethod
+    def _mute_index(cls, rows: list[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
+        result: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            provider = str(row.get("provider") or "")
+            incident_id = cls._incident_id(row)
+            if provider and incident_id:
+                result[(provider, incident_id)] = row
+        return result
+
+    @classmethod
+    def _incident_revision(
+        cls,
+        provider: str,
+        row: dict[str, Any],
+        muted_row: dict[str, Any] | None,
+    ) -> str:
+        # Active/history differ only by presentation, while a muted record is
+        # the local authority once the notification relationship exists.  Use
+        # that authority as the canonical source so all views and mutations
+        # hash the same resource without dropping real feed or mute changes.
+        source = muted_row if muted_row is not None else row
+        return revision_for({
+            "id": cls._incident_id(source),
+            "provider": provider,
+            "name": str(source.get("name") or ""),
+            "impact": str(source.get("impact") or "none").lower(),
+            "status": str(source.get("status") or "").lower(),
+            "createdAt": rfc3339_utc(source.get("created_at")),
+            "updatedAt": rfc3339_utc(source.get("updated_at")),
+            "shortlink": source.get("shortlink"),
+            "muted": muted_row is not None,
+            "mutedAt": rfc3339_utc(muted_row.get("muted_at")) if muted_row is not None else None,
+        })
+
+    @classmethod
+    def _incident(
+        cls,
+        provider: str,
+        row: dict[str, Any],
+        *,
+        muted_row: dict[str, Any] | None,
+        active: bool,
+    ) -> StatusIncident:
+        incident_id = cls._incident_id(row)
         stable = {
-            "id": str(row.get("id") or row.get("incident_id") or ""),
+            "id": incident_id,
             "provider": provider,
             "name": str(row.get("name") or ""),
             "impact": str(row.get("impact") or "none").lower(),
@@ -334,9 +381,9 @@ class StatusAlertControl:
             "createdAt": rfc3339_utc(row.get("created_at")),
             "updatedAt": rfc3339_utc(row.get("updated_at")),
             "shortlink": row.get("shortlink"),
-            "muted": muted,
+            "muted": muted_row is not None,
             "active": active,
-            "mutedAt": rfc3339_utc(row.get("muted_at")),
+            "mutedAt": rfc3339_utc(muted_row.get("muted_at")) if muted_row is not None else None,
         }
         return StatusIncident(
             id=stable["id"],
@@ -350,7 +397,7 @@ class StatusAlertControl:
             muted=stable["muted"],
             active=stable["active"],
             muted_at=stable["mutedAt"],
-            revision=revision_for(stable),
+            revision=cls._incident_revision(provider, row, muted_row),
         )
 
     def list_incidents(
@@ -368,19 +415,26 @@ class StatusAlertControl:
         if provider is not None and provider not in STATUS_PROVIDERS:
             raise invalid_field("provider", "UNKNOWN_PROVIDER", "unsupported provider")
         providers = [provider] if provider else list(STATUS_PROVIDERS)
+        muted_rows = self._status.list_muted()
+        muted_by_incident = self._mute_index(muted_rows)
         rows: list[StatusIncident] = []
         if view == "active":
             snapshot = self._status.snapshot_active()
             for item_provider in providers:
                 rows.extend(
-                    self._incident(item_provider, item, muted=False, active=True)
+                    self._incident(
+                        item_provider,
+                        item,
+                        muted_row=muted_by_incident.get((item_provider, self._incident_id(item))),
+                        active=True,
+                    )
                     for item in snapshot.get(item_provider, [])
                 )
         elif view == "muted":
-            for item in self._status.list_muted():
+            for item in muted_rows:
                 item_provider = str(item.get("provider") or "")
                 if item_provider in providers:
-                    rows.append(self._incident(item_provider, item, muted=True, active=False))
+                    rows.append(self._incident(item_provider, item, muted_row=item, active=False))
         else:
             for item_provider in providers:
                 try:
@@ -388,7 +442,12 @@ class StatusAlertControl:
                 except Exception as exc:
                     raise ManagementError(ManagementErrorCode.UPSTREAM_ERROR, retryable=True) from exc
                 rows.extend(
-                    self._incident(item_provider, item, muted=False, active=False)
+                    self._incident(
+                        item_provider,
+                        item,
+                        muted_row=muted_by_incident.get((item_provider, self._incident_id(item))),
+                        active=False,
+                    )
                     for item in incidents
                 )
         if impact is not None:
@@ -406,17 +465,23 @@ class StatusAlertControl:
             has_next=start + page_size < total,
         )
 
-    def _find_incident(self, incident_id: str) -> tuple[str, dict[str, Any]] | None:
+    def _find_incident(
+        self,
+        incident_id: str,
+        *,
+        muted_rows: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, dict[str, Any]] | None:
         for provider, rows in self._status.snapshot_active().items():
             for row in rows:
-                if str(row.get("id") or "") == incident_id:
+                if self._incident_id(row) == incident_id:
                     return provider, row
-        for row in self._status.list_muted():
-            if str(row.get("incident_id") or row.get("id") or "") == incident_id:
+        current_mutes = muted_rows if muted_rows is not None else self._status.list_muted()
+        for row in current_mutes:
+            if self._incident_id(row) == incident_id:
                 return str(row.get("provider") or ""), row
         for provider in STATUS_PROVIDERS:
             for row in self._status.list_recent(provider, 200):
-                if str(row.get("id") or "") == incident_id:
+                if self._incident_id(row) == incident_id:
                     return provider, row
         return None
 
@@ -428,11 +493,13 @@ class StatusAlertControl:
         expected_revision: str | None = None,
     ) -> StatusIncident:
         require(context, Capability.WRITE)
-        found = self._find_incident(incident_id)
+        muted_rows = self._status.list_muted()
+        found = self._find_incident(incident_id, muted_rows=muted_rows)
         if found is None:
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         provider, row = found
-        current_revision = self._incident(provider, row, muted=False, active=True).revision
+        muted_row = self._mute_index(muted_rows).get((provider, incident_id))
+        current_revision = self._incident_revision(provider, row, muted_row)
         ensure_revision(expected_revision, current_revision)
         self._status.mute(provider, incident_id, str(row.get("name") or ""))
         audit(self._audit_sink, context, action="status-alerts.incident.mute", target=incident_id)
@@ -446,7 +513,7 @@ class StatusAlertControl:
         )
         if muted_row is None:
             raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
-        return self._incident(provider, muted_row, muted=True, active=False)
+        return self._incident(provider, muted_row, muted_row=muted_row, active=False)
 
     def mute_direct(self, context: ManagementContext, provider: str, incident_id: str, name: str) -> None:
         require(context, Capability.WRITE)
@@ -473,7 +540,7 @@ class StatusAlertControl:
         provider = str(found.get("provider") or "")
         ensure_revision(
             expected_revision,
-            self._incident(provider, found, muted=True, active=False).revision,
+            self._incident_revision(provider, found, found),
         )
         self._status.unmute(provider, incident_id)
         audit(self._audit_sink, context, action="status-alerts.incident.unmute", target=incident_id)
