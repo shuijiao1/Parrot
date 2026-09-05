@@ -199,13 +199,15 @@ class StateAuthority:
     def __init__(self, authority: Authority) -> None:
         self.authority = authority
         self.quota_keys: list[str] = []
+        self.quota_load_all_calls = 0
 
     def quota_load(self, key):
         self.quota_keys.append(key)
         return copy.deepcopy(self.authority.quotas.get(key))
 
     def quota_load_all(self):
-        raise AssertionError("overview must not scan orphan quota rows")
+        self.quota_load_all_calls += 1
+        return copy.deepcopy(list(self.authority.quotas.values()))
 
     @staticmethod
     def health():
@@ -340,14 +342,15 @@ def test_real_controls_asgi_authority_counts_health_revisions_and_read_only(tmp_
     assert overview_first["counts"] == {
         "channels": 1, "oauthAccounts": 1, "apiKeys": 1, "quotaHot": 1,
     }
-    assert controls.status.state_db.quota_keys == ["account-one"]
+    assert controls.status.state_db.quota_keys == []
+    assert controls.status.state_db.quota_load_all_calls == 1
 
     runtime_first = _get(client, auth, "/runtime/status").json()["data"]
     api_channel = next(row for row in runtime_first["channels"] if row["id"] == "api:api-one")
     assert api_channel["health"] == "cooldown"
     assert api_channel["cooldownCount"] == 1
-    assert api_channel["cooldowns"][0]["message"] == "authoritative cooldown reason"
-    assert api_channel["problemReasons"] == ["authoritative cooldown reason"]
+    assert api_channel["cooldowns"][0]["message"] is None
+    assert api_channel["problemReasons"] == ["active"]
     assert runtime_first["problemChannels"][0]["id"] == "api:api-one"
 
     jobs = _get(client, auth, "/runtime/background-jobs").json()
@@ -421,7 +424,9 @@ def test_real_controls_asgi_authority_counts_health_revisions_and_read_only(tmp_
     # Public resource changes do change their corresponding stable revisions.
     authority.config_data["apiKeys"]["client-two"] = "another-secret"
     assert _get(client, auth, "/overview").json()["data"]["revision"] != overview_first["revision"]
-    authority.cooldown_rows[0]["last_error_message"] = "new authoritative reason"
+    authority.cooldown_rows[0]["last_error_message"] = "new hidden raw error"
+    assert _get(client, auth, "/runtime/status").json()["data"]["revision"] == runtime_first["revision"]
+    authority.cooldown_rows[0]["error_count"] += 1
     assert _get(client, auth, "/runtime/status").json()["data"]["revision"] != runtime_first["revision"]
     authority.stats_total += 1
     assert _get(client, auth, "/stats/summary").json()["data"]["revision"] != stats_same["revision"]

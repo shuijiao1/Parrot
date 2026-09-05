@@ -220,6 +220,25 @@ class StatusControl:
         row = self.state_db.quota_load(account_key)
         return copy.deepcopy(row) if row else None
 
+    def _management_quota_rows_by_key(
+        self, context: ManagementContext,
+    ) -> dict[str, dict[str, Any]]:
+        """Index stored quota rows by their actual key for Management views.
+
+        ``quota_load()`` intentionally retains a legacy email fallback used by
+        Telegram.  Public Management projections must instead bind only the
+        canonical live account key to an exact stored row.
+        """
+        require(context)
+        rows: dict[str, dict[str, Any]] = {}
+        for row in self.state_db.quota_load_all():
+            if not isinstance(row, dict):
+                continue
+            stored_key = str(row.get("account_key") or "")
+            if stored_key:
+                rows[stored_key] = copy.deepcopy(row)
+        return rows
+
     def refresh_telegram_quota(self, context: ManagementContext, account_keys: list[str]) -> None:
         """Preserve the frozen TG status refresh; API snapshots never call this."""
         require(context)
@@ -250,15 +269,16 @@ class StatusControl:
             lifetime = lifetime.get("overall") if isinstance(lifetime, dict) and "overall" in lifetime else lifetime
         except Exception:
             lifetime = {}
+        try:
+            quota_rows_by_key = self._management_quota_rows_by_key(context)
+        except RuntimeError:
+            quota_rows_by_key = {}
         quota_hot = 0
         for account in accounts:
             account_key = str(self.oauth_manager.get_account_key(account) or "")
             if not account_key:
                 continue
-            try:
-                row = self.state_db.quota_load(account_key)
-            except RuntimeError:
-                row = None
+            row = quota_rows_by_key.get(account_key)
             if not isinstance(row, dict):
                 continue
             values = [row.get(key) for key in (
@@ -314,9 +334,9 @@ class StatusControl:
         cooldown_rows: list[dict[str, Any]] = []
         for row in sorted(cooldowns, key=lambda item: str(item.get("model") or "")):
             until = int(row.get("cooldown_until") or 0)
-            message = row.get("last_error_message")
-            if message is None:
-                message = row.get("message")
+            # ``message`` is the existing explicit public reason contract.  Do
+            # not fall back to the cooldown store's free-form last_error_message.
+            message = row.get("message")
             cooldown_rows.append({
                 "model": str(row.get("model") or ""),
                 "errorCount": int(row.get("error_count") or 0),
@@ -445,9 +465,10 @@ class StatusControl:
 
     def _quota_warning_records(self, context: ManagementContext) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
+        quota_rows_by_key = self._management_quota_rows_by_key(context)
         for account in self.oauth_accounts(context):
             key = str(self.oauth_manager.get_account_key(account) or "")
-            row = self.quota_row(context, key)
+            row = quota_rows_by_key.get(key)
             if not row:
                 continue
             metrics = []
@@ -486,9 +507,12 @@ class StatusControl:
                 "errorCount": int(row.get("error_count") or 0),
                 "state": "permanent" if until == -1 else "active",
                 "until": None if until == -1 else utc_datetime(until / 1000),
-                "message": sanitize_credentials(str(
-                    row.get("last_error_message") or row.get("message") or ""
-                )) or None,
+                # Preserve an explicit public reason, but never fall back to
+                # the cooldown store's free-form last_error_message.
+                "message": (
+                    sanitize_credentials(str(row["message"]))
+                    if row.get("message") is not None else None
+                ),
             })
         return page_slice(normalized, page=page, page_size=page_size)
 
