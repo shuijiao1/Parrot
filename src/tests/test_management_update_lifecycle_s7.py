@@ -58,6 +58,28 @@ class RetryActivationUpdates(FakeUpdates):
         return True, "accepted"
 
 
+class CloseDuringRearmUpdates(FakeUpdates):
+    """Pause the post-failure state read so owner close wins the terminal race."""
+
+    def __init__(self, config: FakeConfig) -> None:
+        super().__init__(config)
+        self.rearm_state_entered = threading.Event()
+        self.release_rearm_state = threading.Event()
+        self._blocked_once = False
+
+    def activate(self):
+        self.activate_calls += 1
+        self.update_state["message"] = "state snapshot guard rejected restart"
+        return False, "private guard detail"
+
+    def state(self):
+        if self.activate_calls and not self._blocked_once:
+            self._blocked_once = True
+            self.rearm_state_entered.set()
+            assert self.release_rearm_state.wait(timeout=3)
+        return super().state()
+
+
 class NoExitUpdates(FakeUpdates):
     def __init__(self, config: FakeConfig) -> None:
         super().__init__(config)
@@ -222,6 +244,34 @@ def test_synchronous_restart_failure_rearms_only_same_staged_version_for_retry()
         store.close()
 
 
+def test_owner_close_during_failed_activation_rearm_retires_plan():
+    clock = FakeClock()
+    gateway = CloseDuringRearmUpdates(_config())
+    control, store = _bound_control(gateway, clock)
+    _, token, plan = _stage(control, store)
+    digest = control._active_plan_digest
+    assert token is not None and digest is not None
+
+    activate_context = _context("activate-close-during-rearm")
+    activation = control.activate_staged(
+        activate_context,
+        plan_token=token,
+        expected_revision=plan["expectedRevision"],
+    )
+    assert gateway.rearm_state_entered.wait(timeout=2)
+
+    assert store.close(timeout_seconds=0) == 1
+    interrupted = store.get(activate_context, activation.id)
+    assert interrupted.status is OperationStatus.FAILED
+    gateway.release_rearm_state.set()
+
+    deadline = time.monotonic() + 2
+    while activation.id in store._futures and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert activation.id not in store._futures
+    assert (control._active_plan_digest, control._plans[digest].consumed) == (None, True)
+
+
 def test_restart_acceptance_without_process_exit_has_bounded_failed_terminal():
     clock = FakeClock()
     gateway = NoExitUpdates(_config())
@@ -376,3 +426,26 @@ def test_failure_log_api_masks_only_known_fields_and_url_userinfo(tmp_path):
         )
         tg_context = ManagementContext(request_id="tg-raw-log", actor=tg_session.principal)
         assert fixture.controls.updates.failure_log_raw(tg_context) == raw
+
+
+def test_failure_log_api_masks_url_userinfo_with_original_uppercase_scheme(tmp_path):
+    app, _runtime, fixture = build_auxiliary_app(tmp_path)
+    raw = (
+        "fetch HtTp://alice:hunter2@example.invalid/repo failed\n"
+        "fetch HTTPS://bob@example.invalid/repo failed\n"
+        "fetch SSH://deploy:key@example.invalid/project failed"
+    )
+    fixture.update_gateway.failure_log = lambda: raw
+
+    with TestClient(app) as client:
+        response = client.get(
+            BASE + "/updates/failure-log",
+            headers=bearer(create_session(client)),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["content"] == (
+        "fetch HtTp://***:***@example.invalid/repo failed\n"
+        "fetch HTTPS://***@example.invalid/repo failed\n"
+        "fetch SSH://***:***@example.invalid/project failed"
+    )
