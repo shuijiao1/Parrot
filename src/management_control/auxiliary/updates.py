@@ -30,6 +30,7 @@ from .common import (
     rfc3339_utc,
     string_list,
 )
+from .update_failure_log import sanitize_update_failure_log
 
 
 STAGE_IDLE = "idle"
@@ -43,6 +44,8 @@ STAGE_FAILED = "failed"
 STAGE_ROLLED_BACK = "rolled_back"
 _ACTIVE_STAGES = {STAGE_BACKING_UP, STAGE_PULLING, STAGE_RESTARTING, STAGE_VERIFYING}
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
+_ACTIVATION_EXIT_TIMEOUT_SECONDS = 660.0
+_ACTIVATION_POLL_INTERVAL_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +120,7 @@ class _ActivationPlan:
     target_version: str
     expires_at: datetime
     revision: str | None = None
+    client_revision: str | None = None
     ready: bool = False
     consumed: bool = False
 
@@ -204,15 +208,11 @@ class ModuleUpdateGateway:
 
 Scheduler = Callable[[Callable[[], None], str], None]
 Clock = Callable[[], datetime]
+Wait = Callable[[float], None]
 
 
 def _actor_key(context: ManagementContext) -> str:
     return context.actor.session_id or context.actor.subject_id
-
-
-def _sanitize_log(value: str) -> str:
-    """Bound failure-log size while preserving its ordinary text verbatim."""
-    return str(value or "")[-3500:]
 
 
 class UpdateControl:
@@ -228,6 +228,9 @@ class UpdateControl:
         scheduler: Scheduler | None = None,
         clock: Clock | None = None,
         plan_ttl_seconds: int = 600,
+        activation_timeout_seconds: float = _ACTIVATION_EXIT_TIMEOUT_SECONDS,
+        activation_poll_interval_seconds: float = _ACTIVATION_POLL_INTERVAL_SECONDS,
+        activation_wait: Wait | None = None,
     ) -> None:
         self._config = config_gateway or ModuleConfigGateway()
         self._updates = update_gateway or ModuleUpdateGateway()
@@ -235,6 +238,11 @@ class UpdateControl:
         self._scheduler = scheduler
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._plan_ttl = timedelta(seconds=plan_ttl_seconds)
+        if activation_timeout_seconds <= 0 or activation_poll_interval_seconds <= 0:
+            raise ValueError("activation monitor timing must be positive")
+        self._activation_timeout = timedelta(seconds=activation_timeout_seconds)
+        self._activation_poll_interval = float(activation_poll_interval_seconds)
+        self._activation_wait = activation_wait or threading.Event().wait
         self._operation_store: OperationStore | None = None
         self._operation_registry: OperationRegistry | None = None
         self._bound_registries: set[int] = set()
@@ -476,7 +484,7 @@ class UpdateControl:
 
     def failure_log(self, context: ManagementContext) -> UpdateFailureLog:
         require(context, Capability.LOG_BODY_READ)
-        content = _sanitize_log(self._updates.failure_log())
+        content = sanitize_update_failure_log(self._updates.failure_log())
         audit(self._audit_sink, context, action="updates.failure-log.read", target="update-failure-log")
         return UpdateFailureLog(content=content, revision=revision_for({"content": content}))
 
@@ -710,38 +718,42 @@ class UpdateControl:
                         message_code=f"UPDATE_{stage.upper()}",
                     )
 
-            self._updates.set_progress(progress)
             try:
-                ok, _detail = self._updates.stage(str(payload["version"]))
-            except Exception:
-                ok = False
-            finally:
-                self._updates.set_progress(None)
-            if not ok:
-                fail()
-                return
-            try:
+                # The updater owns one process-wide progress callback.  Keep callback
+                # install, stage, cleanup, and authoritative state confirmation under
+                # the same lock used by the Telegram direct adapter.
                 with self._lock:
+                    self._updates.set_progress(progress)
+                    try:
+                        ok, _detail = self._updates.stage(str(payload["version"]))
+                    except Exception:
+                        ok = False
+                    finally:
+                        self._updates.set_progress(None)
+                    if not ok:
+                        raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE)
                     state = self._state_without_auth()
                     digest = str(payload["planDigest"])
                     plan = self._plans.get(digest)
                     if plan is None or plan.actor_key != str(payload["actorKey"]):
                         raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
-                    if state.stage != STAGE_STAGED:
+                    if state.stage != STAGE_STAGED or state.target_version != plan.target_version:
                         raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
                     self._retire_plan(self._active_plan_digest)
                     plan.revision = state.revision
+                    plan.client_revision = state.revision
+                    plan.expires_at = self._clock() + self._plan_ttl
                     plan.ready = True
                     self._active_plan_digest = digest
                     expires_at = rfc3339_utc(plan.expires_at)
-                store.succeed(
-                    operation_id,
-                    {
-                        "stagedVersion": payload["version"],
-                        "expectedRevision": state.revision,
-                        "expiresAt": expires_at,
-                    },
-                )
+                    store.succeed(
+                        operation_id,
+                        {
+                            "stagedVersion": payload["version"],
+                            "expectedRevision": state.revision,
+                            "expiresAt": expires_at,
+                        },
+                    )
             except Exception:
                 fail()
 
@@ -804,22 +816,25 @@ class UpdateControl:
                 plan.consumed = True
                 raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
             current = self._state_without_auth()
-            if current.stage != STAGE_STAGED:
+            if current.stage != STAGE_STAGED or current.target_version != plan.target_version:
                 raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
-            ensure_revision(expected_revision, current.revision)
+            # A synchronous restart guard may update only the staged message/revision.
+            # The original response revision remains valid solely with this still-live,
+            # actor-bound plan; the plan itself always tracks authoritative state.
+            if expected_revision not in {current.revision, plan.client_revision}:
+                ensure_revision(expected_revision, current.revision)
             ensure_revision(plan.revision, current.revision)
             plan.consumed = True
             try:
                 operation = self._operation_registry.create(
                     context,
                     kind=self.ACTIVATE_KIND,
-                    payload={"targetVersion": plan.target_version},
+                    payload={"targetVersion": plan.target_version, "planDigest": digest},
                     cancellable=False,
                 )
             except Exception:
                 plan.consumed = False
                 raise
-            self._active_plan_digest = None
             self._idempotency[idempotency_key] = (digest, operation.id)
             self._idempotency.move_to_end(idempotency_key)
             while len(self._idempotency) > 500:
@@ -827,10 +842,97 @@ class UpdateControl:
         audit(self._audit_sink, context, action="updates.activate", target=operation.id, result="queued")
         return operation
 
-    def _start_activate(self, operation_id: str, _context: ManagementContext, _payload: Any) -> None:
+    def _rearm_failed_activation(self, digest: str, target_version: str) -> bool:
+        """Restore only the same still-staged plan after a synchronous rejection."""
+        plan = self._plans.get(digest)
+        if plan is None or self._active_plan_digest != digest or not plan.consumed:
+            return False
+        try:
+            state = self._state_without_auth()
+        except Exception:
+            self._retire_plan(digest)
+            return False
+        if state.stage != STAGE_STAGED or state.target_version != target_version:
+            self._retire_plan(digest)
+            return False
+        plan.revision = state.revision
+        plan.expires_at = self._clock() + self._plan_ttl
+        plan.ready = True
+        plan.consumed = False
+        return True
+
+    def _start_activate(self, operation_id: str, _context: ManagementContext, payload: Any) -> None:
         store = self._operation_store
         if store is None:
             raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY, retryable=True)
+        digest = str(payload["planDigest"])
+        target_version = str(payload["targetVersion"])
+
+        def finish_success() -> None:
+            try:
+                store.update_progress(
+                    operation_id,
+                    current=2,
+                    total=2,
+                    message_code="UPDATE_HEALTH_VERIFIED",
+                )
+                store.succeed(operation_id, {"activated": True})
+            except ManagementError:
+                # Orderly owner shutdown may already have interrupted the record.
+                return
+
+        def monitor_accepted_restart() -> None:
+            deadline = self._clock() + self._activation_timeout
+            while True:
+                state = None
+                try:
+                    state = self._state_without_auth()
+                except Exception:
+                    pass
+                if state is not None:
+                    if state.target_version not in {None, target_version}:
+                        store.fail_if_active(
+                            operation_id,
+                            code=ManagementErrorCode.STATE_CONFLICT,
+                            retryable=False,
+                        )
+                        return
+                    if state.stage == STAGE_SUCCESS:
+                        finish_success()
+                        return
+                    if state.stage in {STAGE_FAILED, STAGE_ROLLED_BACK, STAGE_IDLE}:
+                        store.fail_if_active(
+                            operation_id,
+                            code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                            retryable=False,
+                        )
+                        return
+                try:
+                    terminal = self._updates.activation_is_terminal()
+                except Exception:
+                    terminal = False
+                if terminal:
+                    finish_success()
+                    return
+                if self._clock() >= deadline:
+                    store.fail_if_active(
+                        operation_id,
+                        code=ManagementErrorCode.UPSTREAM_TIMEOUT,
+                        retryable=False,
+                    )
+                    return
+                self._activation_wait(self._activation_poll_interval)
+                try:
+                    # This is also the cooperative owner-close probe: once the shared
+                    # store interrupts the operation, the monitor exits on the next tick.
+                    store.update_progress(
+                        operation_id,
+                        current=1,
+                        total=2,
+                        message_code="UPDATE_RESTARTING",
+                    )
+                except ManagementError:
+                    return
 
         def run() -> None:
             store.mark_running(operation_id)
@@ -840,29 +942,35 @@ class UpdateControl:
                 total=2,
                 message_code="UPDATE_RESTARTING",
             )
-            try:
-                ok, _detail = self._updates.activate()
-            except Exception:
-                ok = False
-            if not ok:
-                store.fail(
-                    operation_id,
-                    code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
-                    message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value,
-                    retryable=True,
-                )
-                return
-            if self._updates.activation_is_terminal():
-                store.update_progress(
-                    operation_id,
-                    current=2,
-                    total=2,
-                    message_code="UPDATE_HEALTH_VERIFIED",
-                )
-                store.succeed(operation_id, {"activated": True})
-            # Production intentionally stays RUNNING until process shutdown marks the
-            # in-memory operation interrupted. The restarted process/health endpoint
-            # is authoritative; returning success here would be false success.
+            with self._lock:
+                plan = self._plans.get(digest)
+                if plan is None or self._active_plan_digest != digest or not plan.consumed:
+                    store.fail_if_active(
+                        operation_id,
+                        code=ManagementErrorCode.INVALID_OPERATION_STATE,
+                        retryable=False,
+                    )
+                    return
+                try:
+                    ok, _detail = self._updates.activate()
+                except Exception:
+                    ok = False
+                if not ok:
+                    try:
+                        store.update_progress(operation_id, current=1, total=2, message_code="UPDATE_RESTARTING")
+                    except ManagementError:
+                        self._retire_plan(digest)
+                        return
+                    retryable = self._rearm_failed_activation(digest, target_version)
+                    store.fail_if_active(
+                        operation_id,
+                        code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
+                        retryable=retryable,
+                    )
+                    return
+                # Restart acceptance is irreversible for this plan, but is not success.
+                self._retire_plan(digest)
+            monitor_accepted_restart()
 
         if self._scheduler is not None:
             self._scheduler(run, "management-update-activate")
