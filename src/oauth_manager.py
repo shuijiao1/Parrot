@@ -4952,7 +4952,17 @@ async def refresh_account_models(
             _model_discovery_flights[canonical] = flight
             owner = True
     if not owner:
-        return await asyncio.wrap_future(flight)
+        waiter = asyncio.wrap_future(flight)
+        try:
+            return await asyncio.shield(waiter)
+        except asyncio.CancelledError:
+            # shield detaches from a pending waiter when its caller is cancelled;
+            # observe any later flight exception on that abandoned proxy.
+            def observe_completion(completed: asyncio.Future) -> None:
+                if not completed.cancelled():
+                    completed.exception()
+            waiter.add_done_callback(observe_completion)
+            raise
     try:
         before = copy.deepcopy(get_account(canonical))
         generation = _discovery_generation(before or {})
