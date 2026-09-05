@@ -34,7 +34,11 @@ from .channel.base import Channel, UpstreamDispatchMetadata
 from .channel.openai_oauth_channel import OpenAIOAuthChannel
 from .transform import cc_mimicry
 from .openai import compaction_owner, deepseek_reasoning, reasoning_replay
-from .openai.codex_identity_confuse import ConfuseState
+from .openai.codex_identity import (
+    capture_turn_state_event,
+    release_request_turn_serialization,
+)
+from .openai.codex_identity_mapper import ProtocolIdentityMap
 from .openai.responses_ws_runtime import (
     flatten_ws_response_headers,
     identity_expose_frame,
@@ -119,10 +123,15 @@ _codex_snapshot_lock = threading.Lock()
 _codex_snapshot_inflight: set[str] = set()
 
 
-def _maybe_record_codex_snapshot(ch: Channel, resp: Any) -> None:
+def _maybe_record_codex_snapshot(
+    ch: Channel, resp: Any, translator_ctx: dict | None = None,
+) -> None:
     if not isinstance(ch, OpenAIOAuthChannel):
         return
     try:
+        oauth_manager.observe_openai_response_metadata(
+            ch.account_key, resp.headers, translator_ctx,
+        )
         snap = openai_provider.parse_rate_limit_headers(dict(resp.headers))
         if not snap:
             return
@@ -162,7 +171,7 @@ def _maybe_record_codex_snapshot(ch: Channel, resp: Any) -> None:
             with _codex_snapshot_lock:
                 _codex_snapshot_inflight.discard(account_key)
     except Exception as exc:
-        print(f"[failover] codex snapshot record failed for {getattr(ch, 'email', '?')}: {exc}")
+        print(f"[failover] codex response metadata record failed: {type(exc).__name__}")
 
 
 # ─── Anthropic 响应头被动采样 snapshot 节流 ──────────────────────
@@ -1828,12 +1837,15 @@ async def run_failover(
         release_done = False
         slot_phase_complete = False
         pending_stream_result: AttemptResult | None = None
+        attempt_body: dict | None = None
 
         def _release_once(_key=channel_state.effect_key(ch)):
             nonlocal release_done
             if release_done:
                 return
             release_done = True
+            if attempt_body is not None:
+                release_request_turn_serialization(attempt_body)
             concurrency.release(_key)
 
         attempt_id = None
@@ -1868,6 +1880,7 @@ async def run_failover(
             attempt_body = _attempt_body_for_channel(
                 body, ch.key, bound_channel_key, portable_body,
             )
+            attempt_body["_codex_turn_serialization_required"] = True
             if (candidate_local_web_loop or candidate_openai_local_web_loop) and attempt_body.get("stream"):
                 attempt_body = dict(attempt_body)
                 attempt_body["stream"] = False
@@ -2405,12 +2418,15 @@ async def run_failover(
                 release_done2 = False
                 slot_phase_complete2 = False
                 pending_stream_result2: AttemptResult | None = None
+                attempt_body: dict | None = None
 
                 def _release_q(_key=channel_state.effect_key(ch)):
                     nonlocal release_done2
                     if release_done2:
                         return
                     release_done2 = True
+                    if attempt_body is not None:
+                        release_request_turn_serialization(attempt_body)
                     concurrency.release(_key)
 
                 attempt_order += 1
@@ -2441,6 +2457,7 @@ async def run_failover(
                     attempt_body = _attempt_body_for_channel(
                         body, ch.key, bound_channel_key, portable_body,
                     )
+                    attempt_body["_codex_turn_serialization_required"] = True
                     if (candidate_local_web_loop or candidate_openai_local_web_loop) and attempt_body.get("stream"):
                         attempt_body = dict(attempt_body)
                         attempt_body["stream"] = False
@@ -2854,7 +2871,9 @@ async def _connect_oauth_responses_ws(
     )
 
 
-def _maybe_record_codex_ws_snapshot(ch: Channel, ws_response: Any) -> None:
+def _maybe_record_codex_ws_snapshot(
+    ch: Channel, ws_response: Any, translator_ctx: dict | None = None,
+) -> None:
     if not isinstance(ch, OpenAIOAuthChannel) or ws_response is None:
         return
     try:
@@ -2863,9 +2882,9 @@ def _maybe_record_codex_ws_snapshot(ch: Channel, ws_response: Any) -> None:
             return
         headers = flatten_ws_response_headers(headers_obj)
         fake_resp = type("_WsResp", (), {"headers": headers})()
-        _maybe_record_codex_snapshot(ch, fake_resp)
+        _maybe_record_codex_snapshot(ch, fake_resp, translator_ctx)
     except Exception as exc:
-        print(f"[failover] codex WS snapshot record failed for {getattr(ch, 'email', '?')}: {exc}")
+        print(f"[failover] codex WS metadata record failed: {type(exc).__name__}")
 
 
 def _maybe_record_codex_rate_limits_event(ch: Channel | None, event: dict) -> None:
@@ -2896,7 +2915,18 @@ def _maybe_record_codex_rate_limits_event(ch: Channel | None, event: dict) -> No
                 _maybe_record_codex_snapshot(ch, fake_resp)
                 return
     except Exception as exc:
-        print(f"[failover] codex WS rate_limits event record failed for {getattr(ch, 'email', '?')}: {exc}")
+        print(f"[failover] codex WS rate_limits event record failed: {type(exc).__name__}")
+
+
+def _capture_codex_response_event(
+    ch: Channel | None, translator_ctx: dict | None, frame: str | bytes,
+) -> bool:
+    captured = capture_turn_state_event(translator_ctx, frame)
+    if isinstance(ch, OpenAIOAuthChannel):
+        oauth_manager.observe_openai_response_event(
+            ch.account_key, frame, translator_ctx,
+        )
+    return captured
 
 
 def _frame_size(data: str | bytes) -> int:
@@ -2947,6 +2977,10 @@ class _WsResponsesTracker:
             self._frames.append(text)
             return
         self.last_event = evt
+        if isinstance(self.channel, OpenAIOAuthChannel):
+            oauth_manager.observe_openai_response_event(
+                self.channel.account_key, evt,
+            )
         typ = str(evt.get("type") or "")
         if typ == "codex.rate_limits":
             _maybe_record_codex_rate_limits_event(self.channel, evt)
@@ -3081,7 +3115,7 @@ def _hydrate_oauth_ws_attempt_result(
     result: AttemptResult,
     tracker: _WsResponsesTracker,
     *,
-    identity_state: ConfuseState | None = None,
+    identity_state: ProtocolIdentityMap | None = None,
     proxy_name: str | None = None,
     proxy_bytes: _WsProxyBytes | None = None,
     translator_ctx: dict | None = None,
@@ -3130,7 +3164,7 @@ async def _build_oauth_responses_ws_upstream_request(
     body: dict,
     resolved_model: str,
 ) -> tuple[
-    str, dict[str, str], str, Optional[dict], ConfuseState,
+    str, dict[str, str], str, Optional[dict], ProtocolIdentityMap,
     UpstreamDispatchMetadata | None,
 ]:
     # 复用 OAuth channel 的鉴权 / session 隔离 / header 构造；只把 URL 改成 WS，
@@ -3138,6 +3172,7 @@ async def _build_oauth_responses_ws_upstream_request(
     req = await ch.build_upstream_request(
         body, resolved_model, ingress_protocol="responses",
         defer_device_fingerprint=True,
+        responses_transport="websocket",
     )
     ws_url, headers, frame, identity_state = prepare_oauth_responses_ws_request_parts(
         req,
@@ -3268,7 +3303,28 @@ async def _try_openai_oauth_responses_ws_channel(
                 connector.stats.total_successes += 1
                 connector.stats.last_success_ts = time.time()
                 connector.stats.last_latency_ms = int(connect_ms or 0)
-            _maybe_record_codex_ws_snapshot(ch, getattr(upstream_ws, "response", None))
+            ws_response = getattr(upstream_ws, "response", None)
+            _maybe_record_codex_ws_snapshot(ch, ws_response, translator_ctx)
+            from .openai.codex_identity import capture_turn_state, project_snapshot
+            if capture_turn_state(
+                translator_ctx,
+                getattr(ws_response, "headers", None),
+            ):
+                identity_context = (translator_ctx or {}).get("codex_identity_context")
+                if identity_context is not None:
+                    refreshed_snapshot = identity_context.snapshot()
+                    frame_obj = json.loads(first_frame)
+                    _, projected_frame = project_snapshot(
+                        refreshed_snapshot,
+                        {},
+                        frame_obj,
+                        direct_installation_header=False,
+                        create_client_metadata=True,
+                    )
+                    assert projected_frame is not None
+                    first_frame = json.dumps(
+                        projected_frame, ensure_ascii=False, separators=(",", ":")
+                    )
             result = await _consume_oauth_responses_ws(
                 upstream_ws,
                 tracker=tracker,
@@ -3481,7 +3537,7 @@ async def _consume_oauth_responses_ws(
     affinity_hit: int,
     translator_ctx: Optional[dict],
     body: Optional[dict],
-    identity_state: ConfuseState,
+    identity_state: ProtocolIdentityMap,
     client_key: Optional[str],
     proxy_name: Optional[str],
     proxy_bytes: _WsProxyBytes,
@@ -3612,6 +3668,7 @@ async def _recv_oauth_ws_until_visible(
     proxy_bytes: _WsProxyBytes,
     start_time: float,
     start_monotonic: float,
+    translator_ctx: Optional[dict],
     timing: WsAttemptTiming,
     round_timeouts: RoundTimeouts,
 ) -> tuple[list[str | bytes], Optional[AttemptResult], Optional[int]]:
@@ -3629,6 +3686,7 @@ async def _recv_oauth_ws_until_visible(
         timeout_detail_mode="packet_or_visible",
         timeout_label_seconds=first_wait,
         use_tracker_error_detail=False,
+        on_text_frame=lambda frame: _capture_codex_response_event(ch, translator_ctx, frame),
         timing=timing,
         round_timeouts=round_timeouts,
     )
@@ -3646,11 +3704,11 @@ async def _recv_oauth_ws_until_visible(
     ), step.first_packet_ms
 
 
-def _identity_expose_frame(data: str | bytes, state: ConfuseState) -> str | bytes:
+def _identity_expose_frame(data: str | bytes, state: ProtocolIdentityMap) -> str | bytes:
     return identity_expose_frame(data, state)
 
 
-def _identity_log_text(text: str, state: ConfuseState) -> str:
+def _identity_log_text(text: str, state: ProtocolIdentityMap) -> str:
     return identity_log_text(text, state)
 
 
@@ -3685,7 +3743,7 @@ async def _consume_oauth_responses_ws_non_stream(
     affinity_hit: int,
     translator_ctx: Optional[dict],
     body: Optional[dict],
-    identity_state: ConfuseState,
+    identity_state: ProtocolIdentityMap,
     client_key: Optional[str],
     proxy_name: Optional[str],
     proxy_bytes: _WsProxyBytes,
@@ -3700,6 +3758,7 @@ async def _consume_oauth_responses_ws_non_stream(
         upstream_ws, tracker, ch=ch, deadline_ts=deadline_ts,
         first_wait=first_wait, idle_timeout=idle_timeout, proxy_bytes=proxy_bytes,
         start_time=start_time, start_monotonic=start_monotonic,
+        translator_ctx=translator_ctx,
         timing=timing, round_timeouts=round_timeouts,
     )
     first_byte_ms = timing.snapshot().first_byte_ms
@@ -3743,6 +3802,7 @@ async def _consume_oauth_responses_ws_non_stream(
             proxy_bytes=proxy_bytes,
             closed_error_detail="upstream websocket closed",
             check_blacklist=False,
+            on_text_frame=lambda frame: _capture_codex_response_event(ch, translator_ctx, frame),
             timing=timing,
             round_timeouts=round_timeouts,
         )
@@ -3865,7 +3925,7 @@ async def _finalize_oauth_ws_error(
     tracker: _WsResponsesTracker,
     proxy_name: Optional[str],
     proxy_bytes: _WsProxyBytes,
-    identity_state: ConfuseState,
+    identity_state: ProtocolIdentityMap,
     timing: WsAttemptTiming,
 ) -> None:
     result = _request_invalid_result_if_needed(result)
@@ -3926,7 +3986,7 @@ async def _consume_oauth_responses_ws_stream(
     affinity_hit: int,
     translator_ctx: Optional[dict],
     body: Optional[dict],
-    identity_state: ConfuseState,
+    identity_state: ProtocolIdentityMap,
     client_key: Optional[str],
     proxy_name: Optional[str],
     proxy_bytes: _WsProxyBytes,
@@ -3941,6 +4001,7 @@ async def _consume_oauth_responses_ws_stream(
         upstream_ws, tracker, ch=ch, deadline_ts=deadline_ts,
         first_wait=first_wait, idle_timeout=idle_timeout, proxy_bytes=proxy_bytes,
         start_time=start_time, start_monotonic=start_monotonic,
+        translator_ctx=translator_ctx,
         timing=timing, round_timeouts=round_timeouts,
     )
     first_byte_ms = timing.snapshot().first_byte_ms
@@ -4129,6 +4190,7 @@ async def _consume_oauth_responses_ws_stream(
                     proxy_bytes=proxy_bytes,
                     closed_error_detail="upstream websocket closed",
                     blacklist_before_error=False,
+                    on_text_frame=lambda frame: _capture_codex_response_event(ch, translator_ctx, frame),
                     timing=timing,
                     round_timeouts=round_timeouts,
                 )
@@ -4453,8 +4515,11 @@ async def _try_channel(
 
     try:
         # 1.5 响应头 snapshot 采样：成功/失败分支前都先记一次
-        _maybe_record_codex_snapshot(ch, upstream_resp)
+        _maybe_record_codex_snapshot(ch, upstream_resp, upstream_req.translator_ctx)
         _maybe_record_anthropic_snapshot(ch, upstream_resp)
+        if isinstance(ch, OpenAIOAuthChannel):
+            from .openai.codex_identity import capture_turn_state
+            capture_turn_state(upstream_req.translator_ctx, upstream_resp.headers)
 
         # 2. HTTP 状态码检查
         if upstream_resp.status_code >= 400:

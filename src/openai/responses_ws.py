@@ -37,14 +37,18 @@ from .. import (
     log_db, model_mapping, model_pricing, network, notifier, oauth_manager, scheduler, scorer, translation, upstream,
 )
 from ..channel.base import Channel, UpstreamRequest, build_dispatch_metadata
-from ..channel.openai_oauth_channel import OpenAIOAuthChannel, _isolate_session_id
+from ..channel.openai_oauth_channel import OpenAIOAuthChannel
 from . import compaction_owner
-from .codex_device_fingerprint import apply_device_fingerprint
-from .codex_identity_confuse import (
-    ConfuseState,
-    confuse_client_metadata,
-    confuse_headers as confuse_identity_headers,
+from .codex_identity import (
+    RequestIdentityContext,
+    acquire_request_turn_serialization,
+    capture_turn_state,
+    capture_turn_state_event,
+    next_request_identity_context,
+    project_snapshot,
+    release_request_turn_serialization,
 )
+from .codex_identity_mapper import ProtocolIdentityMap
 from ..client_ip import get_client_ip
 from ..openai.transform.guard import GuardError, guard_responses_ingress
 from ..openai.transform.responses_to_chat import resolve_current_input_items
@@ -107,11 +111,11 @@ from .responses_ws_runtime import (
     sync_translated_body_to_ws_create,
 )
 
-# Headers used by Codex Responses WS. Most clients will send these to Parrot;
-# forward them when present so sticky routing / observability survives the proxy.
+# Headers used by Codex Responses WS. Identity carriers are re-projected from the
+# selected OAuth snapshot below; downstream turn-state is intentionally never
+# forwarded because it is scoped to one upstream account and turn.
 _FORWARD_CLIENT_HEADERS = {
     "x-codex-beta-features",
-    "x-codex-turn-state",
     "x-codex-turn-metadata",
     "x-codex-parent-thread-id",
     "x-codex-window-id",
@@ -123,6 +127,21 @@ _FORWARD_CLIENT_HEADERS = {
 
 
 _WsProxyBytes = WsProxyBytes
+
+
+def _native_identity_carriers(obj: dict, websocket: WebSocket) -> dict[str, dict]:
+    """Retain only already-supported native lookup carriers, never turn-state."""
+    return {
+        "client_metadata": dict(obj.get("client_metadata") or {})
+        if isinstance(obj.get("client_metadata"), dict) else {},
+        "headers": {
+            str(key): str(value)
+            for key, value in websocket.headers.items()
+            if str(key).lower() in {
+                "session-id", "session_id", "x-codex-turn-metadata",
+            }
+        },
+    }
 
 
 @dataclass
@@ -549,6 +568,11 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         return
 
     body = _request_body_from_ws_create(first_obj)
+    # Native Codex carriers are lookup anchors only. They are retained under an
+    # internal key, hashed by the identity resolver, and never forwarded raw.
+    body["_codex_native_identity"] = _native_identity_carriers(
+        first_obj, websocket
+    )
 
     _ingress_line = "openai-responses"
     model_mapping.apply_default(body, _ingress_line)
@@ -872,6 +896,7 @@ async def _run_ws_failover(
                     log_db.update_pending, request_id, proxy_name=attempt_proxy,
                 ))
 
+            body["_codex_turn_serialization_required"] = True
             attempt_handed_off = True
             result = await _try_ws_channel(
                 websocket, first_obj=first_obj,
@@ -903,6 +928,7 @@ async def _run_ws_failover(
             raise
         finally:
             await turn_capacity.cleanup_after_attempt(api_key_lease)
+            release_request_turn_serialization(body)
 
         if result.proxy_name is None:
             result.proxy_name = attempt_proxy
@@ -1104,6 +1130,7 @@ async def _run_ws_failover(
                         )
 
                     await await_ws_owned(_record_queued_attempt())
+                    body["_codex_turn_serialization_required"] = True
                     attempt_handed_off2 = True
                     result = await _try_ws_channel(
                         websocket, first_obj=first_obj,
@@ -1135,6 +1162,7 @@ async def _run_ws_failover(
                     raise
                 finally:
                     await turn_capacity.cleanup_after_attempt(api_key_lease)
+                    release_request_turn_serialization(body)
                 if result.proxy_name is None:
                     result.proxy_name = attempt_proxy
                 last_result = result
@@ -1421,26 +1449,20 @@ async def _try_ws_channel(
                 connector.stats.total_successes += 1
                 connector.stats.last_success_ts = time.time()
                 connector.stats.last_latency_ms = int(connect_ms or 0)
-            # Headers from a successful WS upgrade carry Codex quota snapshots.
-            _maybe_record_codex_ws_snapshot(ch, getattr(upstream_ws, "response", None))
+            # Headers from a successful WS upgrade carry quota and per-turn state.
+            ws_response = getattr(upstream_ws, "response", None)
+            _maybe_record_codex_ws_snapshot(
+                ch, ws_response, upstream_req.translator_ctx,
+            )
+            capture_turn_state(
+                upstream_req.translator_ctx,
+                getattr(ws_response, "headers", None),
+            )
 
             session_result: _WsAttemptResult | None = None
             session_request_id = request_id
             turn_number = 1
-            header_session_id = next(
-                (
-                    str(value).strip()
-                    for key, value in upstream_req.headers.items()
-                    if str(key).lower() == "session-id" and str(value).strip()
-                ),
-                "",
-            )
-            identity_session: dict[str, Any] = {
-                "session_prompt_cache_key": (
-                    header_session_id
-                    or str(body.get("prompt_cache_key") or "").strip()
-                ),
-            }
+            identity_session: dict[str, Any] = {}
             while True:
                 relay_result = await _relay_ws_session(
                     websocket, upstream_ws,
@@ -1539,6 +1561,7 @@ async def _try_ws_channel(
                 while True:
                     next_turn = await _receive_next_response_create(
                         websocket,
+                        channel=ch,
                         allowed_models=allowed_models,
                         api_key_name=api_key_name,
                         client_ip=client_ip,
@@ -1843,6 +1866,9 @@ async def _try_ws_channel(
                 upstream_protocol=ch_proto,
             )
         finally:
+            active_turn_body = relay_state.get("turn_body")
+            if active_turn_body is not None:
+                release_request_turn_serialization(active_turn_body)
             if last_error is not None and not timing.terminal:
                 await _persist_ws_route_round(
                     route_attempt_id,
@@ -2565,6 +2591,7 @@ async def _try_sse_channel(
 async def _receive_next_response_create(
     websocket: WebSocket,
     *,
+    channel: Channel | None,
     allowed_models: list[str] | None,
     api_key_name: str,
     client_ip: str,
@@ -2607,6 +2634,7 @@ async def _receive_next_response_create(
             )
             continue
         body = _request_body_from_ws_create(obj)
+        body["_codex_native_identity"] = _native_identity_carriers(obj, websocket)
         model_mapping.apply_default(body, "openai-responses")
         model_mapping.apply_mapping(body, "openai-responses")
         body["_client_visible_model"] = str(body.get("model") or "").strip()
@@ -2628,9 +2656,11 @@ async def _receive_next_response_create(
             # Sequential WS v2 continuation is owned by the active upstream
             # connection, not by Parrot's optional local HTTP response store.
             guard_responses_ingress(body, store_enabled=True)
+            if isinstance(channel, OpenAIOAuthChannel):
+                body = channel.apply_request_field_policies(body, "responses")
         except GuardError as exc:
             await _send_request_invalid_error_frame(
-                websocket, exc.message, param=None,
+                websocket, exc.message, param=exc.param,
             )
             continue
         if body.get("background") is True:
@@ -2710,49 +2740,50 @@ async def _relay_ws_session(
         translator_ctx=translator_ctx,
     )
 
-    # ── Identity confuse state (shared across the session lifetime) ──
+    # ── Authoritative identity snapshot (one logical session, one new turn) ──
     identity_session = identity_session if identity_session is not None else {}
-    _identity_confuse_state = identity_session.get("state")
-    if not isinstance(_identity_confuse_state, ConfuseState):
-        _identity_confuse_state = ConfuseState()
-    current_pck = str(body.get("prompt_cache_key") or "").strip()
-    _session_pck = str(
-        identity_session.setdefault("session_prompt_cache_key", current_pck)
-        or current_pck
-    ).strip()
-    _original_pck = str(first_obj.get("prompt_cache_key") or _session_pck).strip()
-    if isinstance(ch, OpenAIOAuthChannel) and api_key_name:
-        if not _identity_confuse_state.enabled:
-            _identity_confuse_state = ConfuseState(
-                enabled=True, auth_id=api_key_name,
-            )
-        downstream_header_installation = str(
-            (translator_ctx or {}).get("_codex_downstream_installation_id") or ""
-        ).strip()
-        if downstream_header_installation and not _identity_confuse_state.original_installation_id:
-            _identity_confuse_state.original_installation_id = downstream_header_installation
-    identity_session["state"] = _identity_confuse_state
-
-    def _apply_identity_confuse_to_frame(obj: dict) -> dict:
-        """Apply identity confuse to a WS create frame's prompt/cache metadata."""
-        nonlocal _identity_confuse_state
-        if not _identity_confuse_state.enabled:
-            return obj
-        obj = dict(obj)
-        frame_raw_pck = str(obj.get("prompt_cache_key") or _original_pck).strip()
-        cm = obj.get("client_metadata") if isinstance(obj.get("client_metadata"), dict) else {}
-        confused_cm, _identity_confuse_state = confuse_client_metadata(
-            api_key_name, cm, session_prompt_cache_key=_session_pck,
-            state=_identity_confuse_state, original_prompt_cache_key=frame_raw_pck,
+    base_context = (translator_ctx or {}).get("codex_identity_context")
+    if isinstance(ch, OpenAIOAuthChannel):
+        if not isinstance(base_context, RequestIdentityContext):
+            raise ValueError("native Codex WS is missing its identity context")
+        previous_context = identity_session.get("context")
+        current_context = (
+            next_request_identity_context(previous_context, body)
+            if isinstance(previous_context, RequestIdentityContext)
+            else base_context
         )
-        identity_session["state"] = _identity_confuse_state
-        if confused_cm:
-            obj["client_metadata"] = confused_cm
-        elif "client_metadata" in obj:
-            obj.pop("client_metadata", None)
-        if _session_pck:
-            obj["prompt_cache_key"] = _session_pck
-        return obj
+        if isinstance(previous_context, RequestIdentityContext):
+            body["_codex_turn_serialization_required"] = True
+            await acquire_request_turn_serialization(body, current_context)
+        identity_session["context"] = current_context
+        # Success persistence reads the attempt body, including on sequential
+        # creates that don't rebuild the channel request. Share its actual turn
+        # context so confirmed compaction advances this session's next window.
+        body.setdefault("_codex_identity_contexts", {})[
+            current_context.account_identity.owner_digest
+        ] = current_context
+        identity_snapshot = current_context.snapshot()
+        translator_ctx = dict(translator_ctx or {})
+        translator_ctx["codex_identity_context"] = current_context
+        translator_ctx["codex_identity_snapshot"] = identity_snapshot
+        result.translator_ctx = translator_ctx
+        _identity_map = ProtocolIdentityMap.from_request(body, identity_snapshot)
+    else:
+        identity_snapshot = None
+        _identity_map = ProtocolIdentityMap()
+
+    def _apply_identity_snapshot_to_frame(obj: dict) -> dict:
+        if identity_snapshot is None:
+            return obj
+        _, projected = project_snapshot(
+            identity_snapshot,
+            {},
+            obj,
+            direct_installation_header=False,
+            create_client_metadata=True,
+        )
+        assert projected is not None
+        return projected
 
     def sync_tracker_result() -> _WsAttemptResult:
         """Hydrate attempt facts before any immutable settlement can run."""
@@ -2760,15 +2791,15 @@ async def _relay_ws_session(
         result.usage = dict(tracker.usage)
         result.usage_observed = tracker.usage_observed
         result.response_text = _identity_log_text(
-            tracker.get_full_response(), _identity_confuse_state,
+            tracker.get_full_response(), _identity_map,
         )
         result.response_id = tracker.response_id
         result.output_items = tracker.get_output_items()
         return result
 
-    # The caller owns cancellation finalization. Expose a synchronous snapshot
-    # closure so it can retain frames observed before this coroutine is
-    # cancelled, without leaking tracker internals into the transport API.
+    # The caller owns cancellation finalization. Expose the active turn body and
+    # a synchronous snapshot so cancellation releases both transport and queue.
+    relay_state["turn_body"] = body
     relay_state["sync_result"] = sync_tracker_result
     relay_state["retry_finalized"] = False
 
@@ -2907,21 +2938,14 @@ async def _relay_ws_session(
                     else "error"
                 ),
             ))
+        release_request_turn_serialization(body)
         return result
 
     # Send first frame upstream before accepting downstream. If upstream rejects
     # before a downstream-visible event, the attempt can still fail over.
     try:
         first_upstream_obj = _map_ws_create_frame_for_upstream(first_obj, resolved_model, channel=ch)
-        first_upstream_obj = _apply_identity_confuse_to_frame(first_upstream_obj)
-        installation_id = str(getattr(ch, "codex_device_installation_id", "") or "")
-        if installation_id:
-            _identity_confuse_state.override_installation_for_upstream(installation_id)
-            identity_session["state"] = _identity_confuse_state
-            _, first_upstream_obj = apply_device_fingerprint(
-                {}, first_upstream_obj, installation_id,
-                create_client_metadata=True,
-            )
+        first_upstream_obj = _apply_identity_snapshot_to_frame(first_upstream_obj)
         dispatch_metadata = build_dispatch_metadata(
             first_upstream_obj,
             getattr(ch, "protocol", "openai-responses"),
@@ -2998,8 +3022,9 @@ async def _relay_ws_session(
     first_wait = round_timeouts.first_byte
     first_read_task = asyncio.create_task(_recv_until_first_visible_ws_event(
         upstream_ws, tracker, pending_visible, ch.key, first_wait,
-        deadline_ts=deadline_ts, idle_timeout=idle_timeout,
+        channel=ch, deadline_ts=deadline_ts, idle_timeout=idle_timeout,
         result=result, proxy_bytes=proxy_bytes,
+        translator_ctx=translator_ctx,
         timing=timing, round_timeouts=round_timeouts,
         timeout_label_seconds=first_byte_timeout,
         commit_retryable_errors=not allow_failover_before_visible,
@@ -3068,7 +3093,7 @@ async def _relay_ws_session(
                 for item in pending_visible:
                     await _send_downstream(
                         websocket,
-                        _identity_expose_frame(item, _identity_confuse_state),
+                        _identity_expose_frame(item, _identity_map),
                     )
             if result.outcome == "request_invalid":
                 if result.http_status == 413:
@@ -3111,7 +3136,7 @@ async def _relay_ws_session(
     _apply_ws_snapshot(result, timing, terminal=False)
     result.closed_after_accept = True
     for item in pending_visible:
-        await _send_downstream(websocket, _identity_expose_frame(item, _identity_confuse_state))
+        await _send_downstream(websocket, _identity_expose_frame(item, _identity_map))
 
     async def upstream_to_downstream() -> None:
         nonlocal result
@@ -3123,9 +3148,12 @@ async def _relay_ws_session(
                 deadline_ts=deadline_ts,
                 idle_timeout=idle_timeout,
                 proxy_bytes=proxy_bytes,
-                frame_transform=lambda frame: _identity_expose_frame(frame, _identity_confuse_state),
+                frame_transform=lambda frame: _identity_expose_frame(frame, _identity_map),
                 skip_event_types=(),
                 blacklist_before_error=True,
+                on_text_frame=lambda frame: _capture_codex_response_event(
+                    ch, translator_ctx, frame
+                ),
                 timing=timing,
                 round_timeouts=round_timeouts,
             )
@@ -3265,58 +3293,23 @@ async def _build_ws_upstream_request(
             websocket,
             preserve_upstream_user_agent=True,
         )
-        # Codex WebSocket uses the same session/thread identity header names as
-        # official codex-rs. Keep old HTTP headers too for compatibility with the
-        # internal endpoint while adding the WS names.
-        sid = headers.get("session-id") or headers.get("session_id")
-        tid = headers.get("thread-id") or sid
-        if not sid:
-            api_key_name = str(body.get("_api_key_name") or "")
-            raw_anchor = str(body.get("prompt_cache_key") or "").strip()
-            if api_key_name and raw_anchor:
-                sid = _isolate_session_id(api_key_name, raw_anchor)
-                tid = sid
-        if sid:
-            headers.setdefault("session-id", sid)
-        if tid:
-            headers.setdefault("thread-id", tid)
-            headers.setdefault("x-client-request-id", tid)
-        # Codex CLI only sends session-id / thread-id (hyphenated).
-        for _ck in [k for k in list(headers) if str(k).lower() in ("session_id", "conversation_id", "conversation-id")]:
-            del headers[_ck]
-        # Identity confuse: obfuscate identity headers for OAuth channels.
-        api_key_name = str(body.get("_api_key_name") or "")
-        session_pck = sid or ""  # session_id is already the isolated prompt_cache_key
-        if api_key_name and isinstance(ch, OpenAIOAuthChannel):
-            _hdr_state = ConfuseState(enabled=True, auth_id=api_key_name)
-            raw_anchor = str(body.get("prompt_cache_key") or "").strip()
-            if session_pck:
-                _hdr_state.original_prompt_cache_key = raw_anchor
-                _hdr_state.confused_prompt_cache_key = session_pck
-            headers = confuse_identity_headers(headers, _hdr_state,
-                                               session_prompt_cache_key=session_pck)
-        else:
-            # Codex CLI only sends session-id / thread-id (hyphenated).
-            for _ck in [k for k in list(headers) if str(k).lower() in ("session_id", "conversation_id", "conversation-id")]:
-                del headers[_ck]
-        installation_id = str(getattr(ch, "codex_device_installation_id", "") or "")
-        translator_ctx = dict(req.translator_ctx or {})
-        downstream_installation = ""
-        for key, value in websocket.headers.items():
-            if str(key).lower() == "x-codex-installation-id":
-                downstream_installation = str(value).strip()
-                break
-        if downstream_installation:
-            translator_ctx["_codex_downstream_installation_id"] = downstream_installation
-        if installation_id:
-            headers, _ = apply_device_fingerprint(
-                headers, None, installation_id, create_client_metadata=False,
-            )
+        # Re-project after generic WS header merging so native downstream
+        # identity/turn-state carriers cannot overwrite the selected OAuth scope.
+        snapshot = (req.translator_ctx or {}).get("codex_identity_snapshot")
+        if snapshot is None:
+            raise ValueError("native Codex WS is missing its identity snapshot")
+        headers, _ = project_snapshot(
+            snapshot,
+            headers,
+            None,
+            direct_installation_header=False,
+            create_client_metadata=False,
+        )
         return UpstreamRequest(
             url=ws_url,
             headers=headers,
             body=b"",
-            translator_ctx=translator_ctx,
+            translator_ctx=dict(req.translator_ctx or {}),
             dispatch_metadata=req.dispatch_metadata,
         )
 
@@ -3415,7 +3408,9 @@ def _pick_non_direct_proxy_name(ch: Channel, resolved_model: str) -> str | None:
     return None
 
 
-def _maybe_record_codex_ws_snapshot(ch: Channel, ws_response: Any) -> None:
+def _maybe_record_codex_ws_snapshot(
+    ch: Channel, ws_response: Any, translator_ctx: dict | None = None,
+) -> None:
     if not isinstance(ch, OpenAIOAuthChannel) or ws_response is None:
         return
     try:
@@ -3427,9 +3422,20 @@ def _maybe_record_codex_ws_snapshot(ch: Channel, ws_response: Any) -> None:
         # Reuse HTTP failover's response-header path so passive quota snapshot,
         # threshold auto-disable, and notification behavior stay identical.
         fake_resp = type("_WsResp", (), {"headers": headers})()
-        failover._maybe_record_codex_snapshot(ch, fake_resp)
+        failover._maybe_record_codex_snapshot(ch, fake_resp, translator_ctx)
     except Exception as exc:
-        print(f"[responses_ws] codex snapshot record failed for {getattr(ch, 'email', '?')}: {exc}")
+        print(f"[responses_ws] codex metadata record failed: {type(exc).__name__}")
+
+
+def _capture_codex_response_event(
+    ch: Channel | None, translator_ctx: dict | None, frame: str | bytes,
+) -> bool:
+    captured = capture_turn_state_event(translator_ctx, frame)
+    if isinstance(ch, OpenAIOAuthChannel):
+        oauth_manager.observe_openai_response_event(
+            ch.account_key, frame, translator_ctx,
+        )
+    return captured
 
 
 async def _finalize_ws_attempt_after_accept(
@@ -3560,11 +3566,11 @@ def _dump_frame(obj: dict) -> str:
     return dump_frame(obj)
 
 
-def _identity_expose_frame(data: str | bytes, state: ConfuseState) -> str | bytes:
+def _identity_expose_frame(data: str | bytes, state: ProtocolIdentityMap) -> str | bytes:
     return identity_expose_frame(data, state)
 
 
-def _identity_log_text(text: str, state: ConfuseState) -> str:
+def _identity_log_text(text: str, state: ProtocolIdentityMap) -> str:
     return identity_log_text(text, state)
 
 
@@ -3687,10 +3693,12 @@ async def _recv_until_first_visible_ws_event(
     channel_key: str,
     first_wait: float,
     *,
+    channel: Channel | None,
     deadline_ts: float,
     idle_timeout: int,
     result: _WsAttemptResult,
     proxy_bytes: _WsProxyBytes,
+    translator_ctx: Optional[dict],
     timing: WsAttemptTiming,
     round_timeouts: RoundTimeouts,
     timeout_label_seconds: float | int | None = None,
@@ -3709,6 +3717,9 @@ async def _recv_until_first_visible_ws_event(
         timeout_detail_mode="event",
         timeout_label_seconds=timeout_label_seconds if timeout_label_seconds is not None else first_wait,
         use_tracker_error_detail=True,
+        on_text_frame=lambda frame: _capture_codex_response_event(
+            channel, translator_ctx, frame,
+        ),
         timing=timing,
         round_timeouts=round_timeouts,
     )

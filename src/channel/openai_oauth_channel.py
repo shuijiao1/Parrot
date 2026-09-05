@@ -24,16 +24,18 @@ src.oauth.openai.parse_rate_limit_headers 解析头并落库（Commit 3）。
 
 from __future__ import annotations
 
-import hashlib
 import json
 from typing import Optional
 
 from .. import cache_hints, config, model_metadata, model_pricing, network, oauth_manager
 from ..providers import registry as provider_registry
 from ..openai import reasoning_replay
-from ..openai.codex_device_fingerprint import (
-    apply_device_fingerprint,
-    canonical_uuid4,
+from ..openai.codex_identity import (
+    account_identity_from_account,
+    acquire_request_turn_serialization,
+    normalize_account_identity,
+    project_snapshot,
+    resolve_request_identity_context,
 )
 from ..openai.transform import (
     anthropic_to_responses,
@@ -50,25 +52,17 @@ def _provider_cfg() -> dict:
     """读取 OpenAI OAuth 配置。
 
     新入口：config.openaiOAuth。
-    旧入口：config.oauth.providers.openai 继续兼容；加载旧配置时 config.py 会
-    自动把旧值补齐到 openaiOAuth。这里仍保留运行时 fallback，照顾单测/局部配置。
+    旧入口只在 config.py 读取原始配置时迁移到新入口。运行时始终读取已规范化
+    的新入口，避免用“值是否等于默认配置”猜测用户是否显式配置。
     """
     default = config.DEFAULT_CONFIG.get("openaiOAuth") or {}
     cfg = config.get()
-    legacy = (((cfg.get("oauth") or {}).get("providers") or {}).get("openai") or {})
     current = cfg.get("openaiOAuth") or {}
     default = default if isinstance(default, dict) else {}
-    legacy = legacy if isinstance(legacy, dict) else {}
     current = current if isinstance(current, dict) else {}
 
     merged = dict(default)
-    # 运行时兼容：如果调用方仍只改旧路径，且 openaiOAuth 还等于默认值，
-    # 旧路径生效；一旦用户显式改了新入口，则新入口优先。
-    if legacy and current == default:
-        source = legacy
-    else:
-        source = current
-    for key, value in source.items():
+    for key, value in current.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             nested = dict(merged.get(key) or {})
             nested.update(value)
@@ -78,32 +72,21 @@ def _provider_cfg() -> dict:
     return merged
 
 
-def _isolate_session_id(api_key_name: str, raw: str) -> str:
-    """把 api_key_name 混入 raw，防止不同 API Key 的会话粘性交叉污染。
+# ─── Codex profile contract ──────────────────────────────────────
 
-    使用带 API Key 身份前缀的原始会话锚点，
-    做 sha256 取前 16 hex 字符。我们用 sha256 而非 xxhash（无新依赖）。
-    """
-    if not raw:
-        return ""
-    material = f"k{api_key_name or '-'}:{raw}".encode("utf-8")
-    return hashlib.sha256(material).hexdigest()[:16]
-
-
-# ─── 常量 ────────────────────────────────────────────────────────
-
-CODEX_UPSTREAM_URL = "https://chatgpt.com/backend-api/codex/responses"
 from ..openai.codex_constants import (
-    CODEX_CLI_USER_AGENT,
-    CODEX_ORIGINATOR,
     CODEX_RESPONSES_LITE_HEADER,
     CODEX_ROUTING_HINT_HEADER,
+    CodexModelPolicy,
     build_codex_routing_hint,
     codex_cli_user_agent,
     codex_cli_version,
-    codex_model_uses_responses_lite,
+    codex_originator,
+    codex_protocol_profile,
+    codex_responses_url,
     codex_version_meets_minimum,
     normalize_codex_service_tier,
+    resolve_codex_model_policy,
 )
 
 _CODEX_UNSUPPORTED_STATEFUL_INPUT_TYPES = frozenset({
@@ -112,6 +95,55 @@ _CODEX_UNSUPPORTED_STATEFUL_INPUT_TYPES = frozenset({
     "mcp_call", "mcp_list_tools", "mcp_approval_request",
     "mcp_approval_response",
 })
+
+_CODEX_PROFILE_CONTROLLED_FIELDS = (
+    "max_output_tokens", "max_completion_tokens", "max_tokens",
+    "temperature", "top_p", "frequency_penalty", "presence_penalty",
+    "prompt_cache_retention",
+)
+
+
+def _apply_explicit_field_policies(
+    body: dict, ingress_protocol: str, prov_cfg: dict,
+) -> dict:
+    """Apply versioned request-field policy before translators rewrite controls."""
+    del ingress_protocol  # policies use the original request keys for every ingress.
+    # Field policies are candidate-local. Keep the original request (including
+    # its identity contexts and turn leases) owned by the HTTP/WS attempt.
+    out = dict(body)
+    policies = codex_protocol_profile(prov_cfg).request_field_policies
+    for field in _CODEX_PROFILE_CONTROLLED_FIELDS:
+        if field not in out:
+            continue
+        policy = policies.get(field)
+        if policy == "unsupported":
+            # Official Codex wire does not accept these client limits. Drop them
+            # so OpenAI/Anthropic clients keep working; do not 400 the request.
+            out.pop(field, None)
+            continue
+        if policy is None:
+            raise guard.GuardError(
+                400,
+                "unsupported_parameter",
+                f"{field} is not supported by the selected Codex protocol profile",
+                param=field,
+                scope="request",
+            )
+        if policy == "map:max_output_tokens":
+            if field != "max_output_tokens" and "max_output_tokens" not in out:
+                out["max_output_tokens"] = out[field]
+            if field != "max_output_tokens":
+                out.pop(field, None)
+        elif policy != "passthrough":
+            raise guard.GuardError(
+                400,
+                "invalid_request_error",
+                f"Invalid Codex profile policy for {field}",
+                param=field,
+                scope="request",
+            )
+    return out
+
 
 _CODEX_UNSUPPORTED_HOSTED_TOOL_TYPES = frozenset({
     "web_search_preview", "file_search", "computer_use_preview",
@@ -219,33 +251,28 @@ class OpenAIOAuthChannel(Channel):
             account.get("workspace_id") or account.get("chatgpt_account_id") or ""
         )
         self.plan_type = str(account.get("plan_type") or "")
-        device_enabled = account.get("codexDeviceConvergenceEnabled") is not False
+        prov_cfg = _provider_cfg()
+        profile = codex_protocol_profile(prov_cfg)
+        normalize_account_identity(account, protocol_profile=profile.profile_id)
+        self.codex_account_identity = account_identity_from_account(account, require=False)
         self.codex_device_installation_id = (
-            canonical_uuid4(account.get("codexDeviceInstallationId"))
-            if device_enabled else ""
+            self.codex_account_identity.installation_id
+            if self.codex_account_identity is not None else ""
         )
-        if self.codex_device_installation_id and not self.chatgpt_account_id:
-            raise ValueError(
-                "codexDeviceInstallationId requires a nonempty OpenAI workspace/chatgpt account ID"
-            )
 
-        # 账户 models 优先级：
-        #   1) 账户 entry 自带 models（TG 面板里手动填的）
-        #   2) 构造参数 default_models（registry 注入，向后兼容；当前为 None）
-        #   3) config.openaiOAuth.defaultModels（默认常用 codex 模型）
-        # 上游 codex endpoint 只认规范名，transform 把别名映射过去；所以这里
-        # 只要列出对外暴露的名字即可。
+        # Account catalog first, then an explicit caller/config fallback, then
+        # the selected versioned profile. There is no Python model-name fallback.
         models = account.get("models") or []
+        self._account_models = list(models)
+        configured_models = prov_cfg.get("defaultModels")
         if models:
             selected_models = list(models)
         elif default_models:
             selected_models = list(default_models)
+        elif isinstance(configured_models, list) and configured_models:
+            selected_models = list(configured_models)
         else:
-            selected_models = list(
-                _provider_cfg().get("defaultModels")
-                or (config.DEFAULT_CONFIG.get("openaiOAuth") or {}).get("defaultModels")
-                or []
-            )
+            selected_models = list(profile.models)
         disabled_models = {
             str(model).strip() for model in account.get("disabledModels") or []
             if str(model).strip()
@@ -262,21 +289,12 @@ class OpenAIOAuthChannel(Channel):
 
     # ─── 模型查询 ─────────────────────────────────────────────
 
-    # Codex 模型在不同 plan_type 下的可用性限制。来自上游 400 错误：
-    #   "The 'gpt-5.2-codex' model is not supported when using Codex with a ChatGPT account."
-    # Plus / Pro / Enterprise 的 ChatGPT 账号都算 "ChatGPT account"；只有 API
-    # 账号可以调老 codex 系列。这里硬过滤，避免 scheduler 选中后浪费重试。
-    _CHATGPT_UNSUPPORTED_MODELS = frozenset({"gpt-5.2-codex"})
-
     def supports_model(self, requested_model: str) -> Optional[str]:
         """OpenAI OAuth 账户里 models 列表直接是"真实名"列表（不做 alias 映射）。
 
         codex 规范化放在 build_upstream_request 的 transform 步骤里做。
         """
         if requested_model not in self.models:
-            return None
-        # ChatGPT 账号（plan_type 非空）不能调 _CHATGPT_UNSUPPORTED_MODELS 里的模型
-        if self.plan_type and requested_model in self._CHATGPT_UNSUPPORTED_MODELS:
             return None
         return requested_model
 
@@ -311,6 +329,41 @@ class OpenAIOAuthChannel(Channel):
         }
         return "advertised" if tier in advertised else "not_advertised"
 
+    def responses_lite_catalog_value(self, model: str) -> bool | None:
+        """Return the account catalog's explicit Lite flag, if it has one."""
+        record = self._account_model_records.get(str(model or "").strip())
+        if not isinstance(record, dict):
+            return None
+        value = record.get("useResponsesLite")
+        return value if isinstance(value, bool) else None
+
+    def codex_model_policy(
+        self,
+        model: str,
+        provider_config: dict | None = None,
+    ) -> CodexModelPolicy:
+        """Resolve account catalog fields before the selected data profile."""
+        record = self._account_model_records.get(str(model or "").strip())
+        return resolve_codex_model_policy(model, record, provider_config)
+
+    def model_uses_responses_lite(
+        self,
+        model: str,
+        provider_config: dict | None = None,
+    ) -> bool:
+        """Return explicit account/profile Lite policy; unknown models fail closed."""
+        return self.codex_model_policy(model, provider_config).use_responses_lite
+
+    def apply_request_field_policies(
+        self,
+        body: dict,
+        ingress_protocol: str,
+        provider_config: dict | None = None,
+    ) -> dict:
+        """Strip, map, or reject explicit controls before any Codex network dispatch."""
+        prov_cfg = provider_config if isinstance(provider_config, dict) else _provider_cfg()
+        return _apply_explicit_field_policies(body, ingress_protocol, prov_cfg)
+
     # ─── 请求构造 ─────────────────────────────────────────────
 
     async def build_upstream_request(
@@ -335,6 +388,9 @@ class OpenAIOAuthChannel(Channel):
         # One immutable provider-config snapshot keeps models/headers/UA coherent
         # even if a hot reload lands while this request is being constructed.
         prov_cfg = _provider_cfg()
+        protocol_body = self.apply_request_field_policies(
+            requested_body, ingress_protocol, prov_cfg,
+        )
 
         # Step A: 准备 Responses shape
         # OAuth HTTP SSE 上游被强制 store=false，不能让 previous_response_id
@@ -362,14 +418,14 @@ class OpenAIOAuthChannel(Channel):
         if ingress_protocol == "responses":
             payload = provider_registry.filter_request_payload(
                 self,
-                requested_body,
+                protocol_body,
                 protocol="openai-responses",
             )
             translator_ctx = None      # 同协议透传无需响应反向；replay scope 稍后会补进 ctx
         elif ingress_protocol == "chat":
             # chat ingress → responses 上游（同家族跨变体）
-            guard.guard_chat_to_responses(requested_body)
-            payload = chat_to_responses.translate_request(requested_body)
+            guard.guard_chat_to_responses(protocol_body)
+            payload = chat_to_responses.translate_request(protocol_body)
             # 下游 chat 是否显式要求 usage 末帧
             stream_opts = requested_body.get("stream_options") or {}
             include_usage = (
@@ -388,7 +444,7 @@ class OpenAIOAuthChannel(Channel):
             # endpoint 仍会被 apply_codex_oauth_transform 强制 stream=true，由
             # failover 的 upstream_stream_only 聚合路径再反向成 Anthropic message。
             payload = anthropic_to_responses.translate_request(
-                requested_body,
+                protocol_body,
                 target_model=resolved_model,
                 codex_oauth=True,
             )
@@ -406,12 +462,15 @@ class OpenAIOAuthChannel(Channel):
             payload,
             protocol="openai-responses",
         )
+        model_policy = self.codex_model_policy(resolved_model, prov_cfg)
         metadata = model_metadata.get_metadata(
             requested_body.get("model") or resolved_model,
             scope_key=self.key,
             outbound_model=resolved_model,
         )
-        efforts = metadata.get("reasoningEfforts")
+        efforts = list(model_policy.reasoning_efforts)
+        if not efforts:
+            efforts = metadata.get("reasoningEfforts")
         if not efforts:
             official = model_pricing.catalog_metadata(f"openai/{resolved_model}") or {}
             efforts = official.get("reasoningEfforts")
@@ -428,13 +487,6 @@ class OpenAIOAuthChannel(Channel):
                 "route this request to an OpenAI API channel."
             )
 
-        # Step B: Codex reasoning replay scope。必须在 codex transform 剥 metadata
-        # 等字段前计算 scope；没有 prompt_cache_key / metadata / Codex
-        # turn/window/session 锚点时不启用，避免跨会话串状态。
-        replay_scope = reasoning_replay.scope_from_payload(
-            resolved_model, payload, account_key=self.account_key,
-        )
-
         # Step B.5: Anthropic ingress 的 cache_control 在 Anthropic→Responses
         # translator 中会被剥离；在进入 Codex transform 前补 OpenAI/Codex 可用
         # 的 prompt_cache_key。放在 replay_scope 之后，避免改变既有 metadata
@@ -448,20 +500,97 @@ class OpenAIOAuthChannel(Channel):
                 client_ip=requested_body.get("_parrot_client_ip"),
             )
 
+        # Cross-protocol translators may create a controlled Responses field
+        # (for example prompt_cache_retention). Apply the same profile policy to
+        # the final shape so unsupported controls are stripped before dispatch.
+        payload = self.apply_request_field_policies(payload, "responses", prov_cfg)
+
+        # Resolve/refresh the final candidate before constructing any upstream
+        # identity. A workspace still unknown after refresh fails closed.
+        access_token = await oauth_manager.ensure_valid_token(self.account_key)
+        from .. import channel_state
+        current_account_key = self.account_key
+        resolved_channel_key = channel_state.resolve(self.key)
+        if resolved_channel_key.startswith("oauth:"):
+            current_account_key = resolved_channel_key[len("oauth:"):]
+        current_account = oauth_manager.get_account(current_account_key)
+        if current_account is None:
+            raise ValueError("OpenAI OAuth account disappeared before Codex dispatch")
+        normalize_account_identity(
+            current_account,
+            protocol_profile=codex_protocol_profile(prov_cfg).profile_id,
+        )
+        current_identity = account_identity_from_account(current_account)
+        if current_identity is None:
+            raise ValueError("OpenAI OAuth workspace/account identity is unavailable")
+        current_workspace_id = str(
+            current_account.get("workspace_id")
+            or current_account.get("chatgpt_account_id")
+            or ""
+        ).strip()
+        if not current_workspace_id:
+            raise ValueError(
+                "OpenAI OAuth workspace/account ID is unknown after token refresh"
+            )
+        self.chatgpt_account_id = current_workspace_id
+        self.workspace_id = current_workspace_id
+        self.codex_account_identity = current_identity
+        self.codex_device_installation_id = current_identity.installation_id
+
+        # Anthropic translation may have supplied a stable generated affinity key
+        # only on the translated payload. Keep it internal as an anchor source.
+        if payload.get("prompt_cache_key") and not requested_body.get("prompt_cache_key"):
+            requested_body.setdefault(
+                "_parrot_stable_anchor", str(payload.get("prompt_cache_key"))
+            )
+        identity_context = resolve_request_identity_context(current_account, requested_body)
+        if requested_body.get("_codex_turn_serialization_required") is True:
+            await acquire_request_turn_serialization(requested_body, identity_context)
+        identity_snapshot = identity_context.snapshot()
+        replay_scope = (
+            reasoning_replay.scope_from_payload(
+                resolved_model,
+                payload,
+                owner_digest=current_identity.owner_digest,
+                logical_session_id=identity_context.logical_session.session_id,
+            )
+            if identity_context.logical_session.durable
+            else None
+        )
+
         # Step C: codex 兼容改造（store=false 等硬约束）。带 encrypted_content 的
         # replay reasoning 只做透明透传，非法/陈旧 EC 由 failover 清 scope 后降级重试。
+        # The authenticated account catalog is authoritative field-by-field;
+        # absent fields come from the explicitly selected versioned profile.
+        responses_lite = model_policy.use_responses_lite
+        profile_instructions = model_policy.base_instructions
+        configured_default = prov_cfg.get("defaultInstructions")
+        base_instructions = profile_instructions
+        if base_instructions is None and isinstance(configured_default, str):
+            base_instructions = configured_default.strip() or None
+
+        # The downstream anchor is lookup-only. Codex receives only the durable
+        # account-scoped logical session UUIDv7 as its cache/thread context.
+        lite_thread_context = identity_snapshot.prompt_cache_key
+        payload["prompt_cache_key"] = identity_snapshot.prompt_cache_key
+
         payload = codex_oauth_transform.apply_codex_oauth_transform(
             payload,
             resolved_model=resolved_model,
-            default_instructions=prov_cfg.get("defaultInstructions"),
+            base_instructions=base_instructions,
+            default_reasoning_effort=model_policy.default_reasoning_effort,
+            default_verbosity=model_policy.default_verbosity,
+            supported_reasoning_efforts=model_policy.reasoning_efforts,
+            multi_agent_reasoning_effort=model_policy.multi_agent_reasoning_effort,
+            lite_thread_context=lite_thread_context,
             transport=responses_transport,
+            use_responses_lite=responses_lite,
+            request_field_policies=dict(
+                codex_protocol_profile(prov_cfg).request_field_policies
+            ),
         )
         model_id = str(payload.get("model") or resolved_model).strip()
-        model_record = self._account_model_records.get(model_id)
-        minimum_client_version = (
-            str(model_record.get("minimalClientVersion") or "").strip()
-            if isinstance(model_record, dict) else ""
-        )
+        minimum_client_version = model_policy.minimal_client_version or ""
         effective_client_version = codex_cli_version(prov_cfg)
         if (
             minimum_client_version
@@ -517,77 +646,29 @@ class OpenAIOAuthChannel(Channel):
             translator_ctx["codex_reasoning_replay"] = replay_scope
             translator_ctx["codex_reasoning_replay_injected"] = replay_injected
 
-        # Step E: 拿 access_token（会在此触发 refresh if 过期）。旧账号可能在
-        # 这次 refresh 中才首次取得 workspace，并由 oauth_manager 同事务生成设备
-        # UUID；当前 Channel 是 refresh 前的快照，因此必须重新读取已提交账户，
-        # 让第一条请求就使用新 workspace/device，而不是等下一次 registry 调度。
-        access_token = await oauth_manager.ensure_valid_token(self.account_key)
-        from .. import channel_state
-        current_account_key = self.account_key
-        resolved_channel_key = channel_state.resolve(self.key)
-        if resolved_channel_key.startswith("oauth:"):
-            current_account_key = resolved_channel_key[len("oauth:"):]
-        current_account = oauth_manager.get_account(current_account_key)
-        current_workspace_id = self.chatgpt_account_id
-        current_device_installation_id = self.codex_device_installation_id
-        if current_account is not None:
-            current_workspace_id = str(
-                current_account.get("workspace_id")
-                or current_account.get("chatgpt_account_id")
-                or ""
-            )
-            device_enabled = (
-                current_account.get("codexDeviceConvergenceEnabled") is not False
-            )
-            current_device_installation_id = (
-                canonical_uuid4(current_account.get("codexDeviceInstallationId"))
-                if device_enabled else ""
-            )
-            if current_device_installation_id and not current_workspace_id:
-                raise ValueError(
-                    "codexDeviceInstallationId requires a nonempty "
-                    "OpenAI workspace/chatgpt account ID"
-                )
-            # Deferred WS builders read the channel after this method returns.
-            # Refresh-derived identity must therefore update this live snapshot as
-            # well as the local HTTP variables, so the very first WS request is
-            # converged too.
-            self.chatgpt_account_id = current_workspace_id
-            self.workspace_id = current_workspace_id
-            self.codex_device_installation_id = current_device_installation_id
-
         headers = self._build_headers(access_token, provider_config=prov_cfg)
         if current_workspace_id:
             headers["chatgpt-account-id"] = current_workspace_id
-        if codex_model_uses_responses_lite(payload.get("model") or resolved_model):
+        if responses_lite and responses_transport == "http":
             headers[CODEX_RESPONSES_LITE_HEADER] = "true"
-        # session_id / conversation_id 隔离（可配置）：基于 prompt_cache_key
-        # 派生，避免同 OAuth 账户下不同下游 API Key 之间会话粘性碰撞。
-        if prov_cfg.get("isolateSessionId", True):
-            api_key_name = _request_api_key_name(requested_body)
-            prompt_cache_key = str(payload.get("prompt_cache_key") or "").strip()
-            if api_key_name and prompt_cache_key:
-                iso = _isolate_session_id(api_key_name, prompt_cache_key)
-                if iso:
-                    headers["session_id"] = iso
-                    # conversation_id deprecated by Codex — no longer sent.
-
-        # Delete deprecated conversation_id header if present.
-        headers.pop("conversation_id", None)
-
-        # Realtime calls _build_headers() directly, so installation identity is
-        # deliberately finalized here only for Codex Responses HTTP.  Applicability
-        # follows the final upstream transport, not the accepted ingress shape:
-        # responses, chat, and anthropic all reach the same HTTP endpoint here.
-        # WS paths defer until after their existing identity-confuse/session updates.
-        if (
-            current_device_installation_id
-            and not defer_device_fingerprint
-        ):
-            headers, payload = apply_device_fingerprint(
-                headers, payload, current_device_installation_id,
-                create_client_metadata=True,
-            )
+        # HTTP and WS use one authoritative immutable snapshot. Ordinary
+        # Responses carries installation identity in metadata, not a second direct
+        # header; compact/realtime endpoint profiles opt into that carrier.
+        headers, payload = project_snapshot(
+            identity_snapshot,
+            headers,
+            payload,
+            direct_installation_header=False,
+            create_client_metadata=True,
+        )
+        if translator_ctx is None:
+            translator_ctx = {
+                "ingress": ingress_protocol,
+                "upstream_protocol": "openai-responses",
+                "model_for_response": resolved_model,
+            }
+        translator_ctx["codex_identity_context"] = identity_context
+        translator_ctx["codex_identity_snapshot"] = identity_snapshot
 
         # Official Codex sends this on both HTTP requests and WebSocket
         # handshakes.  The WS bridge reuses these headers when it dials the
@@ -601,7 +682,7 @@ class OpenAIOAuthChannel(Channel):
             headers[CODEX_ROUTING_HINT_HEADER] = routing_hint
 
         return UpstreamRequest(
-            url=str(prov_cfg.get("codexUpstreamUrl") or CODEX_UPSTREAM_URL),
+            url=codex_responses_url(prov_cfg),
             headers=headers,
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
@@ -620,7 +701,9 @@ class OpenAIOAuthChannel(Channel):
 
     # ─── 主动探测：拉 Codex 用量 snapshot ────────────────────────
 
-    async def probe_usage(self, *, timeout_s: float = 20.0) -> dict:
+    async def probe_usage(
+        self, *, timeout_s: float = 20.0, explicit: bool = False,
+    ) -> dict:
         """主动发一条最小 codex 请求，读响应头更新 Codex 用量 snapshot。
 
         构造一条最小请求，只读取响应头中的用量快照，
@@ -639,6 +722,21 @@ class OpenAIOAuthChannel(Channel):
         # 延迟 import 以免循环依赖
         from .. import oauth_manager, state_db
         from ..oauth import openai as openai_provider
+
+        prov_cfg = _provider_cfg()
+        probe_cfg = (
+            prov_cfg.get("quotaProbe")
+            if isinstance(prov_cfg.get("quotaProbe"), dict)
+            else {}
+        )
+        if not explicit or probe_cfg.get("enabled") is not True:
+            return {
+                "ok": False,
+                "reason": (
+                    "active quota probe requires an explicit user action and "
+                    "openaiOAuth.quotaProbe.enabled=true"
+                ),
+            }
 
         # mockMode 短路：不发真实 HTTP，合成一组 snapshot 写库便于测试
         if oauth_manager.mock_mode_enabled():
@@ -659,10 +757,18 @@ class OpenAIOAuthChannel(Channel):
 
         # 构造最小探测请求体。走 build_upstream_request 能顺带用到 codex
         # transform（store=false / stream=true / 模型规范化 / instructions 兜底 / ...）
-        prov_cfg = _provider_cfg()
-        probe_cfg = prov_cfg.get("quotaProbe") if isinstance(prov_cfg.get("quotaProbe"), dict) else {}
-        fallback_model = str(probe_cfg.get("fallbackModel") or "gpt-5.2")
-        probe_model = self.models[0] if self.models else fallback_model
+        configured_probe_model = str(probe_cfg.get("model") or "").strip()
+        probe_model = configured_probe_model or (
+            str(self._account_models[0]).strip() if self._account_models else ""
+        )
+        if not probe_model:
+            return {
+                "ok": False,
+                "reason": (
+                    "active quota probe requires openaiOAuth.quotaProbe.model "
+                    "or a current account catalog model"
+                ),
+            }
         test_body = {
             "model": probe_model,
             "input": str(probe_cfg.get("input") or "1"),
@@ -736,7 +842,32 @@ class OpenAIOAuthChannel(Channel):
         OAuth channel identity.
         """
         access_token = await oauth_manager.ensure_valid_token(self.account_key)
-        headers = self._build_headers(access_token)
+        from .. import channel_state
+        resolved = channel_state.resolve(self.key)
+        account_key = resolved[len("oauth:"):] if resolved.startswith("oauth:") else self.account_key
+        account = oauth_manager.get_account(account_key)
+        if account is None:
+            raise ValueError("OpenAI OAuth account disappeared before realtime dispatch")
+        prov_cfg = _provider_cfg()
+        normalize_account_identity(
+            account, protocol_profile=codex_protocol_profile(prov_cfg).profile_id,
+        )
+        identity = account_identity_from_account(account)
+        if identity is None:
+            raise ValueError("OpenAI OAuth workspace/account identity is unavailable")
+        workspace_id = str(
+            account.get("workspace_id") or account.get("chatgpt_account_id") or ""
+        ).strip()
+        if not workspace_id:
+            raise ValueError("OpenAI OAuth workspace/account ID is unknown after token refresh")
+        self.chatgpt_account_id = workspace_id
+        self.workspace_id = workspace_id
+        self.codex_account_identity = identity
+        self.codex_device_installation_id = identity.installation_id
+        headers = self._build_headers(access_token, provider_config=prov_cfg)
+        # Realtime's endpoint profile uses the direct installation carrier and
+        # does not borrow Responses session/thread metadata.
+        headers["x-codex-installation-id"] = identity.installation_id
         # These are specific to the SSE Responses endpoint.  Realtime callers
         # supply their own content negotiation / beta headers where needed.
         for name in ("host", "accept", "content-type", "openai-beta"):
@@ -752,20 +883,15 @@ class OpenAIOAuthChannel(Channel):
         prov_cfg = provider_config if isinstance(provider_config, dict) else _provider_cfg()
         client_version = codex_cli_version(prov_cfg)
         headers = {
-            # Host 头：httpx 通常会按 URL 自动设置，这里显式兜底保险
-            "host": "chatgpt.com",
+            # Host is generated from the final URL by the HTTP/WS library.
             "authorization": f"Bearer {access_token}",
-            "openai-beta": "responses=experimental",
-            "originator": CODEX_ORIGINATOR,
+            "originator": codex_originator(prov_cfg),
             "version": client_version,
             "accept": "text/event-stream",
             "content-type": "application/json",
-            # x-client-request-id: set downstream by session/identity-confuse logic;
-            # not included here to avoid sending an empty value if nothing overwrites it.
+            # Request identity is projected after the final OAuth candidate is known.
         }
         if self.chatgpt_account_id:
             headers["chatgpt-account-id"] = self.chatgpt_account_id
-        # forceCodexCLI=True（默认）→ 强制伪装 UA；False 则不设，交给 httpx 默认
-        if prov_cfg.get("forceCodexCLI", True):
-            headers["user-agent"] = codex_cli_user_agent(prov_cfg)
+        headers["user-agent"] = codex_cli_user_agent(prov_cfg)
         return headers

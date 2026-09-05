@@ -539,30 +539,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "runtimeStatePath": "runtime-cache.json",
     "durableStatePath": "durable-state.json",
     # OpenAI OAuth/Codex 简化配置。旧版 oauth.providers.openai 仍兼容；加载旧配置时会自动补齐到这里。
+    # 默认跟随 codex_profiles/current.json 指向的已审核 profile，并把配套版本/profile
+    # 写回真实配置。需要人工固定旧版本时可显式设置 codexProfileAutoUpdate=false；
+    # 固定模式下版本/profile 缺失或不匹配会 fail closed。
     "openaiOAuth": {
-        # 所有 Codex models/HTTP/WS 指纹的唯一版本来源。未来官方提高
-        # minimal_client_version 时只需改配置，不需要修改 Parrot 源码。
-        "codexCliVersion": "0.144.0",
-        "forceCodexCLI": True,
-        "enableTLSFingerprint": False,
-        "isolateSessionId": True,
-        "defaultModels": [
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.4-mini",
-            "gpt-5.2",
-            "gpt-5.2-codex",
-            "gpt-5.3-codex",
-        ],
-        "codexUpstreamUrl": "https://chatgpt.com/backend-api/codex/responses",
-        "defaultInstructions": "You are a helpful coding assistant.",
+        "codexProfileAutoUpdate": True,
+        "codexIdentity": {
+            "mode": "per-oauth-account",
+            "newIdentityGenerationVersion": 1,
+        },
         "quotaProbe": {
+            "enabled": False,
             "input": "1",
             "instructions": "reply ok",
-            "fallbackModel": "gpt-5.2",
         },
     },
     # xAI / Grok OAuth 配置。默认值对齐当前 xAI CLI/Grok OAuth；
@@ -701,11 +690,12 @@ def _deep_merge_defaults(base: dict, override: dict) -> dict:
 
 
 def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
-    """把旧版 oauth.providers.openai 自动补齐到新版 openaiOAuth。
+    """Migrate OpenAI OAuth config and select the packaged current Codex profile.
 
-    新配置入口更短：openaiOAuth。为了兼容已经部署的旧 config.json，
-    当用户没有显式写 openaiOAuth 时，把旧层级的值复制过去并持久化。
-    旧层级保留读取兼容，不删除。
+    ``codexProfileAutoUpdate=true`` (the default) tracks the data-only
+    ``codex_profiles/current.json`` pointer.  This upgrades existing deployments
+    without embedding a release number in Python.  Operators may explicitly pin
+    a reviewed version/profile pair by setting the switch to ``false``.
     """
     raw = raw if isinstance(raw, dict) else {}
     legacy = (((cfg.get("oauth") or {}).get("providers") or {}).get("openai") or {})
@@ -713,32 +703,97 @@ def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
         legacy = {}
     current = cfg.get("openaiOAuth") if isinstance(cfg.get("openaiOAuth"), dict) else {}
     default = DEFAULT_CONFIG.get("openaiOAuth") if isinstance(DEFAULT_CONFIG.get("openaiOAuth"), dict) else {}
-    if isinstance(raw.get("openaiOAuth"), dict):
-        # 新入口已经存在：只做默认字段补齐，避免旧层级反向覆盖新配置。
+    if "openaiOAuth" in raw:
         merged = _deep_merge_defaults(default, current)
     elif legacy:
-        # 老配置升级：旧层级覆盖默认值，作为新版 openaiOAuth 初始值。
         merged = _deep_merge_defaults(default, legacy)
     else:
         merged = _deep_merge_defaults(default, current)
+
+    # These switches either bypassed mandatory Codex identity or advertised a
+    # transport fingerprint implementation that never existed.  Remove them from
+    # both accepted OpenAI config paths; xAI's isolateSessionId is unrelated.
+    obsolete_keys = (
+        "forceCodexCLI", "enableTLSFingerprint", "isolateSessionId",
+        "codexDeviceConvergenceEnabled",
+    )
+    changed = False
+    for obsolete in obsolete_keys:
+        merged.pop(obsolete, None)
+        if obsolete in legacy:
+            legacy.pop(obsolete, None)
+            changed = True
+    identity_cfg = merged.get("codexIdentity")
+    if isinstance(identity_cfg, dict):
+        identity_cfg.pop("protocolProfile", None)
+
+    auto_update = merged.get("codexProfileAutoUpdate", True)
+    if not isinstance(auto_update, bool):
+        raise ValueError("openaiOAuth.codexProfileAutoUpdate must be boolean")
+    if auto_update:
+        from .openai.codex_constants import current_codex_protocol_profile
+
+        selected = current_codex_protocol_profile()
+        merged["codexProtocolProfile"] = selected.profile_id
+        merged["codexCliVersion"] = selected.client_version
+
     if current != merged:
         cfg["openaiOAuth"] = merged
-        return True
-    return False
+        changed = True
+    return changed
+
+
+def _normalize_legacy_codex_catalogs(cfg: dict) -> bool:
+    """Preserve the wire policy of pre-profile, last-known-good model records.
+
+    Released configs did not persist useResponsesLite. The selected profile
+    supplies known policies; older catalog-only models retain standard Responses.
+    This is migration of saved records, not a fallback for newly discovered IDs.
+    """
+    from .openai.codex_constants import codex_protocol_profile
+
+    changed = False
+    for account in cfg.get("oauthAccounts") or []:
+        if not isinstance(account, dict):
+            continue
+        if str(account.get("provider") or account.get("type") or "").lower() != "openai":
+            continue
+        if account.get("codexIdentity") or account.get("last_model_sync_profile"):
+            continue
+        catalog = account.get("account_model_catalog")
+        records = catalog.get("models") if isinstance(catalog, dict) else None
+        if not isinstance(records, list):
+            continue
+        known_ids = set(account.get("models") or [])
+        for record in records:
+            if not isinstance(record, dict) or record.get("id") not in known_ids:
+                continue
+            if "useResponsesLite" in record:
+                continue
+            profile = codex_protocol_profile(cfg.get("openaiOAuth") or {})
+            policy = profile.model_policy(record["id"])
+            record["useResponsesLite"] = policy.use_responses_lite if policy else False
+            changed = True
+    return changed
 
 
 def _normalize_codex_device_accounts(cfg: dict) -> bool:
-    """Persist default-on installation IDs for eligible legacy OpenAI workspaces."""
-    from .openai.codex_device_fingerprint import normalize_account_device
+    """Migrate OpenAI workspaces to versioned, owner-bound Codex identities."""
+    from .openai.codex_identity import normalize_account_identities
 
-    changed = False
-    accounts = cfg.get("oauthAccounts") or []
-    if not isinstance(accounts, list):
+    provider_cfg = cfg.get("openaiOAuth") or {}
+    identity_cfg = provider_cfg.get("codexIdentity") or {}
+    profile = str(provider_cfg.get("codexProtocolProfile") or "").strip()
+    if not profile:
+        # Pinned invalid configs fail closed at Codex dispatch.  Identity
+        # normalization must not invent a release identifier of its own.
         return False
-    for account in accounts:
-        if isinstance(account, dict) and normalize_account_device(account):
-            changed = True
-    return changed
+    generation_version = identity_cfg.get("newIdentityGenerationVersion", 1)
+    return normalize_account_identities(
+        cfg.get("oauthAccounts") or [],
+        protocol_profile=profile,
+        new_identity_generation_version=generation_version,
+    )
 
 
 def _normalize_pricing_sources(cfg: dict) -> bool:
@@ -899,6 +954,7 @@ def _load_from_disk() -> dict:
     if not os.path.exists(CONFIG_PATH):
         initial = copy.deepcopy(DEFAULT_CONFIG)
         _normalize_management_config(initial, {})
+        _normalize_openai_oauth_config(initial)
         _write_atomic(initial)
         return initial
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -924,9 +980,12 @@ def _load_from_disk() -> dict:
     if _normalize_pricing_sources(merged):
         changed = True
         print("[config] migrated built-in pricing source from LiteLLM to models.dev")
+    if _normalize_legacy_codex_catalogs(merged):
+        changed = True
+        print("[config] preserved legacy Codex catalog wire policies")
     if _normalize_codex_device_accounts(merged):
         changed = True
-        print("[config] backfilled default-on Codex device installation identities")
+        print("[config] migrated versioned per-workspace Codex identities")
     if changed:
         if not management_changed:
             _write_atomic(merged)

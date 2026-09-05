@@ -132,9 +132,29 @@ python3 -m venv venv
 # 测试必须经隔离入口启动；用系统 python3 启动同一脚本也会自动切换到此 venv
 ./venv/bin/python src/tests/isolated_pytest.py src/tests -q
 
-# 编辑 config.json（首次启动会自动生成模板）
+# 编辑 config.json（首次启动会生成基础配置；OpenAI OAuth 默认跟随打包的当前 Codex profile）
 ./venv/bin/python server.py
 ```
+
+### Codex 协议 profile（OpenAI OAuth）
+
+Codex 的版本、User-Agent、端点、WS beta、模型能力和请求字段策略都来自 `src/openai/codex_profiles/`。Python 源码不保存会漂移的 CLI 版本或模型名单。`src/openai/codex_profiles/current.json` 是发布包的当前 profile 指针；默认 `codexProfileAutoUpdate=true`，升级 Parrot 后首次加载配置会自动把真实 `config.json` 的 `codexCliVersion` / `codexProtocolProfile` 迁移为该 profile 的配套值，既有 OAuth installation UUID 不会旋转。
+
+```json
+{
+  "openaiOAuth": {
+    "codexProfileAutoUpdate": true,
+    "codexCliVersion": "0.153.4",
+    "codexProtocolProfile": "rust-v0.153.4"
+  }
+}
+```
+
+需要固定已审核旧版时，将 `codexProfileAutoUpdate` 显式设为 `false`，并同时配置完全匹配的 `codexCliVersion` 和 `codexProtocolProfile`。缺失、空值、非法 SemVer、未知 profile 或版本不匹配时，Codex 模型目录、OAuth identity、HTTP 与 WebSocket 请求都会 fail closed。
+
+模型策略按“账户认证 `/models` 的显式字段 → 选中 profile 的同名模型记录”解析。两处都没有 `useResponsesLite` 时拒绝该 Codex 模型请求；`ultra` 也只有模型记录明确给出 supported levels 和 `multiAgentReasoningEffort` 时才映射。目录中的 `defaultReasoningEffort` / `defaultVerbosity` 优先于 profile，且只补调用方未提供的字段。模型 profile 的基础指令优先于用户可选的 `defaultInstructions`；下游显式 instructions、已成形的官方 Lite prefix 和 WebSocket incremental continuation 保持权威。profile 标记为 unsupported 的输出、采样或缓存参数会在发网前剥掉，不会把请求打回客户端；缺失策略仍 fail closed。
+
+模型目录请求携带同一 profile 的版本身份，并使用 ETag / 304；推理响应中的 `X-Models-Etag` 会触发去抖后的目录刷新，`openai-model` / `x-openai-model` 会作为实际模型观测头透传。
 
 ### 下游客户端接入
 
@@ -370,7 +390,7 @@ JSON 请求体：
 - 操作：刷新 Token / 刷新用量 / 清模型错误 / 清亲和绑定 / 启停 / 删除
 - Cursor「模型目录」每页紧凑展示 6 个 canonical 模型及上下文/推理能力，使用编号按钮进入单模型详情；原生变体只保留给内部自动映射，不再铺满列表。所有存在独立 Max Context 档位的模型默认开启，单模型开关按账号持久化关闭例外，下游显式 true/false 仍可逐请求覆盖。目录还支持按账号批量禁用模型；禁用项不会注册为该 Cursor 渠道的候选，也不会出现在该账号的负载均衡顺序或被调度使用，重新进入批量页取消选择即可恢复。
 - 底部批量：🔄 刷新全部用量 / 🧹 清除所有账户错误（有冷却才显示）
-- OpenAI OAuth 的 Codex `device-only` installation 收敛对已知 workspace 默认开启：升级启动及新账户写入会原子持久化随机 UUIDv4，同 workspace 重导入/刷新保持稳定；缺少 workspace 不参与。可用账户字段 `codexDeviceConvergenceEnabled: false` 显式退出（保留 UUID，重启用时复用）；无效 UUID 会阻止加载而不会静默换号。范围仍仅限 installation carriers，不启用 session/full。
+- OpenAI OAuth Codex 使用完整的 account/thread/turn/window 应用层身份生命周期：每个 canonical workspace 固定一个 UUIDv4 installation（versioned config + durable tombstone），每个 downstream principal+stable anchor 映射到 owner-scoped durable UUIDv7 logical session/thread；显式 native `turn_id` 的 HTTP/WS continuation 复用同一上游 UUIDv7 与 turn-state，新 turn 清空。相同 owner/thread 的上游 turn 细粒度串行，不同 thread 可并行；确认成功且 owner/session/model 匹配的 compaction response 以 durable CAS 推进 window，失败、retry 或普通 history 截断不推进。`response.created` 或可见输出后禁止跨账号重放。缺少 canonical workspace、profile 不匹配或身份冲突均 fail closed；不存在 `codexDeviceConvergenceEnabled` 退出开关。
 - 账户设置中的媒体入口明确拆分：
   - 「🖼 GPT 图片设置」管理 GPT/Codex 图片模型、缓存和图片专用账号禁用列表；
   - 「🎨 Grok Imagine」管理 xAI 图片/视频模型、视频任务绑定时长和媒体请求超时，并显示图片模型路由边界；
@@ -504,13 +524,12 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
     "openai-chat":      "gpt-5.4",
     "openai-responses": "gpt-5.4"
   },
-  "providers": {
-    "openai": {
-      "forceCodexCLI": true,
-      "enableTLSFingerprint": false,
-      "isolateSessionId": true,
-      "defaultModels": ["gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.5"]
-    }
+  "openaiOAuth": {
+    "codexProfileAutoUpdate": true,
+    "codexCliVersion": "0.153.4",
+    "codexProtocolProfile": "rust-v0.153.4",
+    "codexIdentity": { "mode": "per-oauth-account", "newIdentityGenerationVersion": 1 },
+    "quotaProbe": { "enabled": false, "input": "1", "instructions": "reply ok" }
   },
   "notifications": { "enabled": true, "events": { ... } },
   "channelSelection": "smart",
@@ -520,7 +539,7 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 }
 ```
 
-> `quotaMonitor.enabled` **默认关闭** —— 启用后每 N 秒拉一次每个 OAuth 账号的 usage（Claude 走 `/api/oauth/usage`，OpenAI 走 Codex 探测头），频繁请求可能被风控盯上。
+> `quotaMonitor.enabled` **默认关闭** —— 启用后每 N 秒拉一次每个 OAuth 账号的 usage（Claude 走 `/api/oauth/usage`，OpenAI 走 `wham/usage`）。`openaiOAuth.quotaProbe` 是另一个会实际调用模型的诊断入口，默认禁用，只有配置开启且调用方明确请求时才发网。
 
 > `apiKeys.*.allowImages` **默认关闭** —— 新建或历史 API Key 不会自动获得图片生成 / 编辑能力，必须在 TG「🔑 管理 API Key」里显式开启。
 
@@ -731,7 +750,7 @@ Parrot/
 该模型在所有启用渠道里都不存在。检查：
 - 模型名拼写
 - 渠道是否被禁用 / 配额禁用 / auth_error
-- 对 OpenAI OAuth：`gpt-5.2-codex` 对 ChatGPT 账号（Plus/Pro/Enterprise）不支持，会被自动剔除；这种情况返回 404
+- 对 OpenAI OAuth：以该账户最近一次认证 `/models` 目录及选中 Codex profile 为准；源码不维护会过期的型号黑名单
 
 ### 下游返回 403 `Model 'xxx' is not allowed for this API key`
 该 Key 设了模型白名单但请求模型不在里面。去 TG bot「🔑 管理 API Key」→ 编辑 Key 的允许模型。

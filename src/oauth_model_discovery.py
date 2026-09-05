@@ -8,16 +8,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 import time
 from typing import Any, Callable
+from urllib.parse import urlencode
 
-from . import network
+from . import config, network
 from .oauth import antigravity as antigravity_provider
 from .oauth import cursor as cursor_provider
 from .oauth import xai as xai_provider
 from .oauth_ids import openai_workspace_id
 from .openai.codex_constants import (
-    CODEX_ORIGINATOR,
-    build_codex_cli_user_agent,
-    codex_cli_version,
+    codex_models_url,
+    codex_protocol_profile,
 )
 
 _TIMEOUT = 20.0
@@ -41,6 +41,11 @@ class DiscoveryResult:
     models: list[str]
     catalog: dict[str, Any]
     source: str
+    # Exact client/profile identity used for this fetch, when the provider has one.
+    client_version: str = ""
+    profile_id: str = ""
+    etag: str = ""
+    not_modified: bool = False
 
 
 def _unique(values: list[Any]) -> list[str]:
@@ -67,6 +72,21 @@ def _positive(value: Any) -> int | None:
 def _strings(value: Any) -> list[str]:
     if isinstance(value, str): value = [value]
     return _unique(value) if isinstance(value, list) else []
+
+
+def _reasoning_efforts(value: Any) -> list[str]:
+    """Normalize old string arrays and current Codex ``{effort: ...}`` arrays."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    efforts: list[Any] = []
+    for item in value:
+        if isinstance(item, dict) and isinstance(item.get("effort"), str):
+            efforts.append(item["effort"])
+        elif isinstance(item, str):
+            efforts.append(item)
+    return _unique(efforts)
 
 
 def _service_tiers(value: Any) -> list[dict[str, str]]:
@@ -106,13 +126,18 @@ def _record(model_id: Any, raw: dict, mapping: dict[str, tuple[str, ...]]) -> di
             # Preserve an explicit empty list: for a successful authenticated
             # account catalog it means the model advertised no service tier.
             value = _service_tiers(value)
+        elif target == "reasoningEfforts":
+            value = _reasoning_efforts(value)
+            if not value: continue
         elif target in {
-            "inputModalities", "outputModalities", "reasoningEfforts", "aliases",
-            "additionalSpeedTiers",
+            "inputModalities", "outputModalities", "aliases", "additionalSpeedTiers",
         }:
             value = _strings(value)
             if not value: continue
-        elif target in {"reasoning", "supportsImages", "supportsThinking"}:
+        elif target in {
+            "reasoning", "supportsImages", "supportsThinking", "useResponsesLite",
+            "supportVerbosity", "supportsSearchTool",
+        }:
             if not isinstance(value, bool): continue
         elif isinstance(value, str):
             value = value.strip()
@@ -125,29 +150,51 @@ def _catalog(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {"schema": 1, "models": records}
 
 
+def _safe_etag(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or len(text) > 512 or "\r" in text or "\n" in text:
+        return ""
+    return text
+
+
 def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
     deadline = _Deadline(timeout)
     token = str(account.get("access_token") or "")
     if not token:
         raise ValueError("missing access token")
-    client_version = codex_cli_version()
-    url = (
-        "https://chatgpt.com/backend-api/codex/models"
-        f"?client_version={client_version}"
-    )
+    provider_cfg = config.get().get("openaiOAuth") or {}
+    profile = codex_protocol_profile(provider_cfg)
+    client_version = profile.client_version
+    url = f"{codex_models_url(provider_cfg)}?{urlencode({'client_version': client_version})}"
     headers = {
         "authorization": f"Bearer {token}",
         "accept": "application/json",
-        "user-agent": build_codex_cli_user_agent(client_version),
-        "originator": CODEX_ORIGINATOR,
-        "origin": "https://chatgpt.com",
+        "user-agent": profile.user_agent,
+        "originator": profile.originator,
+        "version": client_version,
     }
+    etag = ""
+    if (
+        str(account.get("models_etag_client_version") or "") == client_version
+        and str(account.get("models_etag_profile") or "") == profile.profile_id
+    ):
+        etag = _safe_etag(account.get("models_etag"))
+        if etag:
+            headers["If-None-Match"] = etag
     workspace = openai_workspace_id(account)
     if workspace:
         headers["ChatGPT-Account-ID"] = workspace
-    payload = _json_object(network.get_sync(
+    response = network.get_sync(
         url, headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_openai", proxy_channel=proxy_channel,
-    ))
+    )
+    response_headers = getattr(response, "headers", {}) or {}
+    response_etag = _safe_etag(response_headers.get("etag")) or etag
+    if getattr(response, "status_code", 200) == 304:
+        return DiscoveryResult(
+            [], {}, "upstream:codex:not-modified", client_version,
+            profile.profile_id, response_etag, True,
+        )
+    payload = _json_object(response)
     records = payload.get("models")
     if not isinstance(records, list):
         raise ValueError("Codex model catalog has invalid models schema")
@@ -183,8 +230,21 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
             "defaultServiceTier": ("default_service_tier", "defaultServiceTier"),
             "minimalClientVersion": ("minimal_client_version", "minimalClientVersion"),
             "additionalSpeedTiers": ("additional_speed_tiers", "additionalSpeedTiers"),
+            "useResponsesLite": ("use_responses_lite", "useResponsesLite"),
+            "supportVerbosity": ("support_verbosity", "supportVerbosity"),
+            "defaultVerbosity": ("default_verbosity", "defaultVerbosity"),
+            "toolMode": ("tool_mode", "toolMode"),
+            "shellType": ("shell_type", "shellType"),
+            "supportsSearchTool": ("supports_search_tool", "supportsSearchTool"),
+            "multiAgentVersion": ("multi_agent_version", "multiAgentVersion"),
+            "multiAgentReasoningEffort": (
+                "multi_agent_reasoning_effort", "multiAgentReasoningEffort",
+            ),
         }))
-    return DiscoveryResult(models, _catalog(normalized), "upstream:codex")
+    return DiscoveryResult(
+        models, _catalog(normalized), "upstream:codex", client_version,
+        profile.profile_id, response_etag, False,
+    )
 
 
 def discover_claude(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
