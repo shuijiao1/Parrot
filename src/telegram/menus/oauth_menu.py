@@ -6042,17 +6042,11 @@ def _commit_staged_openai_import(staged: dict, *, chat_id: int) -> dict:
         )
         if added.get("status") != "added":
             result["failed"].append((entry.get("email") or "?", "账户已并发出现，请重新导入确认")); continue
+        result["added"].append(entry.get("email") or "?")
+        result["model_sync_keys"].append(record["account_key"])
         _fetch_and_save_usage_sync(
             record["account_key"], chat_id=chat_id,
             email=entry.get("email") or "",
-        )
-        post_save = oauth_control.start_post_save_model_sync(
-            context, record["account_key"],
-        )
-        result["added"].append(entry.get("email") or "?")
-        result["model_sync_keys"].append(record["account_key"])
-        result.setdefault("model_sync_futures", []).append(
-            (record["account_key"], post_save.get("model_sync_future"))
         )
     for record in staged.get("duplicate") or []:
         entry = record["entry"]
@@ -6061,17 +6055,11 @@ def _commit_staged_openai_import(staged: dict, *, chat_id: int) -> dict:
         )
         if replacement.get("status") != "replaced":
             result["failed"].append((entry.get("email") or "?", "目标账户已变化，请重新导入确认")); continue
+        result["replaced"].append(entry.get("email") or "?")
+        result["model_sync_keys"].append(record["account_key"])
         _fetch_and_save_usage_sync(
             record["account_key"], chat_id=chat_id,
             email=entry.get("email") or "",
-        )
-        post_save = oauth_control.start_post_save_model_sync(
-            context, record["account_key"],
-        )
-        result["replaced"].append(entry.get("email") or "?")
-        result["model_sync_keys"].append(record["account_key"])
-        result.setdefault("model_sync_futures", []).append(
-            (record["account_key"], post_save.get("model_sync_future"))
         )
     return result
 
@@ -6086,11 +6074,20 @@ def _wait_import_model_sync(chat_id: int, message_id: int, result: dict) -> None
         f"🔄 <b>正在同步模型，请稍候…</b>\n\n类型: <code>OpenAI</code>\n"
         f"进度: <code>0 / {len(keys)}</code>（最多并发 3）",
     )
-    future_by_key = dict(result.get("model_sync_futures") or ())
-    futures = [future_by_key[key] for key in keys if future_by_key.get(key) is not None]
+    context = _management_context(chat_id)
+    futures = []
+    for key in keys:
+        post_save = oauth_control.start_post_save_model_sync(context, key)
+        future = post_save.get("model_sync_future")
+        if future is None:
+            launch_error = post_save.get("model_sync_error")
+            if isinstance(launch_error, BaseException):
+                raise launch_error
+            raise RuntimeError(str(launch_error or "model sync did not start"))
+        futures.append(future)
     done, pending = concurrent.futures.wait(
         futures, timeout=oauth_control.model_sync_foreground_timeout_seconds(),
-    ) if futures else (set(), set())
+    )
     success = failed = 0
     for future in done:
         try:
@@ -6101,7 +6098,6 @@ def _wait_import_model_sync(chat_id: int, message_id: int, result: dict) -> None
                 failed += 1
         except Exception:
             failed += 1
-    failed += len(keys) - len(futures)
     result["model_sync"] = {"success": success, "failed": failed, "background": len(pending)}
 
 

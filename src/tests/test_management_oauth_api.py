@@ -153,6 +153,10 @@ def test_oauth_openapi_matches_owned_manifest_and_declares_security_and_secrets(
             assert "writeOnly" not in schemas[schema]["properties"][field]
     assert "writeOnly" not in schemas["OAuthLoginFlowData"]["properties"]["flowId"]
     assert "writeOnly" not in schemas["OAuthImportPreviewData"]["properties"]["importId"]
+    import_encoding = schemas["PreviewOAuthImportRequest"]["properties"]["payloadEncoding"]
+    assert import_encoding["enum"] == ["json", "base64"]
+    assert import_encoding["default"] == "json"
+    assert schemas["PreviewOAuthImportRequest"]["properties"]["payload"]["maxLength"] == 2_000_000
     assert all(schema.get("additionalProperties") is False for schema in schemas.values() if schema.get("type") == "object")
     serialized = json.dumps({key: operations[key] for key in operations}, ensure_ascii=False)
     assert "access-secret-in-storage" not in serialized
