@@ -19,6 +19,7 @@ from src.management_auth import Capability
 from src.management_control.context import AuditSink, ManagementContext, audit_record
 from src.management_control.errors import ManagementError, ManagementErrorCode
 
+from ._log_errors import map_historical_log_errors
 from .common import PageResult, page_slice, require, revision_for
 
 
@@ -307,7 +308,8 @@ class StatsControl:
 
     def recent_calls(self, context: ManagementContext, *, page: int, page_size: int) -> PageResult[dict[str, Any]]:
         require(context)
-        rows, total = self.log_db.management_logs_page(page=page, page_size=page_size)
+        with map_historical_log_errors():
+            rows, total = self.log_db.management_logs_page(page=page, page_size=page_size)
         return PageResult(tuple(copy.deepcopy(row) for row in rows), page, page_size, total)
 
     def get_preferences(self, context: ManagementContext) -> dict[str, Any]:
