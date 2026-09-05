@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -62,13 +63,20 @@ class StoreAuditSink:
         self._store = store
 
     def record(self, record: AuditRecord) -> None:
-        self._store.record_audit(
-            actor=record.actor,
-            action=record.action,
-            target=record.target,
-            result=record.result,
-            request_id=record.request_id,
-        )
+        # Audit storage is ancillary: failure cannot undo a committed mutation
+        # or suppress its one-time secret response. Do not log record contents.
+        try:
+            self._store.record_audit(
+                actor=record.actor,
+                action=record.action,
+                target=record.target,
+                result=record.result,
+                request_id=record.request_id,
+            )
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Management audit write failed (%s)", type(exc).__name__,
+            )
 
 
 class BoundedAuditSink:

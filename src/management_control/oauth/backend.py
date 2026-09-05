@@ -34,6 +34,12 @@ _FAMILY_INGRESSES = {
 class OAuthBackend:
     """Small, patch-friendly wrapper over the repository's existing OAuth APIs."""
 
+    def __init__(self, *, settings_control=None) -> None:
+        if settings_control is None:
+            from ..system.settings import DEFAULT_SETTINGS_CONTROL
+            settings_control = DEFAULT_SETTINGS_CONTROL
+        self._settings_control = settings_control
+
     def config_snapshot(self) -> dict:
         return copy.deepcopy(config.get())
 
@@ -382,6 +388,15 @@ class OAuthBackend:
     def get_settings(self) -> tuple[bool, int, float, str]:
         return self._settings_from(config.get())
 
+    def _quota_mutator(self, quota_enabled, interval_seconds, threshold_percent):
+        return self._settings_control.quota_monitor_mutator({
+            key: value for key, value in (
+                ("enabled", quota_enabled),
+                ("intervalSeconds", interval_seconds),
+                ("thresholdPercent", threshold_percent),
+            ) if value is not None
+        })
+
     def update_settings_conditional(
         self,
         expected: tuple[bool, int, float, str],
@@ -392,18 +407,12 @@ class OAuthBackend:
         cch_mode: str | None = None,
     ) -> dict:
         result = {"status": "revision_conflict"}
+        mutate_quota = self._quota_mutator(quota_enabled, interval_seconds, threshold_percent)
 
         def mutate(cfg: dict) -> None:
             if self._settings_from(cfg) != expected:
                 return
-            quota = cfg.setdefault("quotaMonitor", {})
-            if quota_enabled is not None:
-                quota["enabled"] = bool(quota_enabled)
-            if interval_seconds is not None:
-                quota["intervalSeconds"] = int(interval_seconds)
-            if threshold_percent is not None:
-                quota["disableThresholdPercent"] = float(threshold_percent)
-                quota["resumeThresholdPercent"] = float(threshold_percent)
+            mutate_quota(cfg)
             if cch_mode is not None:
                 cfg["cchMode"] = cch_mode
             result["status"] = "updated"
@@ -419,15 +428,10 @@ class OAuthBackend:
         threshold_percent: float | None = None,
         cch_mode: str | None = None,
     ) -> None:
+        mutate_quota = self._quota_mutator(quota_enabled, interval_seconds, threshold_percent)
+
         def mutate(cfg: dict) -> None:
-            quota = cfg.setdefault("quotaMonitor", {})
-            if quota_enabled is not None:
-                quota["enabled"] = bool(quota_enabled)
-            if interval_seconds is not None:
-                quota["intervalSeconds"] = int(interval_seconds)
-            if threshold_percent is not None:
-                quota["disableThresholdPercent"] = float(threshold_percent)
-                quota["resumeThresholdPercent"] = float(threshold_percent)
+            mutate_quota(cfg)
             if cch_mode is not None:
                 cfg["cchMode"] = cch_mode
 

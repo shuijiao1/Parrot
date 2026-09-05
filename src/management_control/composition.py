@@ -20,7 +20,7 @@ from .context import AuditSink
 from .load_balancing import LoadBalancingControl
 from .mapping import MappingControl
 from .network import NetworkControl
-from .oauth import OAuthControl
+from .oauth import OAuthBackend, OAuthControl
 from .observability import (
     LogsControl,
     MediaControl,
@@ -88,11 +88,14 @@ def build_management_controls(
     )
     auxiliary.bind_operations(operations, operation_registry)
     retention = RetentionControl(audit_sink=audit_sink)
+    settings = SettingsControl(audit_sink=audit_sink)
     return ManagementControls(
         audit_sink=audit_sink,
         operations=operations,
         operation_registry=operation_registry,
-        oauth=OAuthControl(audit_sink=audit_sink),
+        oauth=OAuthControl(
+            backend=OAuthBackend(settings_control=settings), audit_sink=audit_sink,
+        ),
         channels=ChannelControl(
             operation_registry=operation_registry,
             operation_store=operations,
@@ -116,7 +119,7 @@ def build_management_controls(
             retention=retention,
         ),
         system=SystemNetworkControls(
-            settings=SettingsControl(audit_sink=audit_sink),
+            settings=settings,
             blacklist=ContentBlacklistControl(audit_sink=audit_sink),
             network=NetworkControl(
                 operations=operations,

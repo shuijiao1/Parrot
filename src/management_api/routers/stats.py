@@ -104,7 +104,7 @@ def get_stats_breakdown(
 
 
 @router.get(
-    "/stats/models/{modelId}", operation_id="getModelStats",
+    "/stats/models/{modelId:path}", operation_id="getModelStats",
     response_model=DataEnvelope[ModelStatsData], responses=_READ_ERRORS,
 )
 def get_model_stats(

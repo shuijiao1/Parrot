@@ -9,6 +9,7 @@ from concurrent.futures import Executor
 from datetime import datetime, timezone
 from typing import Callable, Iterable
 
+from src.model_pricing import TICKS_PER_USD
 from src.management_auth.policy import CapabilityDenied, authorize
 from src.management_auth.principal import AuthMethod, Capability
 from src.management_control.context import AuditSink, ManagementContext, audit_record
@@ -351,7 +352,7 @@ class OAuthControl(
                 request_count=int(stats.get("total") or 0),
                 input_tokens=int(stats.get("input") or 0),
                 output_tokens=int(stats.get("output") or 0),
-                cost_usd=float(stats["cost_usd"]) if stats.get("cost_usd") is not None else None,
+                cost_usd=(stats["cost_ticks"] / TICKS_PER_USD if stats.get("costed_success") else None),
             ),
             runtime_errors=tuple(runtime_errors),
             credential_configured=bool(account.get("refresh_token") or account.get("access_token")),

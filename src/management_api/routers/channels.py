@@ -5,8 +5,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from threading import RLock
 from typing import Annotated
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Body, Depends, Header, Path, Query, Request, Response, status
+from fastapi.routing import APIRoute
+from starlette.routing import Match
 
 from src.management_control import (
     ErrorField,
@@ -114,7 +117,25 @@ def _validate_query_parameters(request: Request) -> None:
         )
 
 
-router = APIRouter(dependencies=[Depends(_validate_query_parameters)])
+class ChannelResourceRoute(APIRoute):
+    def matches(self, scope):
+        # Match encoded IDs before ASGI decoding loses their segment boundary.
+        # A catch-all would confuse a channel named "a/compatibility" with the
+        # compatibility subresource of "a", or shadow that subresource entirely.
+        raw_path = scope.get("raw_path", b"")
+        if "channelId" in self.param_convertors and b"%2f" in raw_path.lower():
+            matched, child = super().matches({
+                **scope, "path": raw_path.decode("latin-1"),
+            })
+            if matched is not Match.NONE:
+                child["path_params"]["channelId"] = unquote(child["path_params"]["channelId"])
+                return matched, child
+        return super().matches(scope)
+
+
+router = APIRouter(
+    dependencies=[Depends(_validate_query_parameters)], route_class=ChannelResourceRoute,
+)
 
 _CHANNEL_EXAMPLE = {
     "id": "api:example-channel",

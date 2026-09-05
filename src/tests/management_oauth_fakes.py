@@ -358,7 +358,7 @@ class InMemoryOAuthBackend(OAuthBackend):
         self.quota[account_id] = dict(usage, email=email)
 
     def tokens_for_channel(self, channel_key, since):
-        return {"total": 3, "input": 100, "output": 20, "cost_usd": 0.01}
+        return {"total": 3, "input": 100, "output": 20, "cost_ticks": 100_000_000, "costed_success": 3}
 
     def cooldown_entries(self):
         return self.cooldowns

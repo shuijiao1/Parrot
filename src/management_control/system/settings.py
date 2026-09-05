@@ -423,8 +423,8 @@ class SettingsControl(DomainControl):
             if key in patch: self._integer(patch[key], key, 0)
         return self._update(context, "api-key-concurrency", patch, expected_revision, lambda cfg: cfg.setdefault("apiKeyConcurrency", {}).update(patch))
 
-    def update_quota_monitor(self, context, patch, *, expected_revision=None) -> QuotaMonitorSettings:
-        self._write(context, Capability.WRITE)
+    def quota_monitor_mutator(self, patch: Mapping[str, Any]) -> Callable[[dict[str, Any]], None]:
+        """One quota validator/mutation, also used by the atomic OAuth+CCH update."""
         self._keys(patch, {"enabled", "intervalSeconds", "thresholdPercent"})
         if "enabled" in patch: self._bool(patch["enabled"], "enabled")
         if "intervalSeconds" in patch: self._integer(patch["intervalSeconds"], "intervalSeconds", 10, 86400)
@@ -436,7 +436,14 @@ class SettingsControl(DomainControl):
             if "thresholdPercent" in patch:
                 target["disableThresholdPercent"] = patch["thresholdPercent"]
                 target["resumeThresholdPercent"] = patch["thresholdPercent"]
-        return self._update(context, "quota-monitor", patch, expected_revision, mutate)
+        return mutate
+
+    def update_quota_monitor(self, context, patch, *, expected_revision=None) -> QuotaMonitorSettings:
+        self._write(context, Capability.WRITE)
+        return self._update(
+            context, "quota-monitor", patch, expected_revision,
+            self.quota_monitor_mutator(patch),
+        )
 
     def update_notifications(self, context, patch, *, expected_revision=None) -> NotificationSettings:
         self._write(context, Capability.WRITE)
