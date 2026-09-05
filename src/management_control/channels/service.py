@@ -600,6 +600,7 @@ class ChannelControl:
         command: ChannelUpdateCommand,
         *,
         expected_revision: str | None = None,
+        telegram_compatibility: bool = False,
     ) -> ChannelMutationResult:
         self._authorize(context, Capability.WRITE)
         if command.api_key is not None:
@@ -612,11 +613,12 @@ class ChannelControl:
                 raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
             if expected_revision is not None and expected_revision != self._revision(current):
                 raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
-            validated_preset(
-                patch.get("providerId", current.get("providerId")),
-                patch.get("providerPresetId", current.get("providerPresetId")),
-                patch.get("protocol", current.get("protocol") or "anthropic"),
-            )
+            if not telegram_compatibility:
+                validated_preset(
+                    patch.get("providerId", current.get("providerId")),
+                    patch.get("providerPresetId", current.get("providerPresetId")),
+                    patch.get("protocol", current.get("protocol") or "anthropic"),
+                )
             try:
                 registry.update_api_channel(name, patch)
             except (KeyError, ValueError) as exc:
