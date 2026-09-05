@@ -508,7 +508,7 @@ class RetentionPlanCreate(StrictSchema):
 
 
 class RetentionPlanData(StrictSchema):
-    id: str
+    planId: str
     state: Literal["prepared", "committed", "cancelled"]
     days: int = Field(ge=1)
     cutoff: datetime
@@ -524,7 +524,7 @@ class RetentionPlanData(StrictSchema):
     revision: str
     operationId: str | None = None
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
-        "id": "plan_example", "state": "prepared", "days": 30,
+        "planId": "plan_example", "state": "prepared", "days": 30,
         "cutoff": "2026-01-02T03:04:05Z", "expiresAt": "2026-01-02T03:14:05Z",
         "affectedRows": 10, "affectedFiles": 1, "affectedBytes": 2048,
         "scannedRows": 100, "scannedFiles": 2, "scannedBytes": 4096,

@@ -869,6 +869,121 @@ def retention_policy(cfg: dict | None = None) -> dict[str, Any]:
     return {"mode": _RETENTION_MODE_DAYS, "days": days}
 
 
+def update_retention_settings(
+    *,
+    mode: str | None = None,
+    days: Any = None,
+    log_store_bodies: bool | None = None,
+    expected_policy: dict[str, Any] | None = None,
+    expected_log_store_bodies: bool | None = None,
+) -> dict[str, Any]:
+    """Atomically persist a safe retention-policy/body-storage patch.
+
+    The retention lock serializes this mutation with plan application.  Both
+    fields are applied to one ``config.update`` candidate so a persistence
+    failure cannot publish either half.  Destructive policy transitions remain
+    exclusive to ``plan_retention`` / ``apply_retention_plan``.
+    """
+
+    if mode not in {None, _RETENTION_MODE_FOREVER, _RETENTION_MODE_DAYS}:
+        raise RetentionPlanError("日志留存模式无效")
+    if mode == _RETENTION_MODE_FOREVER and days is not None:
+        raise RetentionPlanError("永久保留模式不能设置保留天数")
+    target_days = _require_retention_days(days) if mode == _RETENTION_MODE_DAYS else None
+    if log_store_bodies is not None and not isinstance(log_store_bodies, bool):
+        raise RetentionPlanError("日志正文保存设置必须是布尔值")
+
+    if not _retention_lock.acquire(blocking=False):
+        return {"ok": False, "error": "busy", "reason": "已有日志留存清理正在执行，请完成后再修改。"}
+    try:
+        before = config.get()
+        before_policy = retention_policy(before)
+        before_bodies = before.get("logStoreBodies", True) is not False
+        if expected_policy is not None:
+            normalized_expected = retention_policy({"logRetention": expected_policy})
+            if normalized_expected != before_policy:
+                return {
+                    "ok": False,
+                    "error": "revision_conflict",
+                    "reason": "日志留存设置在保存前已被修改",
+                }
+        if expected_log_store_bodies is not None and bool(expected_log_store_bodies) != before_bodies:
+            return {
+                "ok": False,
+                "error": "revision_conflict",
+                "reason": "日志正文保存设置在保存前已被修改",
+            }
+
+        target_policy = before_policy if mode is None else {
+            "mode": mode,
+            "days": target_days if mode == _RETENTION_MODE_DAYS else None,
+        }
+        dangerous = (
+            before_policy["mode"] == _RETENTION_MODE_FOREVER
+            and target_policy["mode"] == _RETENTION_MODE_DAYS
+        ) or (
+            before_policy["mode"] == _RETENTION_MODE_DAYS
+            and target_policy["mode"] == _RETENTION_MODE_DAYS
+            and int(target_policy["days"]) < int(before_policy["days"])
+        )
+        if dangerous:
+            return {
+                "ok": False,
+                "error": "plan_required",
+                "reason": "缩短日志留存期必须先扫描并确认清理计划",
+            }
+
+        target_bodies = before_bodies if log_store_bodies is None else log_store_bodies
+        policy_changed = target_policy != before_policy
+        bodies_changed = target_bodies != before_bodies
+        if not policy_changed and not bodies_changed:
+            return {
+                "ok": True,
+                "changed": False,
+                "policy": before_policy,
+                "log_store_bodies": before_bodies,
+            }
+
+        stale = False
+
+        def mutate(candidate: dict[str, Any]) -> None:
+            nonlocal stale
+            live_policy = retention_policy(candidate)
+            live_bodies = candidate.get("logStoreBodies", True) is not False
+            if live_policy != before_policy or live_bodies != before_bodies:
+                stale = True
+                raise RetentionPlanError("日志留存设置在保存前已被修改")
+            if policy_changed:
+                candidate["logRetention"] = dict(target_policy)
+            if bodies_changed:
+                candidate["logStoreBodies"] = target_bodies
+
+        try:
+            saved = config.update(mutate)
+        except RetentionPlanError as exc:
+            if stale:
+                return {"ok": False, "error": "revision_conflict", "reason": str(exc)}
+            return {"ok": False, "error": "persist_failed", "reason": f"保存日志留存设置失败：{exc}"}
+        except Exception as exc:
+            return {"ok": False, "error": "persist_failed", "reason": f"保存日志留存设置失败：{exc}"}
+
+        if policy_changed:
+            if target_policy["mode"] == _RETENTION_MODE_FOREVER:
+                global _last_retention_cleanup_key
+                with _retention_auto_lock:
+                    _last_retention_cleanup_key = None
+            else:
+                _mark_retention_cleanup(int(target_policy["days"]), time.time())
+        return {
+            "ok": True,
+            "changed": True,
+            "policy": retention_policy(saved),
+            "log_store_bodies": saved.get("logStoreBodies", True) is not False,
+        }
+    finally:
+        _retention_lock.release()
+
+
 def set_retention_forever() -> dict[str, Any]:
     """关闭自动留存清理（不删除现有日志）。"""
 
