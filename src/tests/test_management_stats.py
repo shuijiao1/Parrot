@@ -68,6 +68,9 @@ class FakeLogDb:
     def recent_logs(self, limit, offset=0):
         return [{"request_id": "r", "status": "success"}][offset:offset + limit]
 
+    def management_logs_page(self, *, page=1, page_size=50):
+        return self.recent_logs(page_size, offset=(page - 1) * page_size), self.recent_logs_count()
+
     def request_totals_by_apikey(self):
         return {"key": 3}
 

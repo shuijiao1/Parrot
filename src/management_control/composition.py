@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from src.management_auth import ManagementStateStore
+
 from .apikey import ApiKeyControl
 from .auxiliary import (
     AuxiliaryControls,
@@ -73,6 +75,7 @@ def build_management_controls(
     audit_sink: AuditSink,
     operations: OperationStore,
     operation_registry: OperationRegistry,
+    state_store: ManagementStateStore,
 ) -> ManagementControls:
     """Construct and fully bind one lifecycle's production Control graph."""
 
@@ -94,7 +97,7 @@ def build_management_controls(
             operation_store=operations,
             audit_sink=audit_sink,
         ),
-        api_keys=ApiKeyControl(audit_sink=audit_sink),
+        api_keys=ApiKeyControl(audit_sink=audit_sink, provenance_store=state_store),
         mapping=MappingControl(
             audit_sink=audit_sink,
             operation_store=operations,

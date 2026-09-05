@@ -268,6 +268,9 @@ class LogDbAuthority:
             "credential": "recent-call-secret",
         }]
 
+    def management_logs_page(self, *, page=1, page_size=50):
+        return self.recent_logs(page_size, offset=(page - 1) * page_size), self.recent_logs_count()
+
     def cleanup(self):
         self.authority.mutation("log_db.cleanup")
 

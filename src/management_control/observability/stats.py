@@ -307,8 +307,7 @@ class StatsControl:
 
     def recent_calls(self, context: ManagementContext, *, page: int, page_size: int) -> PageResult[dict[str, Any]]:
         require(context)
-        total = int(self.log_db.recent_logs_count())
-        rows = self.log_db.recent_logs(page_size, offset=(page - 1) * page_size)
+        rows, total = self.log_db.management_logs_page(page=page, page_size=page_size)
         return PageResult(tuple(copy.deepcopy(row) for row in rows), page, page_size, total)
 
     def get_preferences(self, context: ManagementContext) -> dict[str, Any]:

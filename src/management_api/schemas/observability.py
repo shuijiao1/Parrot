@@ -436,12 +436,14 @@ class LogBodyKindCountData(StrictSchema):
 
 
 class LogBodyPagedResponseMeta(PagedResponseMeta):
+    revision: str
     kindCounts: list[LogBodyKindCountData] = Field(
         description="Counts after search and before itemKind filtering and page slicing",
     )
 
 
 class LogBodyItemData(StrictSchema):
+    revision: str
     id: str | None = None
     seq: int = Field(ge=1)
     kind: str
@@ -454,6 +456,7 @@ class LogBodyItemData(StrictSchema):
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "id": "item_1", "seq": 1, "kind": "user", "title": "user",
         "summary": "input", "text": "hello", "raw": "hello", "size": 5, "meta": {},
+        "revision": "rev_example",
     }]})
 
 
@@ -463,11 +466,13 @@ class LogBodyPagedEnvelope(StrictSchema):
 
 
 class RawLogBodyData(StrictSchema):
+    revision: str
     logId: str
     kind: Literal["request", "response"]
     body: JsonValue
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{
         "logId": "request-example", "kind": "request", "body": {"model": "example"},
+        "revision": "rev_example",
     }]})
 
 

@@ -85,6 +85,7 @@ class LogBodyPageResult:
     page_size: int
     total: int
     kind_counts: tuple[dict[str, Any], ...]
+    revision: str
 
     @property
     def has_next(self) -> bool:
@@ -234,7 +235,7 @@ class LogsControl:
         require(context)
         return copy.deepcopy(self.log_db.log_detail(log_id))
 
-    def _raw_body(self, context: ManagementContext, log_id: str, kind: LogBodyKind) -> Any:
+    def _body_snapshot(self, context: ManagementContext, log_id: str, kind: LogBodyKind) -> tuple[Any, str]:
         require(context, Capability.LOG_BODY_READ)
         raw = self.log_db.management_log_detail(log_id)
         if not raw or not raw.get("log"):
@@ -243,7 +244,17 @@ class LogsControl:
         value = detail.get("request_body" if kind is LogBodyKind.REQUEST else "response_body")
         if value is None or value == "":
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
-        return value
+        return value, self._list_record(raw["log"])["revision"]
+
+    @staticmethod
+    def _body_item_record(item: dict, log_id: str, kind: LogBodyKind, source_revision: str) -> dict:
+        result = camelize(item)
+        result["id"] = f"item_{int(result.get('seq') or 0)}"
+        result["revision"] = revision_for({
+            "logId": log_id, "kind": kind.value,
+            "itemId": result["id"], "sourceRevision": source_revision,
+        })
+        return result
 
     @staticmethod
     def _raw_business_body(value: Any) -> Any:
@@ -269,7 +280,7 @@ class LogsControl:
         page: int,
         page_size: int,
     ) -> LogBodyPageResult:
-        raw = self._raw_body(context, log_id, kind)
+        raw, source_revision = self._body_snapshot(context, log_id, kind)
         parser = (
             inspector.parse_request_body
             if kind is LogBodyKind.REQUEST else inspector.parse_response_body
@@ -285,11 +296,15 @@ class LogsControl:
         items = inspector.sort_items(items, sort.value)
         result = page_slice(items, page=page, page_size=page_size)
         return LogBodyPageResult(
-            tuple(camelize(item) for item in result.items),
+            tuple(self._body_item_record(item, log_id, kind, source_revision) for item in result.items),
             page,
             page_size,
             result.total,
             tuple({"kind": key, "count": counts[key]} for key in sorted(counts)),
+            revision_for({
+                "logId": log_id, "kind": kind.value, "sourceRevision": source_revision,
+                "query": query, "sort": sort.value, "itemKind": item_kind,
+            }),
         )
 
     def body_item(
@@ -300,7 +315,7 @@ class LogsControl:
         kind: LogBodyKind,
         item_id: str,
     ) -> dict[str, Any]:
-        raw = self._raw_body(context, log_id, kind)
+        raw, source_revision = self._body_snapshot(context, log_id, kind)
         parser = (
             inspector.parse_request_body
             if kind is LogBodyKind.REQUEST else inspector.parse_response_body
@@ -312,14 +327,17 @@ class LogsControl:
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         for item in items:
             if int(item.get("seq") or 0) == seq:
-                result = camelize(item)
-                result["id"] = f"item_{seq}"
-                return result
+                return self._body_item_record(item, log_id, kind, source_revision)
         raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
 
     def raw_body(self, context: ManagementContext, log_id: str, *, kind: LogBodyKind) -> dict[str, Any]:
-        raw = self._raw_body(context, log_id, kind)
-        return {"logId": log_id, "kind": kind.value, "body": self._raw_business_body(raw)}
+        raw, source_revision = self._body_snapshot(context, log_id, kind)
+        return {
+            "logId": log_id, "kind": kind.value, "body": self._raw_business_body(raw),
+            "revision": revision_for({
+                "logId": log_id, "kind": kind.value, "sourceRevision": source_revision,
+            }),
+        }
 
     def log_store_bodies(self, context: ManagementContext) -> bool:
         require(context)
