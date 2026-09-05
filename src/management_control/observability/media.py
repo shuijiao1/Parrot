@@ -99,7 +99,7 @@ class MediaControl:
     @staticmethod
     def _record(row: dict[str, Any]) -> dict[str, Any]:
         clean = sanitize_credentials(dict(row))
-        return {
+        result = {
             "id": str(clean.get("id") or ""),
             "requestId": str(clean.get("request_id") or ""),
             "status": str(clean.get("status") or "pending"),
@@ -117,8 +117,11 @@ class MediaControl:
             "createdAt": utc_datetime(clean.get("created_at")),
             "finishedAt": utc_datetime(clean.get("finished_at")),
             "error": clean.get("error_message"),
-            "revision": revision_for(clean),
         }
+        # Resource revisions are derived only from fields the public DTO emits;
+        # hidden DB columns (including credentials) cannot perturb the token.
+        result["revision"] = revision_for(result)
+        return result
 
     @staticmethod
     def _matches(row: dict[str, Any], query: MediaLogQuery) -> bool:
@@ -240,6 +243,7 @@ class MediaControl:
         clean = sanitize_credentials(dict(row))
         paths = self._paths(row)
         result = self._record(clean)
+        result.pop("revision", None)
         result.update({
             # ``account_key`` is the media DB's account identifier, not a credential;
             # sanitize its free-text value without treating the storage column name
@@ -267,14 +271,16 @@ class MediaControl:
         out = []
         for index, path in enumerate(self._paths(row), 1):
             content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
-            out.append({
+            artifact = {
                 "id": self._artifact_id(index, path),
                 "fileName": os.path.basename(path),
                 "contentType": content_type,
                 "sizeBytes": os.path.getsize(path),
                 "mediaType": "video" if content_type.startswith("video/") else "image",
                 "expiresAt": utc_datetime(row.get("expires_at")),
-            })
+            }
+            artifact["revision"] = revision_for(artifact)
+            out.append(artifact)
         return out
 
     def download(self, context: ManagementContext, media_log_id: str, artifact_id: str) -> ArtifactDownload:

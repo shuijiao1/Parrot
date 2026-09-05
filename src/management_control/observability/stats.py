@@ -136,14 +136,17 @@ class StatsControl:
             str(name): copy.deepcopy((value.get("overall") if isinstance(value, dict) else {}) or {})
             for name, value in raw_families.items()
         } if isinstance(raw_families, dict) else {}
-        return {
+        data = {
             "period": StatsPeriod(period).value,
             "overall": self._normalize_metrics(overall),
             "families": {
                 name: self._normalize_metrics(metrics) for name, metrics in families.items()
             },
-            "revision": revision_for({"period": StatsPeriod(period).value, "snapshot": snapshot}),
         }
+        # Hash exactly the non-secret public representation.  Hidden aggregate
+        # columns and internal timestamps must not perturb a client revision.
+        data["revision"] = revision_for(data)
+        return data
 
     @staticmethod
     def _normalize_metrics(raw: Any) -> dict[str, Any]:
@@ -262,9 +265,13 @@ class StatsControl:
             reverse=query.descending,
         )
         result = page_slice(items, page=query.page, page_size=query.page_size)
+        public_items = []
+        for item in result.items:
+            public = {"key": item["key"], "metrics": item["metrics"]}
+            public["revision"] = revision_for(public)
+            public_items.append(public)
         return PageResult(
-            tuple({"key": item["key"], "metrics": item["metrics"]} for item in result.items),
-            result.page, result.page_size, result.total,
+            tuple(public_items), result.page, result.page_size, result.total,
         )
 
     def model_stats(self, context: ManagementContext, model_id: str, period: StatsPeriod | str) -> dict[str, Any]:
@@ -289,13 +296,14 @@ class StatsControl:
                 "type": str(row.get("type") or "") or None,
                 "upstreamProtocol": str(row.get("upstream_protocol") or "") or None,
             })
-        return {
+        data = {
             "modelId": model_id,
             "period": StatsPeriod(period).value,
             "metrics": self._normalize_metrics(metrics),
             "channels": channel_rows,
-            "revision": revision_for({"model": model_id, "period": StatsPeriod(period).value, "metrics": metrics}),
         }
+        data["revision"] = revision_for(data)
+        return data
 
     def recent_calls(self, context: ManagementContext, *, page: int, page_size: int) -> PageResult[dict[str, Any]]:
         require(context)
