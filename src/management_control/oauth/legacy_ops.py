@@ -7,6 +7,9 @@ error rendering while the typed HTTP use cases use higher-level methods.
 
 from __future__ import annotations
 
+from src.management_auth.principal import Capability
+from src.management_control.context import ManagementContext
+
 
 class OAuthLegacyOperationsControlMixin:
     def start_account_model_refresh(self, account_id: str):
@@ -20,6 +23,20 @@ class OAuthLegacyOperationsControlMixin:
 
     async def refresh_account_models_raw(self, account_id: str) -> dict:
         return await self.backend.refresh_account_models(account_id)
+
+    async def refresh_account_models_for_telegram(
+        self, context: ManagementContext, account_id: str,
+    ) -> dict:
+        """Preserve the TG async renderer while authorizing and auditing its actor."""
+        self._require(context, Capability.WRITE)
+        self._legacy_account(account_id)
+        try:
+            result = await self.backend.refresh_account_models(account_id)
+        except BaseException:
+            self._audit(context, "oauth.models.sync", account_id, "failed")
+            raise
+        self._audit(context, "oauth.models.sync", account_id)
+        return result
 
     async def fetch_usage_raw(self, account_id: str) -> dict:
         return await self.backend.fetch_usage(account_id)

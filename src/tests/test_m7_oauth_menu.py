@@ -1274,7 +1274,7 @@ def test_openai_reset_credit_count_display_in_list_and_detail(m):
     rec = _install_recorder(m)
     zero_short_click = m["ui"].register_code(ak_zero_click)
     original_fetch_and_save = m["oauth_menu"]._fetch_and_save_usage_sync
-    def _zero_usage(_ak, *, email=None):
+    def _zero_usage(_ak, *, chat_id, email=None):
         return {
             "five_hour": {"utilization": 1.0, "resets_at": None},
             "seven_day": {"utilization": 2.0, "resets_at": None},
@@ -1347,7 +1347,7 @@ def test_openai_usage_refresh_saves_reset_card_details_in_quota_cache(m):
     om.fetch_openai_rate_limit_reset_credits = fake_details
     try:
         result = m["oauth_menu"]._fetch_and_save_usage_result_sync(
-            ak, email="refresh-cards@x.com",
+            ak, chat_id=42, email="refresh-cards@x.com",
         )
     finally:
         om.fetch_usage = original_usage

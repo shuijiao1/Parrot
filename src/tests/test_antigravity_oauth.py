@@ -680,7 +680,7 @@ def test_antigravity_defaults_menu_family(m):
     static = odm._static_models("antigravity")
     assert "claude-sonnet-4-6" in static
     assert "gpt-oss-120b-medium" in static
-    odm._write_list("antigravity", ["gemini-3.7-flash-high"])
+    odm._write_list(42, "antigravity", ["gemini-3.7-flash-high"])
     assert odm._read_list("antigravity") == ["gemini-3.7-flash-high"]
 
 
