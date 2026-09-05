@@ -49,7 +49,8 @@ class SessionSummary(StrictSchema):
 
 class SessionCredentialData(StrictSchema):
     credential: str = Field(
-        json_schema_extra={"writeOnly": True, "examples": ["<one-time-credential>"]}
+        description="One-time session credential returned only by the exchange response",
+        examples=["<one-time-credential>"],
     )
     session: SessionSummary
 
@@ -65,7 +66,8 @@ class TelegramApprovalCreateRequest(StrictSchema):
 class TelegramApprovalCreatedData(StrictSchema):
     approvalId: str
     exchangeSecret: str = Field(
-        json_schema_extra={"writeOnly": True, "examples": ["<write-only>"]}
+        description="One-time challenge secret returned only by the create response",
+        examples=["<one-time-exchange-secret>"],
     )
     expiresAt: datetime
     pollAfterSeconds: int = Field(ge=1, le=30)

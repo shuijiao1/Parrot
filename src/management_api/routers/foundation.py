@@ -26,6 +26,7 @@ from ..dependencies import (
     management_request_id,
     require_capability,
 )
+from ..discovery import build_discovery_snapshot, supported_capabilities
 from ..error_mapping import management_error_responses
 from ..response_helpers import response_meta as _meta
 from ..schemas import (
@@ -41,7 +42,6 @@ from ..schemas import (
     TelegramApprovalCreatedData,
     TelegramApprovalStatusData,
 )
-from ..schemas.metadata import CapabilityDomain, EnumDescriptor
 
 
 router = APIRouter()
@@ -81,7 +81,7 @@ _SESSION_EXAMPLE = {
 }
 _SESSION_CREATED_EXAMPLE = {
     "data": {
-        "credential": "<one-time-write-only>",
+        "credential": "<one-time-credential>",
         "session": _SESSION_EXAMPLE["data"],
     },
     "meta": {"requestId": "request-example"},
@@ -89,7 +89,7 @@ _SESSION_CREATED_EXAMPLE = {
 _APPROVAL_CREATED_EXAMPLE = {
     "data": {
         "approvalId": "approval-example",
-        "exchangeSecret": "<one-time-write-only>",
+        "exchangeSecret": "<one-time-exchange-secret>",
         "expiresAt": "2026-01-02T03:07:05Z",
         "pollAfterSeconds": 2,
     },
@@ -108,9 +108,14 @@ _METADATA_EXAMPLE = {
     "data": {
         "apiVersion": "v1",
         "applicationVersion": "1.0.0",
+        "features": [{"id": "management-auth", "actionCount": 5}],
         "supportedCapabilities": ["management.read", "management.write"],
+        "principalCapabilities": ["management.read", "management.write"],
         "enums": [
-            {"name": "authMethod", "values": ["managementKey", "telegramApproval"]}
+            {
+                "name": "AuthMethod",
+                "values": ["managementKey", "telegramAdmin", "telegramApproval"],
+            }
         ],
         "documentationUrl": "/docs",
     },
@@ -118,17 +123,25 @@ _METADATA_EXAMPLE = {
 }
 _CAPABILITIES_EXAMPLE = {
     "data": {
+        "supportedCapabilities": ["management.read", "management.write"],
+        "principalCapabilities": ["management.read", "management.write"],
         "domains": [
             {
-                "domain": "management",
-                "capabilities": ["management.read"],
-                "actions": ["session.revoke", "operation.get", "operation.cancel"],
+                "domain": "management-auth",
+                "actions": [
+                    {
+                        "operationId": "createManagementSession",
+                        "method": "POST",
+                        "path": "/api/management/v1/auth/sessions",
+                    }
+                ],
                 "providers": [],
                 "presets": [],
                 "protocols": [],
                 "modes": [],
+                "features": [],
             }
-        ]
+        ],
     },
     "meta": {"requestId": "request-example"},
 }
@@ -421,19 +434,17 @@ async def get_management_metadata(
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
 ) -> DataEnvelope[ManagementMetadataData]:
     reject_unknown_query_parameters(request)
-    del context
+    snapshot = build_discovery_snapshot(request.app.openapi())
     return DataEnvelope(
         data=ManagementMetadataData(
             apiVersion="v1",
             applicationVersion=runtime.application_version,
-            supportedCapabilities=list(Capability),
-            enums=[
-                EnumDescriptor(name="authMethod", values=["managementKey", "telegramApproval"]),
-                EnumDescriptor(
-                    name="operationStatus",
-                    values=["queued", "running", "succeeded", "failed", "cancelled"],
-                ),
-            ],
+            features=list(snapshot.features),
+            supportedCapabilities=supported_capabilities(),
+            principalCapabilities=sorted(
+                context.actor.capabilities, key=lambda item: item.value
+            ),
+            enums=list(snapshot.enums),
             documentationUrl=runtime.documentation_url,
         ),
         meta=_meta(request),
@@ -460,22 +471,22 @@ async def get_management_metadata(
 )
 async def get_management_capabilities(
     request: Request,
+    runtime: Annotated[ManagementRuntime, Depends(get_management_runtime)],
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
 ) -> DataEnvelope[ManagementCapabilitiesData]:
     reject_unknown_query_parameters(request)
+    channel_catalog = runtime.control_owner().channels.get_catalog(context)
+    snapshot = build_discovery_snapshot(
+        request.app.openapi(),
+        channel_catalog=channel_catalog,
+    )
     return DataEnvelope(
         data=ManagementCapabilitiesData(
-            domains=[
-                CapabilityDomain(
-                    domain="management",
-                    capabilities=sorted(context.actor.capabilities, key=lambda item: item.value),
-                    actions=["session.revoke", "operation.get", "operation.cancel"],
-                    providers=[],
-                    presets=[],
-                    protocols=[],
-                    modes=[],
-                )
-            ]
+            supportedCapabilities=supported_capabilities(),
+            principalCapabilities=sorted(
+                context.actor.capabilities, key=lambda item: item.value
+            ),
+            domains=list(snapshot.domains),
         ),
         meta=_meta(request),
     )

@@ -261,7 +261,8 @@ def test_openapi_has_exact_p0_operation_ids_typed_schemas_and_security(tmp_path)
     assert "SessionCredentialData" in schemas
     assert schemas["ManagementKeyGrant"]["properties"]["managementKey"]["writeOnly"] is True
     assert schemas["TelegramApprovalGrant"]["properties"]["exchangeSecret"]["writeOnly"] is True
-    assert schemas["SessionCredentialData"]["properties"]["credential"]["writeOnly"] is True
+    assert "writeOnly" not in schemas["SessionCredentialData"]["properties"]["credential"]
+    assert "writeOnly" not in schemas["TelegramApprovalCreatedData"]["properties"]["exchangeSecret"]
     assert "additionalProperties': False" in serialized
     assert "pms_" not in serialized and "pmk_" not in serialized and "max_" not in serialized
 
