@@ -231,6 +231,70 @@ async def test_concurrent_success_uses_one_supplier_call(
 
 
 @pytest.mark.asyncio
+async def test_follower_cancellation_does_not_cancel_shared_flight(
+    monkeypatch, refresh_config,
+):
+    key, _valid_provider, _valid_profile = refresh_config
+    _install_token_fake(monkeypatch)
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def get_sync(_url, **_kwargs):
+        nonlocal calls
+        calls += 1
+        started.set()
+        release.wait(2.0)
+        return _Response(["surviving-flight-model"])
+
+    monkeypatch.setattr(
+        oauth_manager.oauth_model_discovery.network, "get_sync", get_sync,
+    )
+    owner = asyncio.create_task(oauth_manager.refresh_account_models(key))
+    cancelled_waiter = None
+    surviving_waiter = None
+    try:
+        await asyncio.wait_for(_wait_for_thread_event(started), timeout=1.0)
+        cancelled_waiter = asyncio.create_task(
+            oauth_manager.refresh_account_models(key)
+        )
+        surviving_waiter = asyncio.create_task(
+            oauth_manager.refresh_account_models(key)
+        )
+        await asyncio.sleep(0)
+        flight = _registered_flight(key)
+        assert flight is not None and not flight.done()
+
+        cancelled_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_waiter
+        assert _registered_flight(key) is flight
+        assert not flight.done()
+        assert not flight.cancelled()
+        assert not owner.done()
+        assert not surviving_waiter.done()
+
+        release.set()
+        owner_result, waiter_result = await asyncio.wait_for(
+            asyncio.gather(owner, surviving_waiter), timeout=1.0,
+        )
+    finally:
+        release.set()
+        if not owner.done():
+            owner.cancel()
+        if cancelled_waiter is not None and not cancelled_waiter.done():
+            cancelled_waiter.cancel()
+        if surviving_waiter is not None and not surviving_waiter.done():
+            surviving_waiter.cancel()
+
+    assert owner_result == waiter_result
+    assert owner_result["action"] == "updated"
+    assert owner_result["new_model_ids"] == ["surviving-flight-model"]
+    assert calls == 1
+    assert _registered_flight(key) is None
+
+
+@pytest.mark.asyncio
 async def test_owner_cancellation_propagates_and_cleans_flight(
     monkeypatch, refresh_config,
 ):
