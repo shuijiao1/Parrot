@@ -218,6 +218,41 @@ class ManagementStateStore:
                 "UPDATE metadata SET value=? WHERE key=?", (value, metadata_key)
             )
 
+    @staticmethod
+    def _classify_api_key_provenance(
+        row: sqlite3.Row | None,
+        fingerprint: str,
+    ) -> tuple[str, str | None]:
+        if row is None:
+            return "missing", None
+        try:
+            record = json.loads(str(row["value"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return "invalid", None
+        if not isinstance(record, dict) or not hmac.compare_digest(
+            str(record.get("fingerprint") or ""), fingerprint
+        ):
+            return "invalid", None
+        source = str(record.get("source") or "")
+        if source not in _API_KEY_PROVENANCE_SOURCES:
+            return "invalid", None
+        return "valid", source
+
+    def get_api_key_provenance_state(
+        self,
+        *,
+        key_id: str,
+        secret_fingerprint: str,
+    ) -> tuple[str, str | None]:
+        """Distinguish absent, valid and invalid side provenance records."""
+        fingerprint = self._validate_api_key_fingerprint(secret_fingerprint)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (self._api_key_provenance_key(key_id),),
+            ).fetchone()
+        return self._classify_api_key_provenance(row, fingerprint)
+
     def get_api_key_provenance(
         self,
         *,
@@ -225,24 +260,39 @@ class ManagementStateStore:
         secret_fingerprint: str,
     ) -> str | None:
         """Return provenance only when it is bound to this exact secret identity."""
+        _, source = self.get_api_key_provenance_state(
+            key_id=key_id,
+            secret_fingerprint=secret_fingerprint,
+        )
+        return source
+
+    def adopt_api_key_provenance(
+        self,
+        *,
+        key_id: str,
+        secret_fingerprint: str,
+        source: str,
+    ) -> tuple[str, str | None]:
+        """Bind an explicit legacy config source only while its side record is absent."""
         fingerprint = self._validate_api_key_fingerprint(secret_fingerprint)
-        with self._lock:
+        normalized_source = str(source)
+        if normalized_source not in _API_KEY_PROVENANCE_SOURCES:
+            raise ValueError("unsupported API key provenance source")
+        metadata_key = self._api_key_provenance_key(key_id)
+        value = json.dumps(
+            {"fingerprint": fingerprint, "source": normalized_source},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO metadata(key,value) VALUES(?,?)",
+                (metadata_key, value),
+            )
             row = self._conn.execute(
-                "SELECT value FROM metadata WHERE key=?",
-                (self._api_key_provenance_key(key_id),),
+                "SELECT value FROM metadata WHERE key=?", (metadata_key,)
             ).fetchone()
-        if row is None:
-            return None
-        try:
-            record = json.loads(str(row["value"]))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return None
-        if not isinstance(record, dict) or not hmac.compare_digest(
-            str(record.get("fingerprint") or ""), fingerprint
-        ):
-            return None
-        source = str(record.get("source") or "")
-        return source if source in _API_KEY_PROVENANCE_SOURCES else None
+        return self._classify_api_key_provenance(row, fingerprint)
 
     def forget_api_key_provenance(self, *, key_id: str) -> None:
         with self._lock, self._conn:

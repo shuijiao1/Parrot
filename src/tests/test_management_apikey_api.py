@@ -272,7 +272,7 @@ def test_all_operations_happy_path_call_control_once_with_authenticated_actor(tm
         assert created.headers["cache-control"] == "no-store"
         assert created.json()["data"]["secret"] == "ccp-client-custom-secret"
         assert created.json()["data"]["apiKey"]["source"] == "custom"
-        assert "source" not in store.value["apiKeys"]["client.new"]
+        assert store.value["apiKeys"]["client.new"]["source"] == "custom"
         custom_items = client.get(
             "/api/management/v1/api-keys?source=custom&pageSize=200",
             headers=headers,
