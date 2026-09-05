@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import os
@@ -9,6 +10,10 @@ import sqlite3
 import threading
 from collections.abc import Mapping
 from typing import Any, Callable
+
+
+_API_KEY_PROVENANCE_PREFIX = "apiKeyProvenance:"
+_API_KEY_PROVENANCE_SOURCES = frozenset({"custom", "generated"})
 
 
 _SCHEMA = """
@@ -62,7 +67,7 @@ class StoreCapacityError(RuntimeError):
 
 
 class ManagementStateStore:
-    """Owns only high-frequency management security state, never business data."""
+    """Owns management security state and non-secret provenance metadata."""
 
     def __init__(
         self,
@@ -143,6 +148,108 @@ class ManagementStateStore:
                 "SELECT value FROM metadata WHERE key='credentialGeneration'"
             ).fetchone()
             return int(row["value"]) if row else 1
+
+    @staticmethod
+    def _api_key_provenance_key(key_id: str) -> str:
+        identity = hashlib.sha256(str(key_id).encode("utf-8")).hexdigest()
+        return _API_KEY_PROVENANCE_PREFIX + identity
+
+    @staticmethod
+    def _validate_api_key_fingerprint(secret_fingerprint: str) -> str:
+        value = str(secret_fingerprint)
+        try:
+            decoded = bytes.fromhex(value)
+        except ValueError as exc:
+            raise ValueError("API key fingerprint must be SHA-256 hex") from exc
+        if len(decoded) != 32 or len(value) != 64:
+            raise ValueError("API key fingerprint must be SHA-256 hex")
+        return value.lower()
+
+    def stage_api_key_provenance(
+        self,
+        *,
+        key_id: str,
+        secret_fingerprint: str,
+    ) -> None:
+        """Invalidate stale provenance before the corresponding config write."""
+        fingerprint = self._validate_api_key_fingerprint(secret_fingerprint)
+        value = json.dumps(
+            {"fingerprint": fingerprint, "source": None},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)",
+                (self._api_key_provenance_key(key_id), value),
+            )
+
+    def commit_api_key_provenance(
+        self,
+        *,
+        key_id: str,
+        secret_fingerprint: str,
+        source: str,
+    ) -> None:
+        """Mark staged provenance known after the config secret is published."""
+        fingerprint = self._validate_api_key_fingerprint(secret_fingerprint)
+        normalized_source = str(source)
+        if normalized_source not in _API_KEY_PROVENANCE_SOURCES:
+            raise ValueError("unsupported API key provenance source")
+        metadata_key = self._api_key_provenance_key(key_id)
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT value FROM metadata WHERE key=?", (metadata_key,)
+            ).fetchone()
+            try:
+                staged = json.loads(str(row["value"])) if row else None
+            except (TypeError, ValueError, json.JSONDecodeError):
+                staged = None
+            if not isinstance(staged, dict) or not hmac.compare_digest(
+                str(staged.get("fingerprint") or ""), fingerprint
+            ):
+                raise RuntimeError("API key provenance was not staged")
+            value = json.dumps(
+                {"fingerprint": fingerprint, "source": normalized_source},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            self._conn.execute(
+                "UPDATE metadata SET value=? WHERE key=?", (value, metadata_key)
+            )
+
+    def get_api_key_provenance(
+        self,
+        *,
+        key_id: str,
+        secret_fingerprint: str,
+    ) -> str | None:
+        """Return provenance only when it is bound to this exact secret identity."""
+        fingerprint = self._validate_api_key_fingerprint(secret_fingerprint)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (self._api_key_provenance_key(key_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            record = json.loads(str(row["value"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(record, dict) or not hmac.compare_digest(
+            str(record.get("fingerprint") or ""), fingerprint
+        ):
+            return None
+        source = str(record.get("source") or "")
+        return source if source in _API_KEY_PROVENANCE_SOURCES else None
+
+    def forget_api_key_provenance(self, *, key_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM metadata WHERE key=?",
+                (self._api_key_provenance_key(key_id),),
+            )
 
     @staticmethod
     def _session_values(values: Mapping[str, Any]) -> tuple[Any, ...]:
