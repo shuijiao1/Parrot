@@ -27,13 +27,14 @@ from src.channel.compatibility import normalize_mode, normalize_models
 from src.channel.url_utils import detect_suffix_protocol, split_base_url
 from src.management_auth.policy import CapabilityDenied, authorize
 from src.management_auth.principal import Capability
-from src.providers.catalog import PROVIDER_CATALOG, get_preset
+from src.providers.catalog import PROVIDER_CATALOG
 
 from ..context import AuditSink, ManagementContext, audit_record
 from ..errors import ErrorField, ManagementError, ManagementErrorCode
 from ..operations import ManagementOperation, OperationRegistry, OperationStore
 from .discovery import discover_models, run_model_discovery
 from .preflight import validate_existing_operation
+from .validation import validated_preset
 from .models import (
     _UNSET,
     ActionResult,
@@ -491,12 +492,10 @@ class ChannelControl:
         base_url = command.base_url.strip() if command.base_url is not None else None
         api_path = command.api_path.strip() if command.api_path is not None else None
         cc_mimicry = command.cc_mimicry
-        if command.provider_id or command.provider_preset_id:
-            if not command.provider_id or not command.provider_preset_id:
-                raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
-            preset = get_preset(command.provider_id, command.provider_preset_id)
-            if preset is None or command.protocol.value not in preset.protocols:
-                raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
+        preset = validated_preset(
+            command.provider_id, command.provider_preset_id, command.protocol,
+        )
+        if preset is not None:
             parsed = ChannelControl.parse_url(preset.protocols[command.protocol.value])
             base_url, api_path = parsed.base_url, parsed.api_path
             if cc_mimicry is None:
@@ -613,6 +612,11 @@ class ChannelControl:
                 raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
             if expected_revision is not None and expected_revision != self._revision(current):
                 raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+            validated_preset(
+                patch.get("providerId", current.get("providerId")),
+                patch.get("providerPresetId", current.get("providerPresetId")),
+                patch.get("protocol", current.get("protocol") or "anthropic"),
+            )
             try:
                 registry.update_api_channel(name, patch)
             except (KeyError, ValueError) as exc:
