@@ -4953,9 +4953,9 @@ async def refresh_account_models(
             owner = True
     if not owner:
         return await asyncio.wrap_future(flight)
-    before = copy.deepcopy(get_account(canonical))
-    generation = _discovery_generation(before or {})
     try:
+        before = copy.deepcopy(get_account(canonical))
+        generation = _discovery_generation(before or {})
         result = await _discover_account_models_once(canonical, timeout_s=timeout_s)
         # Cursor's native fetch owns its LKG, but the unified scheduler owns
         # retry metadata so all five providers obey the same backoff policy.
