@@ -3797,6 +3797,7 @@ def delete_invalid_accounts_batch_if_unchanged(
         for account_key, expected in expected_accounts
     )
     result = {"status": "missing"}
+    removed_owner_digests: set[str] = set()
     account_keys = tuple(account_key for account_key, _expected in expected_batch)
     channel_keys = {f"oauth:{account_key}" for account_key in account_keys}
 
@@ -3838,6 +3839,15 @@ def delete_invalid_accounts_batch_if_unchanged(
                 if matches[0].get("disabled_reason") != "auth_error":
                     result["status"] = "state_conflict"
                     return
+
+            # Match single-account deletion: keep installation continuity before
+            # removing credentials, but defer owner-state cleanup until publish.
+            from .openai.codex_identity import account_identity_from_account, register_account_identity
+            for _account_key, account in expected_batch:
+                identity = account_identity_from_account(account, require=False)
+                if identity is not None:
+                    register_account_identity(account)
+                    removed_owner_digests.add(identity.owner_digest)
 
             for account_key in account_keys:
                 _remove_exact_account_from_config(cfg, account_key)
@@ -3885,6 +3895,13 @@ def delete_invalid_accounts_batch_if_unchanged(
                     cursor_bridge_runtime.drop_account(account_key)
                 except Exception:
                     pass
+
+        # Do not remove identity tombstones; only deleted owners' session state.
+        from .openai import reasoning_replay
+        for owner_digest in removed_owner_digests:
+            state_db.codex_logical_session_delete_owner(owner_digest)
+            state_db.compaction_owner_delete_owner(owner_digest)
+            reasoning_replay.delete_owner(owner_digest)
     return result
 
 
