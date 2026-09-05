@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from src import config, update_checker, updater
+from src.management_control.auxiliary import updates as update_controls
 from src.telegram import states, ui
 from src.telegram.menus import update_menu as menu
 from src.tests.tg_contract import assert_capability_coverage, assert_strict_equal, load_jsonl
@@ -17,6 +18,7 @@ SEGMENT = Path(__file__).parent / "fixtures/tg_contract/v0.31.13/segments/auxili
 CASES = [c for c in load_jsonl(SEGMENT) if c["capabilityId"] == "TG-UPD-01"] if SEGMENT.exists() else []
 BASE = {"updateChecker": {"enabled": True, "includePrerelease": True, "autoUpdate": False, "intervalSeconds": 3600, "repo": "fake/Parrot", "ignoredVersions": []}}
 LATEST = {"latest_version": "9.9.9", "latest_name": "Release <candidate>", "latest_published_at": "2026-01-02T03:04:05Z", "latest_prerelease": True, "latest_url": "https://fake.invalid/release", "latest_body": "Fix <unsafe> & improve\nsecond line"}
+FROZEN_VERSION = "0.31.13"
 
 def _cfg(**patch: Any) -> dict[str, Any]:
     out = deepcopy(BASE); out["updateChecker"].update(patch); return out
@@ -96,6 +98,7 @@ def _run(case: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> dict[str, Any
         return tuple(rt.get("stageResult", [True, "staged"]))
     states.clear_all(); ui._code_to_name.clear(); ui.configure("fake-token-upd", [42])
     monkeypatch.setattr(states.time, "time", lambda: 1000.0); monkeypatch.setattr(config, "get", lambda: store); monkeypatch.setattr(config, "update", update); monkeypatch.setattr(ui, "api", api)
+    monkeypatch.setattr(update_controls, "__version__", FROZEN_VERSION)
     monkeypatch.setattr(update_checker, "get_cached", lambda: deepcopy(rt.get("cached", {}))); monkeypatch.setattr(update_checker, "_has_newer", lambda version: bool(rt.get("newer", False))); monkeypatch.setattr(update_checker, "force_refresh_sync", refresh)
     monkeypatch.setattr(update_checker, "add_ignored", lambda version: (events.append(["ignore", version]), set_ignored(list(dict.fromkeys(store["updateChecker"].get("ignoredVersions", []) + [version]))))); monkeypatch.setattr(update_checker, "remove_ignored", lambda version: (events.append(["unignore", version]), set_ignored([v for v in store["updateChecker"].get("ignoredVersions", []) if v != version]))); monkeypatch.setattr(update_checker, "clear_ignored", lambda: (events.append("clear_ignored"), set_ignored([])))
     monkeypatch.setattr(updater, "get_mode", lambda: rt.get("mode", "docker")); monkeypatch.setattr(updater, "load_state", lambda: deepcopy(rt.get("state", {"stage": updater.STAGE_IDLE}))); monkeypatch.setattr(updater, "is_busy", lambda: bool(rt.get("busy"))); monkeypatch.setattr(updater, "list_backups", lambda: deepcopy(rt.get("backups", []))); monkeypatch.setattr(updater, "get_update_log", lambda: rt.get("failureLog", "")); monkeypatch.setattr(updater, "set_progress_callback", set_progress); monkeypatch.setattr(updater, "stage_update", stage)

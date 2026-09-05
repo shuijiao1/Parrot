@@ -10,6 +10,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from src import (
@@ -235,7 +236,9 @@ def run_menu_case(case: dict[str, Any], domain: str, monkeypatch) -> dict[str, A
             uuid_counter["value"] += 1
             return f"{uuid_counter['value']:032x}"
 
-    monkeypatch.setattr(registry.uuid, "uuid4", lambda: FakeUuid())
+    # Patch only registry's module reference.  Mutating stdlib uuid.uuid4 here
+    # also changes Codex identity generation and can persist a non-UUID repr.
+    monkeypatch.setattr(registry, "uuid", SimpleNamespace(uuid4=lambda: FakeUuid()))
     monkeypatch.setattr(apikey_menu.secrets, "token_hex", lambda size: "ab" * size)
     monkeypatch.setattr(
         channel_menu.provider_usage, "_SECRET_CACHE", b"fixed-provider-usage-secret",
