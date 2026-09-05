@@ -6,8 +6,12 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
+from src import status_monitor
 from src.management_api.routers.auxiliary_support import get_bound_auxiliary_controls
-from src.management_control.auxiliary.status_alerts import StatusAlertControl
+from src.management_control.auxiliary.status_alerts import (
+    ModuleStatusGateway,
+    StatusAlertControl,
+)
 from src.tests.management_auxiliary_support import (
     bearer,
     build_auxiliary_app,
@@ -356,3 +360,170 @@ def test_stale_revision_has_no_side_effect_and_missing_or_repeat_semantics_stay_
         assert missing_unmute.json()["error"]["code"] == "RESOURCE_NOT_FOUND"
         assert len(gateway.mute_calls) == len(calls_after_first) + 1
         assert gateway.unmute_calls == [("claude", "inc-resolved")]
+
+
+class _NetworkResponse:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return copy.deepcopy(self._payload)
+
+
+class _TemporaryMuteState:
+    def __init__(self) -> None:
+        self.rows: dict[tuple[str, str], dict[str, Any]] = {}
+        self.save_calls: list[tuple[str, str, str]] = []
+
+    def load_all(self) -> list[dict[str, Any]]:
+        return copy.deepcopy(list(self.rows.values()))
+
+    def save(self, provider: str, incident_id: str, name: str = "") -> None:
+        self.save_calls.append((provider, incident_id, name))
+        self.rows[(provider, incident_id)] = {
+            "provider": provider,
+            "incident_id": incident_id,
+            "name": name,
+            "muted_at": 1_700_000_000,
+        }
+
+    def delete(self, provider: str, incident_id: str) -> None:
+        self.rows.pop((provider, incident_id), None)
+
+
+def _build_module_gateway_source_skew_app(tmp_path, monkeypatch, *, current_in_feed: bool):
+    cached_row = {
+        "id": "inc-skew",
+        "name": "Incident",
+        "impact": "major",
+        "status": "investigating",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:01:00Z",
+        "shortlink": "https://status.example/inc-skew",
+    }
+    current_row = {
+        "id": "inc-skew",
+        "name": "Incident",
+        "status": "resolved",
+        "updated_at": "2026-01-01T00:02:00Z",
+    }
+    current_feed = [current_row] if current_in_feed else []
+    network_calls: list[str] = []
+
+    def get_sync(url: str, **_kwargs):
+        network_calls.append(url)
+        incidents = current_feed if url.startswith("https://status.claude.com/") else []
+        return _NetworkResponse({"incidents": incidents})
+
+    state = _TemporaryMuteState()
+    monkeypatch.setattr(status_monitor.network, "get_sync", get_sync)
+    monkeypatch.setattr(status_monitor.state_db, "status_muted_load_all", state.load_all)
+    monkeypatch.setattr(status_monitor.state_db, "status_muted_save", state.save)
+    monkeypatch.setattr(status_monitor.state_db, "status_muted_delete", state.delete)
+    monkeypatch.setattr(
+        status_monitor,
+        "_active",
+        {
+            "claude": {"inc-skew": copy.deepcopy(cached_row)},
+            "openai": {},
+            "cloudflare": {},
+        },
+    )
+    monkeypatch.setattr(status_monitor, "_muted", {})
+    monkeypatch.setattr(status_monitor, "_mute_loaded", False)
+
+    app, _, fixture = build_auxiliary_app(tmp_path)
+    control = StatusAlertControl(config_gateway=fixture.config, audit_sink=fixture.audit)
+    assert isinstance(control._status, ModuleStatusGateway)
+    app.dependency_overrides[get_bound_auxiliary_controls] = lambda: replace(
+        fixture.controls, status_alerts=control
+    )
+    return app, state, network_calls
+
+
+def test_module_gateway_current_history_revision_wins_over_cached_active(tmp_path, monkeypatch):
+    app, state, _ = _build_module_gateway_source_skew_app(
+        tmp_path, monkeypatch, current_in_feed=True
+    )
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        history = _item(
+            client.get(
+                BASE + "/status-alerts/incidents",
+                params={"view": "history", "provider": "claude"},
+                headers=headers,
+            ),
+            "inc-skew",
+        )
+        response = client.post(
+            BASE + "/status-alerts/incidents/inc-skew/actions/mute",
+            headers={**headers, "If-Match": history["revision"]},
+        )
+
+    assert response.status_code == 200, response.text
+    assert state.save_calls == [("claude", "inc-skew", "Incident")]
+
+
+def test_module_gateway_stale_active_revision_loses_to_current_feed(tmp_path, monkeypatch):
+    app, state, _ = _build_module_gateway_source_skew_app(
+        tmp_path, monkeypatch, current_in_feed=True
+    )
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        active = _item(
+            client.get(
+                BASE + "/status-alerts/incidents",
+                params={"view": "active", "provider": "claude"},
+                headers=headers,
+            ),
+            "inc-skew",
+        )
+        history = _item(
+            client.get(
+                BASE + "/status-alerts/incidents",
+                params={"view": "history", "provider": "claude"},
+                headers=headers,
+            ),
+            "inc-skew",
+        )
+        assert active["revision"] != history["revision"]
+        response = client.post(
+            BASE + "/status-alerts/incidents/inc-skew/actions/mute",
+            headers={**headers, "If-Match": active["revision"]},
+        )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "REVISION_CONFLICT"
+    assert state.save_calls == []
+    assert state.rows == {}
+
+
+def test_module_gateway_missing_feed_row_falls_back_to_cached_active(tmp_path, monkeypatch):
+    app, state, network_calls = _build_module_gateway_source_skew_app(
+        tmp_path, monkeypatch, current_in_feed=False
+    )
+    with TestClient(app) as client:
+        headers = bearer(create_session(client))
+        active = _item(
+            client.get(
+                BASE + "/status-alerts/incidents",
+                params={"view": "active", "provider": "claude"},
+                headers=headers,
+            ),
+            "inc-skew",
+        )
+        response = client.post(
+            BASE + "/status-alerts/incidents/inc-skew/actions/mute",
+            headers={**headers, "If-Match": active["revision"]},
+        )
+
+    assert response.status_code == 200, response.text
+    assert state.save_calls == [("claude", "inc-skew", "Incident")]
+    assert {url.split("/api/")[0] for url in network_calls} == {
+        "https://status.claude.com",
+        "https://status.openai.com",
+        "https://www.cloudflarestatus.com",
+    }

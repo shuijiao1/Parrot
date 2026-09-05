@@ -471,16 +471,16 @@ class StatusAlertControl:
         *,
         muted_rows: list[dict[str, Any]] | None = None,
     ) -> tuple[str, dict[str, Any]] | None:
-        for provider, rows in self._status.snapshot_active().items():
-            for row in rows:
-                if self._incident_id(row) == incident_id:
-                    return provider, row
         current_mutes = muted_rows if muted_rows is not None else self._status.list_muted()
         for row in current_mutes:
             if self._incident_id(row) == incident_id:
                 return str(row.get("provider") or ""), row
         for provider in STATUS_PROVIDERS:
             for row in self._status.list_recent(provider, 200):
+                if self._incident_id(row) == incident_id:
+                    return provider, row
+        for provider, rows in self._status.snapshot_active().items():
+            for row in rows:
                 if self._incident_id(row) == incident_id:
                     return provider, row
         return None
