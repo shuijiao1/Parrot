@@ -146,7 +146,7 @@ class OAuthMutationData(StrictSchema):
 
 class OAuthReplaceConflictData(StrictSchema):
     accountId: str
-    replacePlanToken: str = Field(json_schema_extra={"writeOnly": True})
+    replacePlanToken: str
 
 
 class OAuthIdentityConflictEnvelope(StrictSchema):
@@ -160,7 +160,7 @@ class StartOAuthLoginFlowRequest(StrictSchema):
 
 class OAuthLoginFlowData(StrictSchema):
     flowId: str
-    flowSecret: str = Field(json_schema_extra={"writeOnly": True})
+    flowSecret: str
     provider: OAuthProvider
     authUrl: str | None = None
     instruction: str | None = None
@@ -203,7 +203,7 @@ class OAuthImportProblemData(StrictSchema):
 
 class OAuthImportPreviewData(StrictSchema):
     importId: str
-    importSecret: str = Field(json_schema_extra={"writeOnly": True})
+    importSecret: str
     candidates: list[OAuthImportCandidateData]
     errors: list[OAuthImportProblemData]
     expiresAt: datetime
@@ -231,7 +231,7 @@ class InvalidOAuthDeletionPlanRequest(StrictSchema):
 
 
 class OAuthDeletionPlanData(StrictSchema):
-    planToken: str = Field(json_schema_extra={"writeOnly": True})
+    planToken: str
     accountIds: list[str]
     expiresAt: datetime
     revision: str
@@ -250,7 +250,7 @@ class OAuthQuotaResetPlanRequest(StrictSchema):
 
 
 class OAuthQuotaResetPlanData(StrictSchema):
-    planToken: str = Field(json_schema_extra={"writeOnly": True})
+    planToken: str
     accountId: str
     provider: OAuthProvider
     creditCount: int | None = None

@@ -89,10 +89,10 @@ def _read_list(family: str) -> list[str]:
     return oauth_control.default_models_snapshot(OAuthFamily(family))
 
 
-def _write_list(family: str, models: list[str]) -> None:
+def _write_list(chat_id: int, family: str, models: list[str]) -> None:
     old_models = oauth_control.default_models_snapshot(OAuthFamily(family))
     oauth_control.replace_default_models_raw(
-        _management_context(0),
+        _management_context(chat_id),
         OAuthFamily(family),
         models,
         set(old_models) - set(models),
@@ -128,9 +128,9 @@ def _parse_input(text: str) -> list[str]:
 
 # ─── 引用扫描 ────────────────────────────────────────────────────
 
-def _scan_references(family: str, removed: set[str]) -> dict:
+def _scan_references(chat_id: int, family: str, removed: set[str]) -> dict:
     return oauth_control.scan_default_model_references(
-        _management_context(0), OAuthFamily(family), removed,
+        _management_context(chat_id), OAuthFamily(family), removed,
     )
 
 
@@ -144,11 +144,11 @@ def _has_any_refs(refs: dict) -> bool:
 
 
 def _commit_save(
-    family: str, new_models: list[str], removed: set[str],
+    chat_id: int, family: str, new_models: list[str], removed: set[str],
     *, cleanup: bool,
 ) -> dict:
     return oauth_control.replace_default_models_raw(
-        _management_context(0),
+        _management_context(chat_id),
         OAuthFamily(family),
         new_models,
         removed,
@@ -632,9 +632,9 @@ def _apply_new_models(chat_id: int, family: str, new_models: list[str], *, cb_id
 
     old_models = _read_list(family)
     removed = set(old_models) - set(new_models)
-    refs = _scan_references(family, removed) if removed else {}
+    refs = _scan_references(chat_id, family, removed) if removed else {}
     if not removed or not _has_any_refs(refs):
-        _commit_save(family, new_models, removed, cleanup=False)
+        _commit_save(chat_id, family, new_models, removed, cleanup=False)
         states.pop_state(chat_id)
         if cb_id:
             ui.answer_cb(cb_id)
@@ -830,7 +830,7 @@ def _on_commit(
         ui.answer_cb(cb_id, "会话异常"); return
 
     summary = _commit_save(
-        family, [str(m) for m in new_models], removed,
+        chat_id, family, [str(m) for m in new_models], removed,
         cleanup=(mode == "clean"),
     )
     ui.answer_cb(cb_id, "✅ 已保存")

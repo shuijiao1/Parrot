@@ -278,7 +278,9 @@ def show(chat_id: int, message_id: int, cb_id: Optional[str], account_key: str,
         return
     token = menu_cache.begin_view(chat_id, message_id)
     def worker():
-        asyncio.run(oauth_control.refresh_account_models_raw(account_key))
+        asyncio.run(oauth_control.refresh_account_models_for_telegram(
+            _management_context(chat_id), account_key,
+        ))
         if not menu_cache.is_current_view(chat_id, message_id, token):
             return
         text2, kb2 = render(account_key, model_page=model_page, account_page=account_page, filter_key=filter_key)

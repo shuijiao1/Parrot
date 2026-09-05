@@ -8,6 +8,7 @@ from threading import RLock
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from src.management_control.oauth import OAuthBackend, OAuthControl
+from src.oauth.openai_import import parse_openai_import_payload
 
 
 class ImmediateExecutor:
@@ -572,8 +573,7 @@ class InMemoryOAuthBackend(OAuthBackend):
         return "https://xai.example.test/v1/models"
 
     def parse_import(self, kind, payload, *, filename=""):
-        value = json.loads(payload)
-        return value if isinstance(value, list) else [value]
+        return parse_openai_import_payload(kind, payload, filename=filename)
 
     def openai_pkce_generate(self):
         return "verifier", "challenge"
@@ -586,16 +586,21 @@ class InMemoryOAuthBackend(OAuthBackend):
         return {"access_token": "flow-access-secret", "refresh_token": "flow-refresh-secret", "id_token": "flow-id-token", "expires_in": 3600}
 
     def openai_decode_id_token(self, token):
+        if str(token).startswith("{"):
+            return json.loads(token)
         return {"email": "flow@example.test", "workspace_id": "flow-workspace"}
 
     def openai_extract_user_info(self, claims):
         return claims
 
     def openai_refresh(self, refresh_token, **kwargs):
+        email = str(kwargs.get("email") or "import@example.test")
+        workspace = f"import-{email.partition('@')[0]}"
         return {
             "access_token": "openai-refreshed-access",
             "refresh_token": refresh_token,
-            "id_token": "openai-refreshed-id",
+            "id_token": json.dumps({"email": email, "workspace_id": workspace}),
+            "workspace_id": workspace,
             "expires_in": 3600,
         }
 

@@ -1,6 +1,7 @@
 """OpenAI OAuth 低价区导出文件解析。
 
-支持两类常见来源：
+支持三类常见来源：
+  - OpenAI 原生 OAuth 账号 JSON / ZIP
   - Sub2API 导出的 JSON / ZIP
   - CPA 导出的 JSON / ZIP
 
@@ -39,7 +40,7 @@ class OpenAIImportCandidate:
 
 _EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
 _REFRESH_RE = re.compile(r"[A-Za-z0-9_\-.]{20,}")
-_SUPPORTED_KINDS = {"sub2api", "cpa"}
+_SUPPORTED_KINDS = {"openai", "sub2api", "cpa"}
 _MAX_ZIP_JSON_FILES = 200
 _MAX_ZIP_JSON_BYTES = 10 * 1024 * 1024
 
@@ -120,6 +121,9 @@ def _load_json(payload: bytes | str, source: str) -> Any:
 
 
 def _extract_candidates_from_json(kind: str, obj: Any, source: str) -> Iterable[OpenAIImportCandidate]:
+    if kind == "openai":
+        yield from _extract_openai_candidates(obj, source)
+        return
     if kind == "sub2api":
         yield from _extract_sub2api_candidates(obj, source)
         return
@@ -127,6 +131,37 @@ def _extract_candidates_from_json(kind: str, obj: Any, source: str) -> Iterable[
         yield from _extract_cpa_candidates(obj, source)
         return
     raise OpenAIImportParseError(f"不支持的导入类型: {kind!r}")
+
+
+def _extract_openai_candidates(obj: Any, source: str) -> Iterable[OpenAIImportCandidate]:
+    """Extract native OpenAI account JSON without trusting stored identity fields."""
+    if isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            yield from _extract_openai_candidates(item, f"{source}#{idx + 1}")
+        return
+    if not isinstance(obj, dict):
+        return
+
+    accounts = obj.get("accounts")
+    if isinstance(accounts, list) and not obj.get("refresh_token"):
+        for idx, item in enumerate(accounts):
+            yield from _extract_openai_candidates(item, f"{source}#accounts[{idx}]")
+        return
+
+    provider = str(obj.get("provider") or obj.get("platform") or "").strip().lower()
+    account_type = str(obj.get("type") or "").strip().lower()
+    if provider and provider != "openai":
+        return
+    if account_type and account_type not in {"openai", "oauth"}:
+        return
+    creds = obj.get("credentials") if isinstance(obj.get("credentials"), dict) else {}
+    rt = _clean_refresh_token(obj.get("refresh_token") or creds.get("refresh_token"))
+    if not rt:
+        return
+    email = _clean_email(obj.get("email") or creds.get("email") or _email_from_source(source))
+    if not email:
+        email = _fallback_email(source)
+    yield OpenAIImportCandidate(email=email, refresh_token=rt, source=source)
 
 
 def _extract_cpa_candidates(obj: Any, source: str) -> Iterable[OpenAIImportCandidate]:

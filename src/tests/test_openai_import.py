@@ -15,7 +15,7 @@ def _import_modules():
     root = _ap_os.path.dirname(_ap_os.path.dirname(_ap_os.path.dirname(_ap_os.path.abspath(__file__))))
     if root not in _ap_sys.path:
         _ap_sys.path.insert(0, root)
-    from src import config, oauth_manager
+    from src import config, oauth_manager, state_db
     from src.oauth import openai as openai_provider
     from src.oauth.openai_import import parse_openai_import_payload
     from src.telegram import states, ui
@@ -23,6 +23,7 @@ def _import_modules():
     return {
         "config": config,
         "oauth_manager": oauth_manager,
+        "state_db": state_db,
         "openai_provider": openai_provider,
         "parse_openai_import_payload": parse_openai_import_payload,
         "oauth_menu": oauth_menu,
@@ -52,6 +53,7 @@ def _setup(m):
         c.setdefault("oauth", {})["mockMode"] = True
         c["oauthAccounts"] = []
     m["config"].update(_reset)
+    m["state_db"].init()
     m["states"].clear_all()
     m["ui"].api = ApiRecorder()
 
@@ -121,7 +123,7 @@ def test_import_duplicate_requires_confirmation_without_refreshing_existing(m):
     new_tok["refresh_token"] = "new-valid-refresh-token-yyyyyyyy"
     new_entry, _ = oauth_menu._openai_token_to_entry(new_tok)
 
-    action, msg = oauth_menu._save_openai_entry_with_duplicate_policy(new_entry)
+    action, msg = oauth_menu._save_openai_entry_with_duplicate_policy(new_entry, chat_id=42)
 
     assert action == "duplicate"
     assert "确认覆盖" in msg
@@ -146,7 +148,7 @@ def test_import_same_email_different_workspace_adds_new_account(m):
     personal_tok["workspace_type"] = "personal"
     personal_entry, _ = oauth_menu._openai_token_to_entry(personal_tok)
 
-    action, msg = oauth_menu._save_openai_entry_with_duplicate_policy(personal_entry)
+    action, msg = oauth_menu._save_openai_entry_with_duplicate_policy(personal_entry, chat_id=42)
 
     assert action == "added"
     assert om.get_account("openai:same@example.com:acct-team") is not None
@@ -182,7 +184,7 @@ def test_import_duplicate_existing_invalid_still_requires_confirmation(m, monkey
         workspace_id="acct-same",
     )
     assert err is None
-    action, msg = oauth_menu._save_openai_entry_with_duplicate_policy(new_entry)
+    action, msg = oauth_menu._save_openai_entry_with_duplicate_policy(new_entry, chat_id=42)
 
     assert action == "duplicate"
     assert "确认覆盖" in msg
@@ -336,7 +338,7 @@ def test_mixed_batch_stages_without_writes_deduplicates_and_commits_after_confir
     assert len(staged["failed"]) == 2
     assert m["config"].get() == baseline
 
-    result = menu._commit_staged_openai_import(staged)
+    result = menu._commit_staged_openai_import(staged, chat_id=42)
     assert len(result["added"]) == 1
     assert len(result["replaced"]) == 1
     assert len(result["failed"]) == 2
