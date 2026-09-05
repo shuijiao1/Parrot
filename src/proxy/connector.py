@@ -1130,12 +1130,13 @@ def parse_proxy_url(text: str) -> dict:
             raise ValueError("SOCKS5 URL must include host and port")
         name = p.fragment.strip() if p.fragment else ""
         clean = "socks5://"
-        if p.username:
+        if p.username is not None:
             clean += p.username
-            if p.password:
+            if p.password is not None:
                 clean += f":{p.password}"
             clean += "@"
-        clean += f"{p.hostname}:{p.port}"
+        host = f"[{p.hostname}]" if ":" in p.hostname else p.hostname
+        clean += f"{host}:{p.port}"
         return {"type": "socks5", "url": clean, "name": name}
     raise ValueError(f"unsupported proxy URL: {s}")
 

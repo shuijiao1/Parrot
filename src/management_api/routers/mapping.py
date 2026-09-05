@@ -126,7 +126,7 @@ def list_model_mappings(
 
 
 @router.put(
-    "/model-mappings/{alias}",
+    "/model-mappings/{alias:path}",
     operation_id="putModelMapping",
     tags=["management-model-mapping"],
     response_model=MappingEnvelope,
@@ -148,7 +148,7 @@ def put_model_mapping(
 
 
 @router.delete(
-    "/model-mappings/{alias}",
+    "/model-mappings/{alias:path}",
     operation_id="deleteModelMapping",
     tags=["management-model-mapping"],
     status_code=status.HTTP_204_NO_CONTENT,
