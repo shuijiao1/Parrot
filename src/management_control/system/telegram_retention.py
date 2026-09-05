@@ -1,59 +1,42 @@
-"""Frozen Telegram retention commands over the authoritative log database."""
+"""Frozen Telegram retention adapter over the shared RetentionControl."""
 
 from __future__ import annotations
 
 from typing import Any, Callable
 
-from src import config, log_db
-from src.management_auth import Capability
 from src.management_control.context import ManagementContext
-from src.management_control.observability.common import require
+from src.management_control.observability.retention import (
+    DEFAULT_RETENTION_CONTROL,
+    RetentionControl,
+)
 
 
 class TelegramRetentionAdapter:
-    """Thin synchronous facade preserving the v0.31.13 Telegram lifecycle.
+    """Thin synchronous adapter preserving the v0.31.13 Telegram lifecycle.
 
-    The Telegram menu already owns its actor-bound eight-character pending-plan
-    store and exact 600-second TTL.  This adapter must therefore never create a
-    second plan, TTL, capacity limit, or mutable progress capture.  Management API
-    retention continues to use the independent P4 ``RetentionControl``.
+    The Telegram menu continues to own its eight-character pending code, exact
+    600-second TTL, progress rendering, and exception timing.  All retention
+    business calls are delegated to the lifecycle-owned ``RetentionControl``;
+    this adapter owns no config/log-database write path or plan application.
     """
 
-    def __init__(self, *, module=log_db, config_module=config) -> None:
-        self.log_db = module
-        self.config = config_module
-
-    @staticmethod
-    def _write(context: ManagementContext, capability: Capability = Capability.WRITE) -> None:
-        require(context, capability)
+    def __init__(self, control: RetentionControl = DEFAULT_RETENTION_CONTROL) -> None:
+        self.control = control
 
     def settings(self, context: ManagementContext) -> dict[str, Any]:
-        require(context, Capability.READ)
-        cfg = self.config.get()
-        policy = self.log_db.retention_policy(cfg)
-        return {
-            "mode": policy["mode"],
-            "days": policy.get("days"),
-            "logStoreBodies": cfg.get("logStoreBodies", True) is not False,
-        }
+        return self.control.sync_settings(context)
 
     def set_log_store_bodies(self, context: ManagementContext, value: bool) -> None:
-        self._write(context)
-        # Exactly the baseline config.update call: raw storage exceptions escape.
-        self.config.update(lambda cfg: cfg.__setitem__("logStoreBodies", value))
+        self.control.sync_set_log_store_bodies(context, value)
 
     def extend_days(self, context: ManagementContext, days: int) -> dict[str, Any]:
-        self._write(context)
-        return self.log_db.extend_retention_days(days)
+        return self.control.sync_extend_days(context, days)
 
     def set_forever(self, context: ManagementContext) -> dict[str, Any]:
-        self._write(context)
-        return self.log_db.set_retention_forever()
+        return self.control.sync_set_forever(context)
 
     def create_plan(self, context: ManagementContext, days: int) -> dict[str, Any]:
-        self._write(context)
-        # Keep the raw cutoff for the frozen renderer's "时间不可表示" fallback.
-        return self.log_db.plan_retention(days)
+        return self.control.sync_create_plan(context, days)
 
     def commit_plan(
         self,
@@ -62,12 +45,7 @@ class TelegramRetentionAdapter:
         *,
         progress: Callable[[dict[str, Any]], None],
     ) -> dict[str, Any]:
-        self._write(context, Capability.DESTRUCTIVE)
-        # The callback remains call-local, so concurrent chats cannot exchange
-        # progress events.  RuntimeError and all other authority errors propagate.
-        return self.log_db.apply_retention_plan(
-            plan, activate_policy=True, progress=progress,
-        )
+        return self.control.sync_commit_plan(context, plan, progress=progress)
 
 
-DEFAULT_TELEGRAM_RETENTION_ADAPTER = TelegramRetentionAdapter()
+DEFAULT_TELEGRAM_RETENTION_ADAPTER = TelegramRetentionAdapter(DEFAULT_RETENTION_CONTROL)

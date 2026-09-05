@@ -112,13 +112,13 @@ class RetentionControl:
         cfg = self.config.get()
         policy = self.log_db.retention_policy(cfg)
         try:
-            rows = int(self.log_db.recent_logs_count())
+            rows = int(self.log_db.management_logs_count())
         except Exception:
             rows = 0
         data = {
             "mode": str(policy.get("mode") or "forever"),
             "days": policy.get("days"),
-            "logStoreBodies": bool(cfg.get("logStoreBodies", True)),
+            "logStoreBodies": cfg.get("logStoreBodies", True) is not False,
             "currentData": {"rows": rows},
             "busy": bool(self.log_db.retention_cleanup_busy()),
         }
@@ -190,15 +190,18 @@ class RetentionControl:
                 ),),
             )
 
-        if policy_changed:
-            if self.log_db.retention_cleanup_busy():
-                self._audit(context, "retention.settings.update", "logs.retention", "failed")
-                raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+        body_changed = (
+            log_store_bodies is not None
+            and bool(log_store_bodies) != bool(current["logStoreBodies"])
+        )
+        if policy_changed or body_changed:
             try:
-                result = (
-                    self.log_db.set_retention_forever()
-                    if target_mode is RetentionMode.FOREVER
-                    else self.log_db.extend_retention_days(target_days)
+                result = self.log_db.update_retention_settings(
+                    mode=target_mode.value if policy_changed else None,
+                    days=target_days if policy_changed and target_mode is RetentionMode.DAYS else None,
+                    log_store_bodies=bool(log_store_bodies) if body_changed else None,
+                    expected_policy={"mode": current_mode.value, "days": current_days},
+                    expected_log_store_bodies=bool(current["logStoreBodies"]),
                 )
             except Exception as exc:
                 self._audit(context, "retention.settings.update", "logs.retention", "failed")
@@ -207,27 +210,84 @@ class RetentionControl:
                 ) from exc
             if not isinstance(result, dict) or not result.get("ok"):
                 self._audit(context, "retention.settings.update", "logs.retention", "failed")
+                error = result.get("error") if isinstance(result, dict) else None
+                if error == "revision_conflict":
+                    raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+                if error == "plan_required":
+                    raise ManagementError(
+                        ManagementErrorCode.CONFIRMATION_REQUIRED,
+                        fields=(ErrorField(
+                            path="mode" if current_mode is RetentionMode.FOREVER else "days",
+                            code="retention_plan_required",
+                            message="Create and commit a retention plan for this policy change",
+                        ),),
+                    )
+                if error == "persist_failed":
+                    raise ManagementError(
+                        ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
+                    )
                 raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
-
-        body_changed = (
-            log_store_bodies is not None
-            and bool(log_store_bodies) != bool(current["logStoreBodies"])
-        )
-        if body_changed:
-            try:
-                self.config.update(
-                    lambda cfg: cfg.__setitem__("logStoreBodies", bool(log_store_bodies)),
-                )
-            except Exception as exc:
-                self._audit(context, "retention.settings.update", "logs.retention", "failed")
-                raise ManagementError(
-                    ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True,
-                ) from exc
         self._audit(
             context, "retention.settings.update", "logs.retention",
             "succeeded" if policy_changed or body_changed else "noop",
         )
         return self.settings(context)
+
+    def _scan_retention_plan(self, days: int) -> dict[str, Any]:
+        return self.log_db.plan_retention(days)
+
+    def _apply_retention_plan(
+        self,
+        plan: dict[str, Any],
+        *,
+        progress: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        return self.log_db.apply_retention_plan(
+            plan, activate_policy=True, progress=progress,
+        )
+
+    def sync_settings(self, context: ManagementContext) -> dict[str, Any]:
+        """Return the frozen synchronous adapter view without API-only fields."""
+
+        require(context, Capability.READ)
+        cfg = self.config.get()
+        policy = self.log_db.retention_policy(cfg)
+        return {
+            "mode": policy["mode"],
+            "days": policy.get("days"),
+            "logStoreBodies": cfg.get("logStoreBodies", True) is not False,
+        }
+
+    def sync_set_log_store_bodies(self, context: ManagementContext, value: bool) -> None:
+        require(context, Capability.WRITE)
+        # Preserve the Telegram timing/error contract: a raw persistence error
+        # escapes before the adapter emits its success answer and redraw.
+        self.config.update(lambda cfg: cfg.__setitem__("logStoreBodies", value))
+
+    def sync_extend_days(self, context: ManagementContext, days: int) -> dict[str, Any]:
+        require(context, Capability.WRITE)
+        return self.log_db.extend_retention_days(days)
+
+    def sync_set_forever(self, context: ManagementContext) -> dict[str, Any]:
+        require(context, Capability.WRITE)
+        return self.log_db.set_retention_forever()
+
+    def sync_create_plan(self, context: ManagementContext, days: int) -> dict[str, Any]:
+        require(context, Capability.WRITE)
+        # Keep raw timestamps for the frozen renderer's fallback semantics.
+        return self._scan_retention_plan(days)
+
+    def sync_commit_plan(
+        self,
+        context: ManagementContext,
+        plan: dict[str, Any],
+        *,
+        progress: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        require(context, Capability.DESTRUCTIVE)
+        # Deliberately synchronous and call-local: the Telegram menu controls
+        # progress ordering and retains the original exception point.
+        return self._apply_retention_plan(plan, progress=progress)
 
     @staticmethod
     def _public_plan(plan: RetentionPlan) -> dict[str, Any]:
@@ -271,7 +331,7 @@ class RetentionControl:
                     )
                 return self._public_plan(existing)
         try:
-            raw = self.log_db.plan_retention(days)
+            raw = self._scan_retention_plan(days)
         except Exception as exc:
             raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE, retryable=True) from exc
         if raw.get("errors") or not bool((raw.get("preflight") or {}).get("ok")):
@@ -354,8 +414,8 @@ class RetentionControl:
                     except ManagementError:
                         pass
 
-                result = self.log_db.apply_retention_plan(
-                    copy.deepcopy(committed.raw_plan), activate_policy=True, progress=progress,
+                result = self._apply_retention_plan(
+                    copy.deepcopy(committed.raw_plan), progress=progress,
                 )
                 if not result.get("ok"):
                     operations.fail(

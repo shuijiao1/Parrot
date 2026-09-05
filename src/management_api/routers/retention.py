@@ -77,6 +77,11 @@ def create_log_retention_plan(
 ) -> DataEnvelope[RetentionPlanData]:
     reject_unknown_query(request, ())
     value = controls(request).retention.create_plan(context, days=command.days)
+    # The Control keeps its internal plan identifier as ``id``; the public v1
+    # DTO and path contract consistently expose ``planId``.
+    if "planId" not in value and "id" in value:
+        value = {**value, "planId": value["id"]}
+        value.pop("id", None)
     return DataEnvelope(data=RetentionPlanData.model_validate(value), meta=meta(request))
 
 
