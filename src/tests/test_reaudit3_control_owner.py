@@ -162,6 +162,8 @@ def test_production_telegram_bindings_are_the_same_instances_as_api_dependencies
         assert tgbot.system_menu._runtime_control is owner.system_runtime
         assert tgbot.system_menu._load_balancing_control is owner.load_balancing
         assert tgbot.system_menu._retention_control is owner.telegram_retention
+        assert owner.telegram_retention.control is owner.observability.retention
+        assert tgbot.system_menu._retention_control.control is owner.observability.retention
         assert system_support.get_bound_system_network_controls(request) is owner.system
     finally:
         server._unbind_telegram_management_controls(owner)

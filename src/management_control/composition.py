@@ -87,6 +87,7 @@ def build_management_controls(
         xai_media=XaiMediaControl(audit_sink=audit_sink),
     )
     auxiliary.bind_operations(operations, operation_registry)
+    retention = RetentionControl(audit_sink=audit_sink)
     return ManagementControls(
         audit_sink=audit_sink,
         operations=operations,
@@ -112,7 +113,7 @@ def build_management_controls(
             stats=StatsControl(audit_sink=audit_sink),
             logs=LogsControl(),
             media=MediaControl(),
-            retention=RetentionControl(audit_sink=audit_sink),
+            retention=retention,
         ),
         system=SystemNetworkControls(
             settings=SettingsControl(audit_sink=audit_sink),
@@ -123,6 +124,6 @@ def build_management_controls(
             ),
         ),
         system_runtime=SystemRuntimeControl(audit_sink=audit_sink),
-        telegram_retention=TelegramRetentionAdapter(),
+        telegram_retention=TelegramRetentionAdapter(retention),
         auxiliary=auxiliary,
     )
