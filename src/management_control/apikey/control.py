@@ -292,7 +292,6 @@ class ApiKeyControl:
             for raw in keys.values():
                 if self._normalize_entry(raw).get("key") == secret:
                     raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT, "API key secret is already in use")
-            self._stage_provenance(name, secret)
             keys[name] = {
                 "key": secret,
                 **(
@@ -307,7 +306,7 @@ class ApiKeyControl:
             }
 
         self._config.update(mutate)
-        self._commit_provenance(name, secret, mode.value)
+        self._save_provenance(name, secret, mode.value)
         item = self._current_view(name)
         self._record(context, "apikey.create", name)
         return ApiKeySecretResult(api_key=item, secret=secret)
@@ -400,7 +399,6 @@ class ApiKeyControl:
                 raise self._not_found(key_id)
             entry = self._normalize_entry(raw)
             self._check_revision(key_id, entry, if_match)
-            self._stage_provenance(key_id, str(entry.get("key") or ""))
             keys.pop(key_id, None)
 
         self._config.update(mutate)
@@ -586,13 +584,12 @@ class ApiKeyControl:
             for name, other in keys.items():
                 if name != key_id and self._normalize_entry(other).get("key") == secret:
                     raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT, "API key secret is already in use")
-            self._stage_provenance(key_id, secret)
             entry["key"] = secret
             if record_source or "source" in entry:
                 entry["source"] = source.value
             keys[key_id] = entry
         self._config.update(mutate)
-        self._commit_provenance(key_id, secret, source.value)
+        self._save_provenance(key_id, secret, source.value)
 
     def _validated_plan(
         self, context: ManagementContext, key_id: str, plan_id: str, token: str,
@@ -740,75 +737,34 @@ class ApiKeyControl:
             return {}
         return {str(name): cls._normalize_entry(raw) for name, raw in value.items() if cls._normalize_entry(raw).get("key")}
 
-    def _provenance(
-        self,
-        key_id: str,
-        entry: Mapping[str, Any],
-    ) -> ApiKeyProvenance:
+    def _provenance(self, key_id: str, entry: Mapping[str, Any]) -> ApiKeyProvenance:
+        source = entry.get("source")
+        if source not in {ApiKeyProvenance.CUSTOM.value, ApiKeyProvenance.GENERATED.value}:
+            source = None
+            if self._provenance_store is not None:
+                try:
+                    source = self._provenance_store.get_api_key_provenance(
+                        key_id=key_id,
+                        secret_fingerprint=self._provenance_fingerprint(
+                            key_id, str(entry.get("key") or ""),
+                        ),
+                    )
+                except Exception:
+                    pass
+        return ApiKeyProvenance(source or ApiKeyProvenance.UNKNOWN.value)
+
+    def _save_provenance(self, key_id: str, secret: str, source: str) -> None:
         if self._provenance_store is not None:
-            secret = str(entry.get("key") or "")
-            if not secret:
-                return ApiKeyProvenance.UNKNOWN
-            fingerprint = self._provenance_fingerprint(key_id, secret)
             try:
-                state, source = self._provenance_store.get_api_key_provenance_state(
+                self._provenance_store.set_api_key_provenance(
                     key_id=key_id,
-                    secret_fingerprint=fingerprint,
+                    secret_fingerprint=self._provenance_fingerprint(key_id, secret),
+                    source=source,
                 )
-                if state == "missing":
-                    configured = str(entry.get("source") or "")
-                    if configured not in {
-                        ApiKeyProvenance.CUSTOM.value,
-                        ApiKeyProvenance.GENERATED.value,
-                    }:
-                        return ApiKeyProvenance.UNKNOWN
-                    try:
-                        state, source = self._provenance_store.adopt_api_key_provenance(
-                            key_id=key_id,
-                            secret_fingerprint=fingerprint,
-                            source=configured,
-                        )
-                    except Exception:
-                        return ApiKeyProvenance(configured)
-                if state != "valid":
-                    return ApiKeyProvenance.UNKNOWN
             except Exception:
-                return ApiKeyProvenance.UNKNOWN
-        else:
-            source = entry.get("source")
-        try:
-            return ApiKeyProvenance(str(source or "unknown"))
-        except ValueError:
-            return ApiKeyProvenance.UNKNOWN
-
-    def _stage_provenance(self, key_id: str, secret: str) -> None:
-        if self._provenance_store is None:
-            return
-        try:
-            self._provenance_store.stage_api_key_provenance(
-                key_id=key_id,
-                secret_fingerprint=self._provenance_fingerprint(key_id, secret),
-            )
-        except Exception as exc:
-            raise ManagementError(
-                ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
-                "API key provenance is unavailable",
-                retryable=True,
-            ) from exc
-
-    def _commit_provenance(self, key_id: str, secret: str, source: str) -> None:
-        if self._provenance_store is None:
-            return
-        try:
-            self._provenance_store.commit_api_key_provenance(
-                key_id=key_id,
-                secret_fingerprint=self._provenance_fingerprint(key_id, secret),
-                source=source,
-            )
-        except Exception:
-            # The staged marker remains source-less, so this generation is
-            # reported as unknown without changing the successful config write.
-            return
+                # Auxiliary provenance must not turn a successful business write
+                # into failure. A record for an older secret will not match.
+                pass
 
     def _forget_provenance(self, key_id: str) -> None:
         if self._provenance_store is None:
@@ -816,8 +772,7 @@ class ApiKeyControl:
         try:
             self._provenance_store.forget_api_key_provenance(key_id=key_id)
         except Exception:
-            # Delete was already published; a staged marker cannot attribute a
-            # later different secret and is therefore safe to leave behind.
+            # Deletion already succeeded; provenance cleanup is best-effort.
             return
 
     @staticmethod

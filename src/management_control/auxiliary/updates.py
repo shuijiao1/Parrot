@@ -44,8 +44,6 @@ STAGE_FAILED = "failed"
 STAGE_ROLLED_BACK = "rolled_back"
 _ACTIVE_STAGES = {STAGE_BACKING_UP, STAGE_PULLING, STAGE_RESTARTING, STAGE_VERIFYING}
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
-_ACTIVATION_EXIT_TIMEOUT_SECONDS = 660.0
-_ACTIVATION_POLL_INTERVAL_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,7 +206,6 @@ class ModuleUpdateGateway:
 
 Scheduler = Callable[[Callable[[], None], str], None]
 Clock = Callable[[], datetime]
-Wait = Callable[[float], None]
 
 
 def _actor_key(context: ManagementContext) -> str:
@@ -228,9 +225,6 @@ class UpdateControl:
         scheduler: Scheduler | None = None,
         clock: Clock | None = None,
         plan_ttl_seconds: int = 600,
-        activation_timeout_seconds: float = _ACTIVATION_EXIT_TIMEOUT_SECONDS,
-        activation_poll_interval_seconds: float = _ACTIVATION_POLL_INTERVAL_SECONDS,
-        activation_wait: Wait | None = None,
     ) -> None:
         self._config = config_gateway or ModuleConfigGateway()
         self._updates = update_gateway or ModuleUpdateGateway()
@@ -238,11 +232,6 @@ class UpdateControl:
         self._scheduler = scheduler
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._plan_ttl = timedelta(seconds=plan_ttl_seconds)
-        if activation_timeout_seconds <= 0 or activation_poll_interval_seconds <= 0:
-            raise ValueError("activation monitor timing must be positive")
-        self._activation_timeout = timedelta(seconds=activation_timeout_seconds)
-        self._activation_poll_interval = float(activation_poll_interval_seconds)
-        self._activation_wait = activation_wait or threading.Event().wait
         self._operation_store: OperationStore | None = None
         self._operation_registry: OperationRegistry | None = None
         self._bound_registries: set[int] = set()
@@ -881,59 +870,6 @@ class UpdateControl:
                 # Orderly owner shutdown may already have interrupted the record.
                 return
 
-        def monitor_accepted_restart() -> None:
-            deadline = self._clock() + self._activation_timeout
-            while True:
-                state = None
-                try:
-                    state = self._state_without_auth()
-                except Exception:
-                    pass
-                if state is not None:
-                    if state.target_version not in {None, target_version}:
-                        store.fail_if_active(
-                            operation_id,
-                            code=ManagementErrorCode.STATE_CONFLICT,
-                            retryable=False,
-                        )
-                        return
-                    if state.stage == STAGE_SUCCESS:
-                        finish_success()
-                        return
-                    if state.stage in {STAGE_FAILED, STAGE_ROLLED_BACK, STAGE_IDLE}:
-                        store.fail_if_active(
-                            operation_id,
-                            code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
-                            retryable=False,
-                        )
-                        return
-                try:
-                    terminal = self._updates.activation_is_terminal()
-                except Exception:
-                    terminal = False
-                if terminal:
-                    finish_success()
-                    return
-                if self._clock() >= deadline:
-                    store.fail_if_active(
-                        operation_id,
-                        code=ManagementErrorCode.UPSTREAM_TIMEOUT,
-                        retryable=False,
-                    )
-                    return
-                self._activation_wait(self._activation_poll_interval)
-                try:
-                    # This is also the cooperative owner-close probe: once the shared
-                    # store interrupts the operation, the monitor exits on the next tick.
-                    store.update_progress(
-                        operation_id,
-                        current=1,
-                        total=2,
-                        message_code="UPDATE_RESTARTING",
-                    )
-                except ManagementError:
-                    return
-
         def run() -> None:
             store.mark_running(operation_id)
             store.update_progress(
@@ -969,7 +905,11 @@ class UpdateControl:
                     return
                 # Restart acceptance is irreversible for this plan, but is not success.
                 self._retire_plan(digest)
-            monitor_accepted_restart()
+            if self._updates.activation_is_terminal():
+                finish_success()
+            # Production acceptance is not completion. Release this worker and
+            # let owner shutdown interrupt the Operation; the new process's
+            # health/rollback and a new Session are the recovery authority.
 
         if self._scheduler is not None:
             self._scheduler(run, "management-update-activate")

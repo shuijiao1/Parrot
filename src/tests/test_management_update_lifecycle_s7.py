@@ -272,79 +272,33 @@ def test_owner_close_during_failed_activation_rearm_retires_plan():
     assert (control._active_plan_digest, control._plans[digest].consumed) == (None, True)
 
 
-def test_restart_acceptance_without_process_exit_has_bounded_failed_terminal():
+def test_restart_acceptance_releases_worker_and_owner_close_interrupts_operation():
     clock = FakeClock()
     gateway = NoExitUpdates(_config())
-    control, store = _bound_control(
-        gateway,
-        clock,
-        activation_timeout_seconds=5,
-        activation_poll_interval_seconds=1,
-        activation_wait=clock.advance,
-    )
+    control, store = _bound_control(gateway, clock)
     try:
         _, token, plan = _stage(control, store)
-        activate_context = _context("activate-no-exit")
-        activation = control.activate_staged(
-            activate_context,
-            plan_token=token,
-            expected_revision=plan["expectedRevision"],
+        context = _context("activate-no-exit")
+        operation = control.activate_staged(
+            context, plan_token=token, expected_revision=plan["expectedRevision"],
         )
-        terminal = _terminal(store, activate_context, activation.id)
-        assert terminal.status is OperationStatus.FAILED
-        assert terminal.error is not None
-        assert terminal.error.code.value == "UPSTREAM_TIMEOUT"
-        assert terminal.error.retryable is False
-        assert terminal.result is None
+        assert gateway.activated.wait(timeout=2)
+        deadline = time.monotonic() + 2
+        while operation.id in store._futures and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert operation.id not in store._futures
         assert gateway.activate_calls == 1
         assert control._active_plan_digest is None
+        clock.advance(3600)
+        accepted = store.get(context, operation.id)
+        assert accepted.status is OperationStatus.RUNNING
+        assert accepted.result is None and accepted.error is None
+        assert store.close(timeout_seconds=0) == 1
+        interrupted = store.get(context, operation.id)
+        assert interrupted.status is OperationStatus.FAILED
+        assert interrupted.error.code.value == "DEPENDENCY_UNAVAILABLE"
     finally:
         store.close()
-
-
-def test_activation_monitor_converges_when_operation_owner_closes():
-    clock = FakeClock()
-    gateway = NoExitUpdates(_config())
-    wait_entered = threading.Event()
-    release_wait = threading.Event()
-
-    def blocking_wait(_seconds: float) -> None:
-        wait_entered.set()
-        release_wait.wait(timeout=2)
-
-    control, store = _bound_control(
-        gateway,
-        clock,
-        activation_timeout_seconds=1000,
-        activation_poll_interval_seconds=1,
-        activation_wait=blocking_wait,
-    )
-    _, token, plan = _stage(control, store)
-    activate_context = _context("activate-before-close")
-    activation = control.activate_staged(
-        activate_context,
-        plan_token=token,
-        expected_revision=plan["expectedRevision"],
-    )
-    assert gateway.activated.wait(timeout=2)
-    assert wait_entered.wait(timeout=2)
-
-    started = time.monotonic()
-    interrupted = store.close(timeout_seconds=0.02)
-    elapsed = time.monotonic() - started
-    try:
-        assert interrupted == 1
-        assert elapsed < 0.5
-        terminal = store.get(activate_context, activation.id)
-        assert terminal.status is OperationStatus.FAILED
-        assert terminal.error is not None
-        assert terminal.error.code.value == "DEPENDENCY_UNAVAILABLE"
-    finally:
-        release_wait.set()
-    deadline = time.monotonic() + 2
-    while activation.id in store._futures and time.monotonic() < deadline:
-        time.sleep(0.005)
-    assert activation.id not in store._futures
 
 
 def test_api_and_telegram_stage_share_callback_lock_without_deadlock():

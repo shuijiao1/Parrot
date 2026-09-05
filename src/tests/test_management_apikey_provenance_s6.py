@@ -13,7 +13,7 @@ from src.management_auth import (
     ManagementPrincipal,
     ManagementStateStore,
 )
-from src.management_control import ManagementContext, ManagementError
+from src.management_control import ManagementContext
 from src.management_control.apikey import ApiKeyControl, ApiKeyProvenance, ApiKeySource
 from src.tests.test_management_apikey_api import build_app, session_headers
 from src.tests.test_management_apikey_control import (
@@ -232,35 +232,7 @@ def test_fingerprints_and_failed_writes_never_misattribute_a_secret(tmp_path, mo
         assert config_store.value["apiKeys"]["config-write-failure"] == before
         assert control.get_api_key(
             read, "config-write-failure",
-        ).source is ApiKeyProvenance.UNKNOWN
-        control.create_api_key(
-            tg,
-            name="stage-write-failure",
-            mode=ApiKeySource.CUSTOM,
-            custom_secret="stage-old-custom-secret",
-        )
-        stage_before = deepcopy(config_store.value["apiKeys"]["stage-write-failure"])
-        with monkeypatch.context() as scoped:
-            scoped.setattr(
-                state_store,
-                "stage_api_key_provenance",
-                lambda **_kwargs: (_ for _ in ()).throw(OSError("stage failed")),
-            )
-            with pytest.raises(ManagementError) as caught:
-                control.replace_api_key_secret(
-                    tg,
-                    "stage-write-failure",
-                    custom_secret="stage-new-custom-secret",
-                    if_match=None,
-                    require_revision=False,
-                    reset_runtime=False,
-                )
-        assert caught.value.code.value == "DEPENDENCY_UNAVAILABLE"
-        assert config_store.value["apiKeys"]["stage-write-failure"] == stage_before
-        assert control.get_api_key(
-            read, "stage-write-failure",
         ).source is ApiKeyProvenance.CUSTOM
-
         control.create_api_key(
             tg,
             name="commit-write-failure",
@@ -270,7 +242,7 @@ def test_fingerprints_and_failed_writes_never_misattribute_a_secret(tmp_path, mo
         with monkeypatch.context() as scoped:
             scoped.setattr(
                 state_store,
-                "commit_api_key_provenance",
+                "set_api_key_provenance",
                 lambda **_kwargs: (_ for _ in ()).throw(OSError("commit failed")),
             )
             changed = control.regenerate_api_key(
@@ -293,3 +265,36 @@ def test_fingerprints_and_failed_writes_never_misattribute_a_secret(tmp_path, mo
         ).source is ApiKeyProvenance.UNKNOWN
     finally:
         state_store.close()
+
+
+def test_auxiliary_source_store_failure_never_blocks_tg_key_writes(tmp_path, monkeypatch):
+    store = ManagementStateStore(str(tmp_path / "unavailable-source.db"), clock=lambda: 1_788_557_400.0)
+    control, config_store, _, _ = make_control(
+        {"apiKeys": {}, "xaiOAuth": {"imageModels": [], "videoModels": []}},
+        provenance_store=store,
+    )
+
+    def unavailable(**kwargs):
+        raise OSError("auxiliary store unavailable")
+
+    monkeypatch.setattr(store, "set_api_key_provenance", unavailable)
+    monkeypatch.setattr(store, "forget_api_key_provenance", unavailable)
+    try:
+        created = control.create_api_key(
+            telegram_context(), name="still-usable", mode=ApiKeySource.CUSTOM,
+            custom_secret="first-custom-secret",
+        )
+        assert created.api_key.source is ApiKeyProvenance.UNKNOWN
+        assert config_store.value["apiKeys"]["still-usable"] == entry("first-custom-secret")
+        changed = control.replace_api_key_secret(
+            telegram_context(), "still-usable", custom_secret="second-custom-secret",
+            if_match=None, require_revision=False, reset_runtime=False,
+        )
+        assert changed.api_key.source is ApiKeyProvenance.UNKNOWN
+        assert config_store.value["apiKeys"]["still-usable"] == entry("second-custom-secret")
+        control.delete_api_key(
+            telegram_context(), "still-usable", if_match=None, require_confirmation=False,
+        )
+        assert "still-usable" not in config_store.value["apiKeys"]
+    finally:
+        store.close()

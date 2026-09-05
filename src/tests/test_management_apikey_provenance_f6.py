@@ -110,7 +110,7 @@ def test_real_asgi_rejected_duplicate_create_preserves_committed_source(
         runtime.close()
 
 
-def test_real_asgi_legacy_config_source_is_adopted_once_and_survives_rebuild(
+def test_real_asgi_legacy_config_source_is_read_only_and_survives_rebuild(
     tmp_path, monkeypatch,
 ):
     initial = {
@@ -130,12 +130,9 @@ def test_real_asgi_legacy_config_source_is_adopted_once_and_survives_rebuild(
         assert detail.status_code == 200, detail.text
         assert detail.json()["data"]["source"] == "custom"
 
-        adopted_rows = _provenance_rows(runtime.state_store)
-        assert len(adopted_rows) == 1
-        assert "legacy" not in repr(adopted_rows)
-        assert "legacy-custom-secret" not in repr(adopted_rows)
+        assert _provenance_rows(runtime.state_store) == before_rows
+        assert config.get() == initial
 
-        config.update(lambda cfg: cfg["apiKeys"]["legacy"].pop("source"))
         rebuilt = ApiKeyControl(
             config_store=config,
             provenance_store=runtime.state_store,
@@ -149,7 +146,7 @@ def test_real_asgi_legacy_config_source_is_adopted_once_and_survives_rebuild(
         )
         assert after_rebuild.status_code == 200, after_rebuild.text
         assert after_rebuild.json()["data"]["source"] == "custom"
-        assert _provenance_rows(runtime.state_store) == adopted_rows
+        assert _provenance_rows(runtime.state_store) == before_rows
     finally:
         runtime.close()
 
@@ -305,63 +302,22 @@ def test_rejected_mutations_preserve_config_and_all_provenance_rows(tmp_path, ca
         state_store.close()
 
 
-def test_side_record_missing_valid_and_invalid_states_control_fallback(tmp_path):
-    state_store = ManagementStateStore(
-        str(tmp_path / "side-states.db"), clock=lambda: 1_788_557_400.0,
+def test_explicit_source_is_authoritative_and_unknown_is_not_guessed(tmp_path):
+    store = ManagementStateStore(str(tmp_path / "source-read.db"), clock=lambda: 1_788_557_400.0)
+    control, _, _, _ = make_control(
+        {"apiKeys": {
+            "known": _entry("known-custom-secret", source="custom"),
+            "unknown": _entry("ccp-prefix-is-not-proof"),
+        }},
+        provenance_store=store,
     )
-    control, config_store, _, _ = make_control(
-        {
-            "apiKeys": {
-                "known": _entry("known-custom-secret", source="custom"),
-                "unknown": _entry("ccp-prefix-is-not-proof"),
-                "tombstone": _entry("tombstone-secret", source="custom"),
-            },
-            "xaiOAuth": {"imageModels": [], "videoModels": []},
-        },
-        provenance_store=state_store,
-    )
-    read = context(Capability.READ)
     try:
-        known_fingerprint = control._provenance_fingerprint(
-            "known", "known-custom-secret",
-        )
-        assert state_store.get_api_key_provenance_state(
-            key_id="known", secret_fingerprint=known_fingerprint,
-        ) == ("missing", None)
-        assert control.get_api_key(read, "known").source is ApiKeyProvenance.CUSTOM
-        assert state_store.get_api_key_provenance_state(
-            key_id="known", secret_fingerprint=known_fingerprint,
-        ) == ("valid", "custom")
-
-        unknown_fingerprint = control._provenance_fingerprint(
-            "unknown", "ccp-prefix-is-not-proof",
-        )
-        assert control.get_api_key(read, "unknown").source is ApiKeyProvenance.UNKNOWN
-        assert state_store.get_api_key_provenance_state(
-            key_id="unknown", secret_fingerprint=unknown_fingerprint,
-        ) == ("missing", None)
-
-        tombstone_fingerprint = control._provenance_fingerprint(
-            "tombstone", "tombstone-secret",
-        )
-        state_store.stage_api_key_provenance(
-            key_id="tombstone", secret_fingerprint=tombstone_fingerprint,
-        )
-        assert state_store.get_api_key_provenance_state(
-            key_id="tombstone", secret_fingerprint=tombstone_fingerprint,
-        ) == ("invalid", None)
-        assert control.get_api_key(read, "tombstone").source is ApiKeyProvenance.UNKNOWN
-
-        config_store.value["apiKeys"]["known"]["key"] = "externally-changed-secret"
-        mismatched = control._provenance_fingerprint(
-            "known", "externally-changed-secret",
-        )
-        assert state_store.get_api_key_provenance_state(
-            key_id="known", secret_fingerprint=mismatched,
-        ) == ("invalid", None)
-        assert control.get_api_key(read, "known").source is ApiKeyProvenance.UNKNOWN
+        before = _provenance_rows(store)
+        assert control.get_api_key(context(Capability.READ), "known").source is ApiKeyProvenance.CUSTOM
+        assert control.get_api_key(context(Capability.READ), "unknown").source is ApiKeyProvenance.UNKNOWN
+        assert _provenance_rows(store) == before
     finally:
-        state_store.close()
+        store.close()
 
 
 def test_successful_source_changes_update_config_side_record_and_reopen(tmp_path):
