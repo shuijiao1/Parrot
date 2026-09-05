@@ -24,6 +24,10 @@ from .schemas.metadata import (
 
 _MANAGEMENT_PREFIX = "/api/management/v1"
 _HTTP_METHODS = ("get", "post", "put", "patch", "delete")
+_LEGACY_ENUM_ALIASES = {
+    "authMethod": "AuthMethod",
+    "operationStatus": "OperationStatus",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,7 +39,7 @@ class DiscoverySnapshot:
 
 @dataclass(slots=True)
 class _DomainValues:
-    actions: list[ManagementActionDescriptor] = field(default_factory=list)
+    action_details: list[ManagementActionDescriptor] = field(default_factory=list)
     providers: set[str] = field(default_factory=set)
     presets: set[str] = field(default_factory=set)
     protocols: set[str] = field(default_factory=set)
@@ -304,6 +308,7 @@ def build_discovery_snapshot(
     document: Mapping[str, object],
     *,
     channel_catalog: object | None = None,
+    principal_capabilities: Iterable[Capability] = (),
 ) -> DiscoverySnapshot:
     """Build one deterministic snapshot without calling network or mutation APIs."""
 
@@ -311,13 +316,16 @@ def build_discovery_snapshot(
     domains: dict[str, _DomainValues] = defaultdict(_DomainValues)
     operation_domains: dict[str, str] = {}
     enum_values: dict[str, list[str]] = {}
+    principal_grants = sorted(
+        set(principal_capabilities), key=lambda capability: capability.value
+    )
 
     for operation_id, method, path, operation in _management_operations(document):
         tags = operation["tags"]
         domain_name = tags[0]
         operation_domains[operation_id] = domain_name
         domain = domains[domain_name]
-        domain.actions.append(
+        domain.action_details.append(
             ManagementActionDescriptor(
                 operationId=operation_id,
                 method=method,
@@ -331,19 +339,26 @@ def build_discovery_snapshot(
                 getattr(domain, category).update(hit.values)
 
     _merge_channel_catalog(domains, operation_domains, channel_catalog)
+    for alias, schema_name in _LEGACY_ENUM_ALIASES.items():
+        if schema_name in enum_values:
+            enum_values[alias] = list(enum_values[schema_name])
 
-    domain_models = tuple(
-        CapabilityDomain(
-            domain=domain_name,
-            actions=sorted(values.actions, key=lambda item: item.operationId),
-            providers=sorted(values.providers),
-            presets=sorted(values.presets),
-            protocols=sorted(values.protocols),
-            modes=sorted(values.modes),
-            features=sorted(values.features),
+    domain_models: list[CapabilityDomain] = []
+    for domain_name, values in sorted(domains.items()):
+        action_details = sorted(values.action_details, key=lambda item: item.operationId)
+        domain_models.append(
+            CapabilityDomain(
+                domain=domain_name,
+                capabilities=list(principal_grants),
+                actions=[item.operationId for item in action_details],
+                actionDetails=action_details,
+                providers=sorted(values.providers),
+                presets=sorted(values.presets),
+                protocols=sorted(values.protocols),
+                modes=sorted(values.modes),
+                features=sorted(values.features),
+            )
         )
-        for domain_name, values in sorted(domains.items())
-    )
     features = tuple(
         ManagementFeatureDescriptor(id=domain.domain, actionCount=len(domain.actions))
         for domain in domain_models
@@ -352,7 +367,7 @@ def build_discovery_snapshot(
         EnumDescriptor(name=name, values=values)
         for name, values in sorted(enum_values.items())
     )
-    return DiscoverySnapshot(features=features, enums=enums, domains=domain_models)
+    return DiscoverySnapshot(features=features, enums=enums, domains=tuple(domain_models))
 
 
 def supported_capabilities() -> list[Capability]:

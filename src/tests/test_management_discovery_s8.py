@@ -153,7 +153,9 @@ def _raw_enum_value_sets(document: dict) -> set[frozenset[str]]:
 def _discovered_actions(capabilities: dict) -> dict[str, tuple[str, str, str]]:
     result = {}
     for domain in capabilities["domains"]:
-        for action in domain["actions"]:
+        details = domain["actionDetails"]
+        assert domain["actions"] == [item["operationId"] for item in details]
+        for action in details:
             operation_id = action["operationId"]
             assert operation_id not in result
             result[operation_id] = (
@@ -167,7 +169,10 @@ def _discovered_actions(capabilities: dict) -> dict[str, tuple[str, str, str]]:
 def _product_projection(capabilities: dict) -> dict:
     return {
         "supportedCapabilities": capabilities["supportedCapabilities"],
-        "domains": capabilities["domains"],
+        "domains": [
+            {key: value for key, value in domain.items() if key != "capabilities"}
+            for domain in capabilities["domains"]
+        ],
     }
 
 
@@ -209,6 +214,8 @@ def test_production_discovery_exactly_describes_routes_catalogs_and_enums(produc
     assert enum_descriptors["OAuthProvider"] == [item.value for item in OAuthProvider]
     assert enum_descriptors["ChannelProtocol"] == [item.value for item in ChannelProtocol]
     assert enum_descriptors["CompatibilityMode"] == [item.value for item in CompatibilityMode]
+    assert enum_descriptors["authMethod"] == enum_descriptors["AuthMethod"]
+    assert enum_descriptors["operationStatus"] == enum_descriptors["OperationStatus"]
     reflected_sets = {frozenset(values) for values in enum_descriptors.values()}
     for declared_values in _raw_enum_value_sets(document):
         assert any(declared_values <= reflected for reflected in reflected_sets)
@@ -247,6 +254,77 @@ def test_production_discovery_exactly_describes_routes_catalogs_and_enums(produc
         not domain["presets"] or domain["domain"] == channel_domain["domain"]
         for domain in capabilities["domains"]
     )
+
+
+def test_v1_legacy_discovery_fields_remain_additive_and_consumable(production_app):
+    app, _ = production_app
+    schemas = app.openapi()["components"]["schemas"]
+    domain_schema = schemas["CapabilityDomain"]
+    legacy_domain_fields = {
+        "domain",
+        "capabilities",
+        "actions",
+        "providers",
+        "presets",
+        "protocols",
+        "modes",
+    }
+    assert legacy_domain_fields <= set(domain_schema["required"])
+    assert domain_schema["properties"]["actions"]["items"] == {"type": "string"}
+    assert domain_schema["properties"]["capabilities"]["deprecated"] is True
+    assert domain_schema["properties"]["actionDetails"]["items"] == {
+        "$ref": "#/components/schemas/ManagementActionDescriptor"
+    }
+
+    with TestClient(app) as client:
+        credential = _create_management_key_session(client)
+        metadata_response = client.get(
+            "/api/management/v1/meta", headers=_bearer(credential)
+        )
+        capabilities_response = client.get(
+            "/api/management/v1/capabilities", headers=_bearer(credential)
+        )
+    assert metadata_response.status_code == capabilities_response.status_code == 200
+    metadata = metadata_response.json()["data"]
+    capabilities = capabilities_response.json()["data"]
+
+    for field in (
+        "apiVersion",
+        "applicationVersion",
+        "supportedCapabilities",
+        "enums",
+        "documentationUrl",
+    ):
+        assert field in metadata
+    enum_descriptors = {item["name"]: item["values"] for item in metadata["enums"]}
+    assert {"authMethod", "operationStatus"} <= set(enum_descriptors)
+    assert {"managementKey", "telegramApproval"} <= set(
+        enum_descriptors["authMethod"]
+    )
+    assert enum_descriptors["operationStatus"] == [
+        "queued",
+        "running",
+        "succeeded",
+        "failed",
+        "cancelled",
+    ]
+
+    for domain in capabilities["domains"]:
+        assert isinstance(domain["domain"], str)
+        for field in (
+            "capabilities",
+            "actions",
+            "providers",
+            "presets",
+            "protocols",
+            "modes",
+        ):
+            assert isinstance(domain[field], list)
+            assert all(isinstance(value, str) for value in domain[field])
+        assert domain["capabilities"] == capabilities["principalCapabilities"]
+        assert domain["actions"] == [
+            action["operationId"] for action in domain["actionDetails"]
+        ]
 
 
 def test_real_server_app_exposes_the_same_complete_discovery(production_app, monkeypatch):
@@ -330,7 +408,11 @@ def test_product_discovery_is_stable_across_grants_and_separate_from_principal(p
         capability.value for capability in Capability
     }
     assert payloads[2]["principalCapabilities"] == [Capability.READ.value]
-    assert all("capabilities" not in domain for domain in payloads[2]["domains"])
+    for payload in payloads:
+        assert all(
+            domain["capabilities"] == payload["principalCapabilities"]
+            for domain in payload["domains"]
+        )
 
 
 def test_discovery_gets_do_not_start_operations_workers_or_network(production_app, monkeypatch):

@@ -43,8 +43,21 @@ class ManagementMetadataData(StrictSchema):
 
 class CapabilityDomain(StrictSchema):
     domain: str = Field(description="Primary OpenAPI tag for this management domain")
-    actions: list[ManagementActionDescriptor] = Field(
-        description="Actually mounted product operations, independent of principal grants"
+    capabilities: list[Capability] = Field(
+        deprecated=True,
+        description=(
+            "Deprecated v1 compatibility alias for the current principal's grants; "
+            "use top-level principalCapabilities, not this field, for authorization"
+        ),
+    )
+    actions: list[str] = Field(
+        description=(
+            "Actually mounted operationId strings. This preserves the v1 string element "
+            "type but does not preserve the former placeholder action labels"
+        )
+    )
+    actionDetails: list[ManagementActionDescriptor] = Field(
+        description="Method and path details for the operationIds listed in actions"
     )
     providers: list[str] = Field(
         description="Provider identifiers constrained by this domain's schema or catalog"

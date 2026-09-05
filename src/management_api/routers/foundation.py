@@ -114,8 +114,12 @@ _METADATA_EXAMPLE = {
         "enums": [
             {
                 "name": "AuthMethod",
-                "values": ["managementKey", "telegramAdmin", "telegramApproval"],
-            }
+                "values": ["managementKey", "telegramApproval", "telegramAdmin"],
+            },
+            {
+                "name": "authMethod",
+                "values": ["managementKey", "telegramApproval", "telegramAdmin"],
+            },
         ],
         "documentationUrl": "/docs",
     },
@@ -128,7 +132,9 @@ _CAPABILITIES_EXAMPLE = {
         "domains": [
             {
                 "domain": "management-auth",
-                "actions": [
+                "capabilities": ["management.read", "management.write"],
+                "actions": ["createManagementSession"],
+                "actionDetails": [
                     {
                         "operationId": "createManagementSession",
                         "method": "POST",
@@ -434,16 +440,19 @@ async def get_management_metadata(
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
 ) -> DataEnvelope[ManagementMetadataData]:
     reject_unknown_query_parameters(request)
-    snapshot = build_discovery_snapshot(request.app.openapi())
+    principal_capabilities = sorted(
+        context.actor.capabilities, key=lambda item: item.value
+    )
+    snapshot = build_discovery_snapshot(
+        request.app.openapi(), principal_capabilities=principal_capabilities
+    )
     return DataEnvelope(
         data=ManagementMetadataData(
             apiVersion="v1",
             applicationVersion=runtime.application_version,
             features=list(snapshot.features),
             supportedCapabilities=supported_capabilities(),
-            principalCapabilities=sorted(
-                context.actor.capabilities, key=lambda item: item.value
-            ),
+            principalCapabilities=principal_capabilities,
             enums=list(snapshot.enums),
             documentationUrl=runtime.documentation_url,
         ),
@@ -475,17 +484,19 @@ async def get_management_capabilities(
     context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
 ) -> DataEnvelope[ManagementCapabilitiesData]:
     reject_unknown_query_parameters(request)
+    principal_capabilities = sorted(
+        context.actor.capabilities, key=lambda item: item.value
+    )
     channel_catalog = runtime.control_owner().channels.get_catalog(context)
     snapshot = build_discovery_snapshot(
         request.app.openapi(),
         channel_catalog=channel_catalog,
+        principal_capabilities=principal_capabilities,
     )
     return DataEnvelope(
         data=ManagementCapabilitiesData(
             supportedCapabilities=supported_capabilities(),
-            principalCapabilities=sorted(
-                context.actor.capabilities, key=lambda item: item.value
-            ),
+            principalCapabilities=principal_capabilities,
             domains=list(snapshot.domains),
         ),
         meta=_meta(request),
