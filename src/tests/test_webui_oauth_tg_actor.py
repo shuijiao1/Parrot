@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from src.tests import _isolation
 
 _isolation.isolate()
@@ -53,11 +55,39 @@ def test_tg_import_restores_usage_quota_and_model_effects_once(monkeypatch):
         }],
         "failed": [],
     }
+    events: list[str] = []
+    original_usage = backend.fetch_usage_snapshot
+    original_model_sync = control.start_post_save_model_sync
+
+    async def traced_usage(account_id):
+        events.append(f"usage:{account_id}")
+        return await original_usage(account_id)
+
+    def traced_model_sync(context, account_id):
+        assert context.actor.subject_id == "telegram:4242"
+        events.append(f"model:{account_id}")
+        return original_model_sync(context, account_id)
+
+    monkeypatch.setattr(backend, "fetch_usage_snapshot", traced_usage)
+    monkeypatch.setattr(control, "start_post_save_model_sync", traced_model_sync)
+    monkeypatch.setattr(
+        oauth_menu.ui, "edit",
+        lambda _chat_id, _message_id, text, **_kwargs: events.append(
+            "progress" if "正在同步模型，请稍候" in text else "result"
+        ),
+    )
 
     result = oauth_menu._commit_staged_openai_import(staged, chat_id=4242)
 
     assert result["added"] == ["tg-import@example.test"]
     assert result["replaced"] == ["admin@example.test"]
+    assert events == [f"usage:{new_id}", f"usage:{existing_id}"]
+    assert backend.model_sync_started == []
+    oauth_menu._wait_import_model_sync(4242, 99, result)
+    assert events == [
+        f"usage:{new_id}", f"usage:{existing_id}", "progress",
+        f"model:{new_id}", f"model:{existing_id}",
+    ]
     assert backend.model_sync_started == [new_id, existing_id]
     assert backend.usage_fetches == [new_id, existing_id]
     assert backend.quota_evaluations == [new_id, existing_id]
@@ -67,6 +97,30 @@ def test_tg_import_restores_usage_quota_and_model_effects_once(monkeypatch):
         if row.action in {"oauth.account.create", "oauth.account.replace"}
     ]
     assert [row.actor for row in mutations] == ["telegram:4242", "telegram:4242"]
+
+
+def test_tg_import_model_launch_error_follows_progress_and_escapes(monkeypatch):
+    failure = RuntimeError("fake model launch failure")
+    events: list[str] = []
+
+    class ControlProbe:
+        def start_post_save_model_sync(self, context, account_id):
+            assert context.actor.subject_id == "telegram:4242"
+            events.append(f"model:{account_id}")
+            return {"model_sync_future": None, "model_sync_error": failure}
+
+    monkeypatch.setattr(oauth_menu, "oauth_control", ControlProbe())
+    monkeypatch.setattr(
+        oauth_menu.ui, "edit",
+        lambda _chat_id, _message_id, _text, **_kwargs: events.append("progress"),
+    )
+    result = {"model_sync_keys": ["account-a"]}
+
+    with pytest.raises(RuntimeError, match="fake model launch failure"):
+        oauth_menu._wait_import_model_sync(4242, 99, result)
+
+    assert events == ["progress", "model:account-a"]
+    assert "model_sync" not in result
 
 
 def test_tg_usage_defaults_and_model_sync_keep_real_chat_actor(monkeypatch):

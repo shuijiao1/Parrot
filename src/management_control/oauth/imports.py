@@ -57,7 +57,7 @@ class OAuthImportControlMixin:
 
     @audit_failures("oauth.import.preview", target="oauthImport")
     def preview_import(
-        self, context, *, format: str, payload: str, filename: str = "",
+        self, context, *, format: str, payload: str | bytes, filename: str = "",
     ) -> OAuthImportPreview:
         self._require(context, Capability.SECRETS_WRITE)
         if format not in {"openai", "cpa", "sub2api"}:

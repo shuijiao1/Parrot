@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import copy
+import io
 import json
 import os
+import zipfile
 from concurrent.futures import Future
 
 import pytest
@@ -200,14 +203,30 @@ def _real_control_client(tmp_path, monkeypatch, accounts, identities):
     return client, headers, runtime, control, calls, writes, path, before
 
 
-def _preview(client, headers, kind: str, email: str, refresh_token: str):
+def _preview(
+    client, headers, kind: str, email: str, refresh_token: str,
+    *, payload_encoding: str | None = None,
+):
+    json_payload = _payload(kind, email, refresh_token)
+    body = {
+        "format": kind,
+        "payload": json_payload,
+        "filename": f"{kind}.json",
+    }
+    if payload_encoding == "base64":
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zipped:
+            zipped.writestr(f"{kind}-account.json", json_payload)
+        body.update({
+            "payloadEncoding": "base64",
+            "payload": base64.b64encode(archive.getvalue()).decode("ascii"),
+            "filename": f"{kind}.zip",
+        })
+    elif payload_encoding is not None:
+        body["payloadEncoding"] = payload_encoding
     return client.post(
         "/api/management/v1/oauth/imports/preview",
-        json={
-            "format": kind,
-            "payload": _payload(kind, email, refresh_token),
-            "filename": f"{kind}.json",
-        },
+        json=body,
         headers=headers,
     )
 
@@ -227,8 +246,9 @@ def _commit(client, headers, preview: dict, action: str):
 
 
 @pytest.mark.parametrize("kind", ["openai", "cpa", "sub2api"])
-def test_real_backend_asgi_preview_commit_supports_all_documented_formats(
-    tmp_path, monkeypatch, kind,
+@pytest.mark.parametrize("payload_encoding", ["json", "base64"])
+def test_real_backend_asgi_preview_commit_supports_all_formats_and_encodings(
+    tmp_path, monkeypatch, kind, payload_encoding,
 ):
     email = f"webui-{kind}@example.test"
     workspace = f"workspace-{kind}"
@@ -240,7 +260,10 @@ def test_real_backend_asgi_preview_commit_supports_all_documented_formats(
     )
     account_id = f"openai:{email}:{workspace}"
     try:
-        preview_response = _preview(client, headers, kind, email, refresh_token)
+        preview_response = _preview(
+            client, headers, kind, email, refresh_token,
+            payload_encoding=payload_encoding,
+        )
         assert preview_response.status_code == 200, preview_response.text
         preview = preview_response.json()["data"]
         assert preview["errors"] == []
@@ -284,6 +307,32 @@ def test_real_backend_asgi_preview_commit_supports_all_documented_formats(
         assert replay.status_code == 400
         assert replay.json()["error"]["code"] == "INVALID_OPERATION_STATE"
         assert len(writes) == 1
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_import_payload_encoding_and_base64_fail_as_typed_validation(
+    tmp_path, monkeypatch,
+):
+    client, headers, _runtime, _control, calls, writes, _path, before = (
+        _real_control_client(tmp_path, monkeypatch, [], {})
+    )
+    try:
+        cases = (
+            {"format": "openai", "payloadEncoding": "hex", "payload": "7b7d"},
+            {"format": "openai", "payloadEncoding": "base64", "payload": "%%%not-base64%%%"},
+        )
+        for body in cases:
+            response = client.post(
+                "/api/management/v1/oauth/imports/preview",
+                json=body,
+                headers=headers,
+            )
+            assert response.status_code == 422, response.text
+            assert response.json()["error"]["code"] == "VALIDATION_FAILED"
+        assert config.get() == before
+        assert writes == []
+        assert all(not values for values in calls.values())
     finally:
         client.__exit__(None, None, None)
 
