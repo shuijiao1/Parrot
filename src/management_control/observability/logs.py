@@ -211,7 +211,7 @@ class LogsControl:
 
     def detail(self, context: ManagementContext, log_id: str) -> dict[str, Any]:
         require(context)
-        raw = self.log_db.log_detail(log_id)
+        raw = self.log_db.management_log_detail(log_id)
         if not raw or not raw.get("log"):
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         detail = raw.get("detail") or {}
@@ -236,7 +236,7 @@ class LogsControl:
 
     def _raw_body(self, context: ManagementContext, log_id: str, kind: LogBodyKind) -> Any:
         require(context, Capability.LOG_BODY_READ)
-        raw = self.log_db.log_detail(log_id)
+        raw = self.log_db.management_log_detail(log_id)
         if not raw or not raw.get("log"):
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         detail = raw.get("detail") or {}
@@ -246,23 +246,16 @@ class LogsControl:
         return value
 
     @staticmethod
-    def _sanitize_raw(value: Any) -> Any:
+    def _raw_business_body(value: Any) -> Any:
+        """Return the stored business body without generic credential rewriting."""
+
         if isinstance(value, (dict, list)):
-            return sanitize_credentials(value)
+            return copy.deepcopy(value)
         text = str(value)
         try:
-            parsed = json.loads(text)
+            return json.loads(text)
         except Exception:
-            return sanitize_credentials(text)
-        return sanitize_credentials(parsed)
-
-    @classmethod
-    def _sanitize_parser_input(cls, value: Any) -> Any:
-        """Sanitize bodies without changing a SQLite text row into a dict input."""
-        clean = cls._sanitize_raw(value)
-        if isinstance(value, str) and isinstance(clean, (dict, list)):
-            return json.dumps(clean, ensure_ascii=False)
-        return clean
+            return text
 
     def body_items(
         self,
@@ -277,9 +270,11 @@ class LogsControl:
         page_size: int,
     ) -> LogBodyPageResult:
         raw = self._raw_body(context, log_id, kind)
-        clean = self._sanitize_parser_input(raw)
-        parsed = inspector.parse_request_body(clean) if kind is LogBodyKind.REQUEST else inspector.parse_response_body(clean)
-        searched = inspector.filter_items(parsed, query)
+        parser = (
+            inspector.parse_request_body
+            if kind is LogBodyKind.REQUEST else inspector.parse_response_body
+        )
+        searched = inspector.filter_items(parser(raw), query)
         counts: dict[str, int] = {}
         for item in searched:
             item_type = str(item.get("kind") or "")
@@ -290,7 +285,7 @@ class LogsControl:
         items = inspector.sort_items(items, sort.value)
         result = page_slice(items, page=page, page_size=page_size)
         return LogBodyPageResult(
-            tuple(camelize(sanitize_credentials(item)) for item in result.items),
+            tuple(camelize(item) for item in result.items),
             page,
             page_size,
             result.total,
@@ -306,22 +301,25 @@ class LogsControl:
         item_id: str,
     ) -> dict[str, Any]:
         raw = self._raw_body(context, log_id, kind)
-        clean = self._sanitize_parser_input(raw)
-        items = inspector.parse_request_body(clean) if kind is LogBodyKind.REQUEST else inspector.parse_response_body(clean)
+        parser = (
+            inspector.parse_request_body
+            if kind is LogBodyKind.REQUEST else inspector.parse_response_body
+        )
+        items = parser(raw)
         try:
             seq = int(item_id.removeprefix("item_"))
         except (TypeError, ValueError):
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         for item in items:
             if int(item.get("seq") or 0) == seq:
-                result = camelize(sanitize_credentials(item))
+                result = camelize(item)
                 result["id"] = f"item_{seq}"
                 return result
         raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
 
     def raw_body(self, context: ManagementContext, log_id: str, *, kind: LogBodyKind) -> dict[str, Any]:
         raw = self._raw_body(context, log_id, kind)
-        return {"logId": log_id, "kind": kind.value, "body": self._sanitize_raw(raw)}
+        return {"logId": log_id, "kind": kind.value, "body": self._raw_business_body(raw)}
 
     def log_store_bodies(self, context: ManagementContext) -> bool:
         require(context)
