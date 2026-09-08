@@ -39,6 +39,14 @@ def pop_state(chat_id: int) -> Optional[dict]:
         return _states.pop(chat_id, None)
 
 
+def pop_state_if_current(chat_id: int, data: dict) -> Optional[dict]:
+    """A background result may only clear the exact input state it owns."""
+    with _lock:
+        if (_states.get(chat_id) or {}).get("data") is data:
+            return _states.pop(chat_id)
+        return None
+
+
 def cleanup() -> int:
     """清理过期状态，返回清理条数。"""
     now = time.time()

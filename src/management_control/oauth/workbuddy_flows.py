@@ -41,7 +41,7 @@ class WorkBuddyFlows:
                                     "expires_at": plan.expires_at, "status": "pending"}
         region = "国际区（Google/GitHub）" if realm == "global" else "中国区 CLI"
         return OAuthLoginFlow(flow_id, secret, OAuthProvider.WORKBUDDY, payload["auth_url"],
-                              f"在浏览器完成{region}授权，点击检查登录；未完成可以再次检查。", plan.expires_at)
+                              f"在浏览器完成{region}授权；轮询确认身份后直接保存账户，无需再次确认。", plan.expires_at)
 
     def _terminal(self, actor, flow_id, secret):
         with self._known_lock:
@@ -49,14 +49,19 @@ class WorkBuddyFlows:
             digest = hashlib.sha256(str(secret or "").encode()).digest()
             if not record or not hmac.compare_digest(record["verifier"], digest) or record["actor"] != actor:
                 raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
-            if record["status"] == "pending" and record["expires_at"] <= self.clock():
+            if record["status"] == "pending" and not record.get("saving") and record["expires_at"] <= self.clock():
                 record["status"] = "expired"
                 try:
                     self.store.inspect_parts(flow_id, secret, actor_subject_id=actor, kind="workbuddy-login")
                 except ManagementError:
                     pass
             if record["status"] != "pending":
-                return OAuthLoginPoll(flow_id, record["status"], record["expires_at"], None)
+                result = record.get("result")
+                return OAuthLoginPoll(
+                    flow_id, record["status"], record["expires_at"], copy.deepcopy(record.get("preview")),
+                    result.account_id if result else None, result.status if result else None,
+                    result.revision if result else None,
+                )
         return None
 
     @contextmanager
@@ -71,6 +76,21 @@ class WorkBuddyFlows:
             yield plan
         finally:
             lock.release()
+
+    @contextmanager
+    def saving(self, actor, flow_id, secret):
+        # Cancellation can interrupt vendor polling, but not a local commit that
+        # has already begun. No network wait is made while holding this lock.
+        with self._known_lock:
+            if self._terminal(actor, flow_id, secret) is not None:
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            self._known[flow_id]["saving"] = True
+        try:
+            yield
+        finally:
+            with self._known_lock:
+                if flow_id in self._known:
+                    self._known[flow_id].pop("saving", None)
 
     @staticmethod
     def preview(payload: dict) -> dict | None:
@@ -106,7 +126,15 @@ class WorkBuddyFlows:
             raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
         return copy.deepcopy(plan.payload["entry"])
 
-    def finish(self, actor: str, flow_id: str, secret: str, *, completed: bool = False) -> None:
+    def completed_result(self, actor: str, flow_id: str, secret: str):
+        terminal = self._terminal(actor, flow_id, secret)
+        if terminal is not None and terminal.status == "completed":
+            with self._known_lock:
+                return self._known[flow_id]["result"]
+        return None
+
+    def finish(self, actor: str, flow_id: str, secret: str, *, completed: bool = False,
+               result=None, preview=None) -> None:
         try:
             self.store.consume_parts(flow_id, secret, actor_subject_id=actor, kind="workbuddy-login")
         except ManagementError:
@@ -116,14 +144,27 @@ class WorkBuddyFlows:
                 raise
         with self._known_lock:
             if flow_id in self._known:
-                self._known[flow_id]["status"] = "completed" if completed else "cancelled"
+                self._known[flow_id].update(
+                    status="completed" if completed else "cancelled",
+                    result=result, preview=copy.deepcopy(preview),
+                )
 
     def cancel(self, actor: str, flow_id: str, secret: str) -> None:
-        terminal = self._terminal(actor, flow_id, secret)
-        if terminal is not None:
-            if terminal.status in {"cancelled", "expired"}:
-                return
-            raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
-        with self.lease(actor, flow_id, secret) as plan:
-            self.finish(actor, flow_id, secret)
-            plan.payload.clear()
+        with self._known_lock:
+            terminal = self._terminal(actor, flow_id, secret)
+            if terminal is not None:
+                if terminal.status in {"cancelled", "expired"}:
+                    return
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            if self._known[flow_id].get("saving"):
+                raise ManagementError(ManagementErrorCode.STATE_CONFLICT, retryable=True)
+            plan = self.store.consume_parts(flow_id, secret, actor_subject_id=actor, kind="workbuddy-login")
+            self._known[flow_id]["status"] = "cancelled"
+        # In-flight polling owns its payload until its post-request inspect fails;
+        # consuming the store above prevents that result from ever being saved.
+        lock = plan.payload["lock"]
+        if lock.acquire(blocking=False):
+            try:
+                plan.payload.clear()
+            finally:
+                lock.release()

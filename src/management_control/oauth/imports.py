@@ -36,14 +36,6 @@ class OAuthImportControlMixin:
         return None
 
     def _prepare_import_entry(self, value) -> dict:
-        if isinstance(value, dict) and "_workbuddy_import" in value:
-            from src.oauth.workbuddy import normalize_credential
-            # WorkBuddy imports have AT/RT/UID, not an independently verified
-            # browser identity. Never rotate imported credentials to preview them.
-            entry = normalize_credential(value["_workbuddy_import"], source="import")
-            if entry["realm"] != "cn":
-                raise ValueError("WorkBuddy international JSON import has been removed")
-            return entry
         # Parsed material is never trusted as a complete account. Every candidate
         # must pass through the native refresh/token/identity conversion first.
         parts = self._unprepared_candidate(value)
@@ -68,7 +60,7 @@ class OAuthImportControlMixin:
         self, context, *, format: str, payload: str | bytes, filename: str = "",
     ) -> OAuthImportPreview:
         self._require(context, Capability.SECRETS_WRITE)
-        if format not in {"openai", "cpa", "sub2api", "workbuddy"}:
+        if format not in {"openai", "cpa", "sub2api"}:
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
 
         problems: list[OAuthImportProblem] = []

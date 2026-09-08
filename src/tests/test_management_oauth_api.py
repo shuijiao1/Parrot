@@ -767,7 +767,9 @@ def test_control_login_flows_cover_every_supported_provider(provider):
     context = telegram_context(42)
     flow = control.start_login_flow(context, provider)
     if provider is OAuthProvider.WORKBUDDY:
-        assert control.poll_login_flow(context, flow.flow_id, flow.flow_secret).status == "ready"
+        poll = control.poll_login_flow(context, flow.flow_id, flow.flow_secret)
+        assert poll.status == "completed" and poll.save_status == "created"
+        assert backend.get_account(poll.account_id) is not None
         command = CompleteOAuthLoginCommand(completed=True)
     elif provider is OAuthProvider.CURSOR:
         command = CompleteOAuthLoginCommand(completed=True)

@@ -1,12 +1,20 @@
-"""Authenticated, account-scoped WorkBuddy CLI model discovery."""
+"""Authenticated client catalogs; 404/405-only fallback, never union sources."""
 from __future__ import annotations
 
 from . import common
 
 
 def fetch_models_sync(account: dict, *, account_key: str = "", timeout: float = 20.0) -> list[dict]:
-    data = common.request(account, "/console/enterprises/personal/models", method="GET",
-                          kind="account", account_key=account_key, timeout=timeout)
+    try:
+        data = common.request(account, "/console/enterprises/personal/models", method="GET",
+                              kind="account", account_key=account_key, timeout=timeout)
+    except common.WorkBuddyError as exc:
+        # Auth/rate limits/transient failures are not evidence of a missing route.
+        # The same account, host and profile must validate the alternate catalog.
+        if exc.status_code not in {404, 405}:
+            raise
+        data = common.request(account, "/v3/config", method="GET",
+                              kind="account", account_key=account_key, timeout=timeout)
     models, agents = data.get("models"), data.get("agents")
     if not isinstance(models, list) or not isinstance(agents, list):
         raise common.WorkBuddyError("models", kind="invalid_catalog")

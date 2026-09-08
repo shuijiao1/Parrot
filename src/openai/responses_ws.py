@@ -1028,12 +1028,13 @@ async def _run_ws_failover(
                 try:
                     ek = notifier.escape_html
                     prov = getattr(ch, "provider", "") or oauth_manager.provider_of(ak)
+                    relogin_hint = "重新登录" if prov == "workbuddy" else "重新登录或粘贴新 JSON"
                     notifier.notify_event(
                         "oauth_refresh_failed",
                         "⚠ <b>OAuth Token 刷新失败</b>（Responses WS 请求路径触发）\n"
                         f"账号: <code>{ek(email)}</code> · {notifier.provider_tag(prov)}\n"
                         f"原因: <code>{ek(str(exc))}</code>\n"
-                        "账号已被自动禁用 (auth_error)。请通过 TG Bot 重新登录或粘贴新 JSON。"
+                        f"账号已被自动禁用 (auth_error)。请通过 TG Bot {relogin_hint}。"
                     )
                 except Exception:
                     pass

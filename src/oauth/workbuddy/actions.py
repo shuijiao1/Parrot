@@ -134,6 +134,17 @@ def execute(account_key: str, action: str, *, actor: str, source: str = "manual"
             return public_record(old)
         if old and old.get("status") in {"pending", "unknown"}:
             return _reconcile(account_key, account, key, old)
+        if source == "auto":
+            # A fresh evening opportunity may retry a *certain* rejection from
+            # before 21:05. Pending/unknown returned above only reconcile. The
+            # durable attempt timestamp also prevents retries after a restart.
+            now_bjt = datetime.now(billing.CN_TIMEZONE)
+            evening = now_bjt.replace(hour=21, minute=5, second=0, microsecond=0)
+            previous_at = common.number((old or {}).get("updated_at"))
+            retry_failed = bool(old and old.get("status") in {"failed", "rejected"}
+                                and now_bjt >= evening and previous_at is not None
+                                and previous_at < evening.timestamp() * 1000)
+            allow_unknown = False
         if old and not retry_failed:
             return public_record(old)
         if action == "claim_trial" and not free_trial_confirmed:
@@ -157,7 +168,7 @@ def execute(account_key: str, action: str, *, actor: str, source: str = "manual"
         candidate = {"owner": owner(account_key), "action": action, "business_date": day,
             "attempt_id": uuid.uuid4().hex, "actor": actor, "source": source,
             "credential_generation": generation, "confirmed_at": now, "created_at": now, "updated_at": now}
-        intent = state_db.workbuddy_action_begin(key, candidate, retry_failed=retry_failed and source == "manual")
+        intent = state_db.workbuddy_action_begin(key, candidate, retry_failed=retry_failed)
         if not intent["created"]:
             return public_record(intent["record"])
         record = intent["record"]
@@ -219,14 +230,15 @@ def auto_checkin_once() -> dict:
         key = oauth_manager.get_account_key(account)
         if account.get("disabled_reason") not in (None, "quota"):
             continue
-        if _next_auto_at.get(key, 0) > time.monotonic():
-            continue
         day = now.strftime("%Y-%m-%d")
-        previous_day, count = _auto_attempts.get(key, (day, 0))
-        count = count if previous_day == day else 0
+        window = day + (":evening" if (now.hour, now.minute) >= (21, 5) else ":morning")
+        previous_window, count = _auto_attempts.get(key, (window, 0))
+        if previous_window == window and _next_auto_at.get(key, 0) > time.monotonic():
+            continue
+        count = count if previous_window == window else 0
         if count >= 3:
             continue
-        _auto_attempts[key] = (day, count + 1)
+        _auto_attempts[key] = (window, count + 1)
         _next_auto_at[key] = time.monotonic() + 15 * 60
         try:
             results[key] = execute(key, "checkin", actor="scheduler:workbuddy", source="auto")

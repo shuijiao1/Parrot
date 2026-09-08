@@ -25,7 +25,7 @@ def test_policy_describes_real_login_regions_and_accepted_profiles(api, monkeypa
     assert response.status_code == 200, response.text
     policy = response.json()["data"]
     assert policy["browserLoginRealms"] == ["cn", "global"]
-    assert policy["importRealms"] == ["cn"]
+    assert policy["importRealms"] == []
     assert policy["clientProfile"] == "cli"
     assert policy["clientProfilesByRealm"] == {"cn": "cli", "global": "ide"}
     calls = []

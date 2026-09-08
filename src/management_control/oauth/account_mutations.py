@@ -208,7 +208,11 @@ class OAuthAccountMutationControlMixin:
                 if command.completed is not True:
                     raise ManagementError(ManagementErrorCode.INVALID_REQUEST)
                 device = self._flows.workbuddy
-                with device.lease(context.actor.subject_id, flow_id, flow_secret) as plan:
+                saved = device.completed_result(context.actor.subject_id, flow_id, flow_secret)
+                if saved is not None:
+                    return saved
+                with device.lease(context.actor.subject_id, flow_id, flow_secret) as plan, \
+                        device.saving(context.actor.subject_id, flow_id, flow_secret):
                     entry = device.ready(plan)
                     if command.replace_plan_token:
                         result = self._commit_replace_plan(
@@ -216,8 +220,18 @@ class OAuthAccountMutationControlMixin:
                             flow_binding=(flow_id, flow_secret),
                         )
                     else:
-                        result = self._create_entry(context, entry, flow_binding=(flow_id, flow_secret))
-                    device.finish(context.actor.subject_id, flow_id, flow_secret, completed=True)
+                        try:
+                            result = self._create_entry(context, entry, flow_binding=(flow_id, flow_secret))
+                        except OAuthReplaceRequired as conflict:
+                            # WorkBuddy browser login explicitly authorizes saving
+                            # this exact identity. Keep the existing CAS replacement
+                            # path and its settings preservation; never implicit upsert.
+                            result = self._commit_replace_plan(
+                                context, conflict.plan_token, candidate=entry,
+                                flow_binding=(flow_id, flow_secret),
+                            )
+                    device.finish(context.actor.subject_id, flow_id, flow_secret, completed=True,
+                                  result=result, preview=device.preview(plan.payload))
                     plan.payload.clear()
             elif command.replace_plan_token:
                 result = self._commit_replace_plan(

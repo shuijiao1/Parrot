@@ -144,10 +144,6 @@ class ManualCredential:
     workspace_id: str | None = None
     project_id: str | None = None
     expires_at: str | None = None
-    realm: str | None = None
-    uid: str | None = None
-    enterprise_id: str | None = None
-    domain: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +198,9 @@ class OAuthLoginPoll:
     status: str
     expires_at: datetime
     account_preview: dict | None = None
+    account_id: str | None = None
+    save_status: str | None = None
+    revision: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

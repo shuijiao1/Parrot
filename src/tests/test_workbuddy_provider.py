@@ -57,7 +57,7 @@ def test_identity_no_email_and_scope_collisions():
 
 
 @pytest.mark.parametrize("shape", ["nested", "camel", "snake"])
-def test_import_shapes_and_unknown_expiry(shape):
+def test_stored_credential_shapes_and_unknown_expiry_remain_compatible(shape):
     raw = {"accessToken": "fixture-at", "refreshToken": "fixture-rt", "domain": "www.codebuddy.cn", "expiresIn": 3600}
     user = {"uid": "id", "enterpriseId": "team", "nickname": "演示账号"}
     value = {"auth": raw, "account": user} if shape == "nested" else dict(raw, **user)
@@ -66,7 +66,7 @@ def test_import_shapes_and_unknown_expiry(shape):
     entry = auth.normalize_credential(value)
     assert entry["expired"] == ""
     assert entry["label"] == "演示账号"
-    assert entry["workbuddy_identity_source"] == "import"
+    assert entry["workbuddy_identity_source"] == "import"  # Preserve existing imported-account metadata.
 
 
 @pytest.mark.parametrize("expiry", ["2026-09-07 18:30:00", "bad", True, {}, -1000.0])

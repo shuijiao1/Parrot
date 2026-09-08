@@ -14,6 +14,17 @@ from ..providers.workbuddy_codec import WorkBuddyStream
 from .base import ChannelDisplay, UpstreamRequest, build_dispatch_metadata
 
 
+CLIENT_IDENTITY = "You are CodeBuddy Code."
+
+
+def add_client_identity(payload: dict) -> None:
+    """Add the client identity without rewriting business roles/content/order."""
+    messages = payload.get("messages") or []
+    identity = {"role": "system", "content": CLIENT_IDENTITY}
+    if not messages or messages[0] != identity:
+        payload["messages"] = [identity, *messages]
+
+
 def normalize_tool_choice(payload: dict) -> None:
     """The CLI endpoint accepts a string, never an OpenAI choice object."""
     choice = payload.get("tool_choice")
@@ -106,6 +117,7 @@ class WorkBuddyOAuthChannel(OpenAIApiChannel):
         if effort is not None and efforts and effort not in efforts:
             raise guard.GuardError(400, "invalid_request_error", "Requested reasoning_effort is not supported by this WorkBuddy model", param="reasoning_effort", scope="candidate")
         normalize_tool_choice(payload)
+        add_client_identity(payload)
         payload["stream"] = True
         payload["stream_options"] = {**(payload.get("stream_options") or {}), "include_usage": True}
         token = await oauth_manager.ensure_channel_token(self)

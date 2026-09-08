@@ -303,6 +303,8 @@ class OAuthFlowService:
         return self.antigravity_entry(token, now=now)
 
     def credential_entry(self, credential: OAuthCredential) -> dict:
+        if credential.provider is OAuthProvider.WORKBUDDY:
+            raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         now = self._now()
         if isinstance(credential, ManualCredential):
             entry = {
@@ -326,14 +328,6 @@ class OAuthFlowService:
                 entry.update(workspace_id=credential.workspace_id, chatgpt_account_id=credential.workspace_id)
             if credential.project_id:
                 entry["project_id"] = credential.project_id
-            if credential.provider is OAuthProvider.WORKBUDDY:
-                from src.oauth.workbuddy import normalize_credential
-                entry.update(realm=credential.realm, uid=credential.uid,
-                             enterprise_id=credential.enterprise_id, domain=credential.domain)
-                try:
-                    return normalize_credential(entry)
-                except ValueError:
-                    raise ManagementError(ManagementErrorCode.VALIDATION_FAILED) from None
             return entry
         if isinstance(credential, JsonCredential):
             try:
@@ -342,12 +336,6 @@ class OAuthFlowService:
                 raise ManagementError(ManagementErrorCode.VALIDATION_FAILED) from exc
             if not isinstance(value, dict):
                 raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
-            if credential.provider is OAuthProvider.WORKBUDDY:
-                from src.oauth.workbuddy import normalize_credential
-                try:
-                    return normalize_credential(value)
-                except ValueError:
-                    raise ManagementError(ManagementErrorCode.VALIDATION_FAILED) from None
             return self.credential_entry(
                 ManualCredential(
                     provider=credential.provider,

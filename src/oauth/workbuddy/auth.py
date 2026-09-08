@@ -1,8 +1,7 @@
-"""WorkBuddy device-style login, credential imports and refresh normalization."""
+"""WorkBuddy browser login, stored credential normalization and refresh."""
 from __future__ import annotations
 
 import copy
-import json
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode, quote
@@ -79,22 +78,6 @@ def normalize_credential(value: dict, *, realm: str | None = None, source: str =
         entry["last_refresh"] = utc_text(time.time())
     identity(entry)  # Validate every identity component before publication.
     return entry
-
-
-def parse_import_payload(payload: str | bytes) -> list[dict]:
-    if not isinstance(payload, (str, bytes)) or len(payload) > 1024 * 1024:
-        raise ValueError("WorkBuddy import must be JSON within 1 MiB")
-    value = json.loads(payload)
-    if isinstance(value, dict) and isinstance(value.get("accounts"), list):
-        realm = value.get("realm")
-        values = [dict(item, realm=item.get("realm") or realm) if isinstance(item, dict) else item for item in value["accounts"]]
-    else:
-        values = value if isinstance(value, list) else [value]
-    if not values or len(values) > 200:
-        raise ValueError("WorkBuddy import supports 1–200 accounts")
-    # A marker wraps the original value without overwriting its declared provider;
-    # per-candidate normalization below can still report an explicit wrong type.
-    return [{"_workbuddy_import": item} for item in values]
 
 
 def start_login_sync(*, realm: str = "cn", client_profile: str | None = None) -> dict:

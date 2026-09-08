@@ -4792,7 +4792,6 @@ def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
             [ui.provider_button("OpenAI 导入 CPA 文件", "oa:import:cpa", "openai")],
             [ui.provider_button("WorkBuddy 中国区登录", "oa:wb:login", "workbuddy")],
             [ui.provider_button("WorkBuddy 国际区登录", "oa:wb:login:global", "workbuddy")],
-            [ui.provider_button("WorkBuddy 中国区 JSON 导入", "oa:wb:import", "workbuddy")],
             [ui.btn("◀ 返回列表", "menu:oauth")],
             [ui.btn("🏠 返回主菜单", "menu:main")],
         ]),
@@ -6584,8 +6583,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
 
 
 def handle_text_state(chat_id: int, action: str, text: str) -> bool:
-    if action == "oa_wb_import":
-        workbuddy_menu.import_payload(chat_id, text)
+    if action in {"oa_wb_import", "oa_wb_import_preview"}:
+        workbuddy_menu.reject_removed_import(chat_id)
         return True
     if action == "oa_login_code":
         on_login_code_input(chat_id, text)
@@ -6624,8 +6623,8 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
 
 
 def handle_document_state(chat_id: int, action: str, msg: dict) -> bool:
-    if action == "oa_wb_import":
-        workbuddy_menu.handle_document(chat_id, msg)
+    if action in {"oa_wb_import", "oa_wb_import_preview"}:
+        workbuddy_menu.reject_removed_import(chat_id)
         return True
     if action == "oa_openai_import":
         on_import_openai_document_input(chat_id, msg)

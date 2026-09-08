@@ -665,9 +665,6 @@ class OAuthBackend:
     def parse_import(
         self, kind: str, payload, *, filename: str = "",
     ) -> list[OpenAIImportCandidate]:
-        if kind == "workbuddy":
-            from src.oauth.workbuddy.auth import parse_import_payload
-            return parse_import_payload(payload)
         return parse_openai_import_payload(kind, payload, filename=filename)
 
     def cursor_catalog_records(self, account: dict) -> list[dict]:

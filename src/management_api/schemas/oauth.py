@@ -90,9 +90,16 @@ class OAuthAccountDetailData(StrictSchema):
     workbuddy: dict | None = None
 
 
+# WorkBuddy credentials are acquired only through its browser login flow.
+ImportedOAuthProvider = Literal[
+    OAuthProvider.CLAUDE, OAuthProvider.OPENAI, OAuthProvider.XAI,
+    OAuthProvider.CURSOR, OAuthProvider.ANTIGRAVITY,
+]
+
+
 class ManualOAuthCredential(StrictSchema):
     kind: Literal["manual"]
-    provider: OAuthProvider
+    provider: ImportedOAuthProvider
     email: str = Field(default="", max_length=320)
     accessToken: SecretStr = Field(min_length=1, json_schema_extra={"writeOnly": True})
     refreshToken: SecretStr = Field(min_length=1, json_schema_extra={"writeOnly": True})
@@ -101,30 +108,23 @@ class ManualOAuthCredential(StrictSchema):
     workspaceId: str | None = Field(default=None, max_length=500)
     projectId: str | None = Field(default=None, max_length=500)
     expiresAt: str | None = Field(default=None, max_length=64)
-    realm: Literal["cn", "global"] | None = None
-    uid: str | None = Field(default=None, min_length=1, max_length=256)
-    enterpriseId: str | None = Field(default=None, max_length=256)
-    domain: str | None = Field(default=None, max_length=256)
 
     @model_validator(mode="after")
     def validate_identity(self):
-        if self.provider is OAuthProvider.WORKBUDDY:
-            if not self.uid or not (self.realm or self.domain):
-                raise ValueError("WorkBuddy requires uid and region/domain")
-        elif not self.email.strip():
+        if not self.email.strip():
             raise ValueError("email is required for this provider")
         return self
 
 
 class JsonOAuthCredential(StrictSchema):
     kind: Literal["json"]
-    provider: OAuthProvider
+    provider: ImportedOAuthProvider
     payload: SecretStr = Field(min_length=2, max_length=200_000, json_schema_extra={"writeOnly": True})
 
 
 class RefreshTokenOAuthCredential(StrictSchema):
     kind: Literal["refreshToken"]
-    provider: OAuthProvider
+    provider: ImportedOAuthProvider
     refreshToken: SecretStr = Field(min_length=20, json_schema_extra={"writeOnly": True})
     emailHint: str | None = Field(default=None, max_length=320)
 
@@ -200,6 +200,9 @@ class OAuthLoginPollData(StrictSchema):
     status: Literal["pending", "identity_pending", "ready", "completed", "cancelled", "expired"]
     expiresAt: datetime
     accountPreview: dict | None = None
+    accountId: str | None = None
+    saveStatus: Literal["created", "replaced"] | None = None
+    revision: str | None = None
 
 
 class CompleteOAuthLoginFlowRequest(StrictSchema):
@@ -221,7 +224,7 @@ _MAX_IMPORT_DECODED_PAYLOAD_BYTES = 1_500_000
 
 
 class PreviewOAuthImportRequest(StrictSchema):
-    format: Literal["openai", "cpa", "sub2api", "workbuddy"]
+    format: Literal["openai", "cpa", "sub2api"]
     payloadEncoding: Literal["json", "base64"] = "json"
     payload: SecretStr = Field(
         min_length=1,

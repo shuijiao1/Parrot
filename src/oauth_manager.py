@@ -6019,7 +6019,8 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
                             out[email] = "skipped:deleted_generation"
                             continue
                         set_enabled(ak, False, reason="auth_error")
-                        disabled_line = "\n账号已被自动禁用 (auth_error)。请到「🔐 管理 OAuth」重新登录或粘贴新 JSON。"
+                        relogin_hint = "重新登录" if provider == "workbuddy" else "重新登录或粘贴新 JSON"
+                        disabled_line = f"\n账号已被自动禁用 (auth_error)。请到「🔐 管理 OAuth」{relogin_hint}。"
                 except Exception:
                     disabled_line = "\n⚠ 自动禁用写入失败，请查看 systemd 日志。"
             else:

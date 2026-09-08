@@ -449,7 +449,6 @@ def test_oauth_04_06_strict_trace(case, monkeypatch):
         rows[-2:-2] = [
             [{"text": "WorkBuddy 中国区登录", "callback_data": "oa:wb:login", "icon_custom_emoji_id": "6120617435214132136"}],
             [{"text": "WorkBuddy 国际区登录", "callback_data": "oa:wb:login:global", "icon_custom_emoji_id": "6120617435214132136"}],
-            [{"text": "WorkBuddy 中国区 JSON 导入", "callback_data": "oa:wb:import", "icon_custom_emoji_id": "6120617435214132136"}],
         ]
     check_trace(expected, observed)
 

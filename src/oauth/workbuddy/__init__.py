@@ -1,4 +1,4 @@
-"""WorkBuddy OAuth provider (CLI profile; CN login, CN/Global imports)."""
+"""WorkBuddy OAuth provider (CN CLI / Global IDE browser login)."""
 from .auth import ACCOUNT_FIELDS, identity, normalize_credential, poll_login_sync, refresh_sync, start_login_sync
 from .billing import execute_action_sync, fetch_checkin_sync, fetch_usage_sync
 from .catalog import fetch_models_sync

@@ -16,7 +16,6 @@ from src.management_auth.principal import AuthMethod, ManagementPrincipal
 from src.management_control.context import ManagementContext
 from src.management_control.errors import ManagementError
 from src.management_control.oauth import CompleteOAuthLoginCommand, OAuthControl, OAuthProvider
-from src.management_control.oauth.account_mutations import OAuthReplaceRequired
 from src.oauth.workbuddy import auth, common, runtime
 
 
@@ -208,11 +207,13 @@ def test_flow_pending_ready_actor_guard_complete_and_double_submit(account, cont
         ctl.complete_login_flow(context(), flow.flow_id, flow.flow_secret, CompleteOAuthLoginCommand(completed=True))
     clock[0] += timedelta(seconds=3)
     ready = ctl.poll_login_flow(context(), flow.flow_id, flow.flow_secret)
-    assert ready.status == "ready" and "fixture-at" not in repr(ready)
+    assert ready.status == "completed" and "fixture-at" not in repr(ready)
+    assert om.get_account(ready.account_id) is not None
     result = ctl.complete_login_flow(context(), flow.flow_id, flow.flow_secret, CompleteOAuthLoginCommand(completed=True))
     assert result.status == "created"
+    assert ctl.complete_login_flow(context(), flow.flow_id, flow.flow_secret, CompleteOAuthLoginCommand(completed=True)) == result
     with pytest.raises(ManagementError):
-        ctl.complete_login_flow(context(), flow.flow_id, flow.flow_secret, CompleteOAuthLoginCommand(completed=True))
+        ctl.complete_login_flow(context("other"), flow.flow_id, flow.flow_secret, CompleteOAuthLoginCommand(completed=True))
 
 
 def test_flow_overlap_cancel_and_expiry(account, control, monkeypatch):
@@ -233,19 +234,21 @@ def test_flow_overlap_cancel_and_expiry(account, control, monkeypatch):
     ctl.cancel_login_flow(context(), flow.flow_id, flow.flow_secret)
 
 
-def test_flow_same_identity_requires_explicit_plan_and_preserves_user_state(account, control, monkeypatch):
+def test_flow_same_identity_auto_updates_authorization_and_preserves_user_state(account, control, monkeypatch):
     ctl, clock = control
     om.set_enabled(account, False, reason="user")
-    monkeypatch.setattr(ctl.backend, "workbuddy_poll_login", lambda p: p.update(status="ready", entry=dict(om.get_account(account), access_token="login-at")))
+    config.update(lambda c: c["oauthAccounts"][0].update(label="保留备注", models=["selected"],
+        disabledModels=["selected"], maxConcurrent=7, workbuddy_auto_checkin=True))
+    old = copy.deepcopy(om.get_account(account))
+    monkeypatch.setattr(ctl.backend, "workbuddy_poll_login", lambda p: p.update(status="ready", entry=dict(old,
+        access_token="login-at", label="新登录名称", models=[], disabledModels=[], maxConcurrent=0, enabled=True)))
     flow = ctl.start_login_flow(context(), OAuthProvider.WORKBUDDY)
-    ctl.poll_login_flow(context(), flow.flow_id, flow.flow_secret)
-    with pytest.raises(OAuthReplaceRequired) as captured:
-        ctl.complete_login_flow(context(), flow.flow_id, flow.flow_secret, CompleteOAuthLoginCommand(completed=True))
-    assert om.get_account(account)["access_token"] == "fixture-at"
-    result = ctl.complete_login_flow(context(), flow.flow_id, flow.flow_secret,
-        CompleteOAuthLoginCommand(completed=True, replace_plan_token=captured.value.plan_token))
-    assert result.status == "replaced" and om.get_account(account)["access_token"] == "login-at"
-    assert om.get_account(account)["disabled_reason"] == "user"
+    result = ctl.poll_login_flow(context(), flow.flow_id, flow.flow_secret)
+    assert result.status == "completed" and result.save_status == "replaced"
+    assert om.get_account(account)["access_token"] == "login-at"
+    for key in ("label", "models", "disabledModels", "maxConcurrent", "enabled", "disabled_reason", "workbuddy_auto_checkin"):
+        assert om.get_account(account)[key] == old[key]
+    assert ctl.complete_login_flow(context(), flow.flow_id, flow.flow_secret, CompleteOAuthLoginCommand(completed=True)).account_id == account
 
 
 def test_public_snapshot_allowlist_never_leaks_credentials(account):

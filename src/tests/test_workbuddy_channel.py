@@ -10,7 +10,7 @@ import uuid
 import httpx
 import pytest
 
-from src import config, oauth_manager as om
+from src import config, notifier, oauth_manager as om
 from src.channel import registry
 from src.channel.workbuddy_oauth_channel import WorkBuddyOAuthChannel, normalize_tool_choice
 from src.oauth.workbuddy import auth, common
@@ -248,6 +248,8 @@ async def test_auth_refresh_boundary_and_no_false_auth_disable(env, monkeypatch,
     if not protected:
         monkeypatch.delenv("PARROT_NO_REFRESH", raising=False)
     config.update(lambda c: c.update(retry={"recovery": {"oauthRefresh": True}}))
+    notices = []
+    monkeypatch.setattr(notifier, "notify_event", lambda event, text, **kw: notices.append(text))
     calls = []
     async def ensure(*a, **k):
         return "fixture-access"
@@ -272,6 +274,9 @@ async def test_auth_refresh_boundary_and_no_false_auth_disable(env, monkeypatch,
     assert len(attempts) == (2 if refresh_result == "ok" else 1)
     assert (om.get_account(ch.account_key).get("disabled_reason") == "auth_error") is (refresh_result == "auth")
     assert (response.status_code == 200) is (refresh_result == "ok")
+    if refresh_result == "auth":
+        assert any("重新登录" in text for text in notices)
+        assert all("JSON" not in text for text in notices)
 
 
 async def test_workbuddy_stream_close_records_cancelled_and_closes_upstream(env):

@@ -30,6 +30,9 @@ def tg(action_env, monkeypatch):
     # Content/contract tests run deterministically; separate runtime regressions
     # exercise the real background thread and view-token cancellation boundary.
     monkeypatch.setattr(wb, "_start_query_worker", lambda worker: worker())
+    ledger["login_workers"] = []
+    monkeypatch.setattr(wb, "_start_login_worker", ledger["login_workers"].append)
+    wb._login_jobs.clear()
     monkeypatch.setattr(ui, "answer_cb", Mock())
     output = []
     def emit(chat, *args, **kwargs):
@@ -50,6 +53,10 @@ def tg(action_env, monkeypatch):
     save(snap)
     states.clear_all()
     yield key, ctl, ledger, output, snap, save, clock
+    for job in wb._login_jobs.values():
+        job["stop"].set()
+        job["wake"].set()
+    wb._login_jobs.clear()
     states.clear_all()
 
 
@@ -236,20 +243,23 @@ def test_auto_checkin_needs_confirmation_cas_and_is_not_immediate_action(tg):
     assert "发生变化" in output[-1][0]
 
 
-def test_login_pending_ready_save_overwrite_cancel_and_secret_non_echo(tg, monkeypatch):
+def test_login_automatic_save_manual_wake_cancel_and_secret_non_echo(tg, monkeypatch):
     key, ctl, ledger, output, _, _, clock = tg
     monkeypatch.setattr(ctl.backend, "workbuddy_start_login", lambda: {"status": "pending", "realm": "cn", "auth_url": "https://www.codebuddy.cn/login", "state": "fixture-state"})
     monkeypatch.setattr(ctl.backend, "workbuddy_poll_login", lambda p: None)
     menu.handle_callback(42, 900, "cb", "oa:wb:login")
     click(tg, "检查登录")
-    assert "等待浏览器授权" in output[-1][0]
-    monkeypatch.setattr(ctl.backend, "workbuddy_poll_login", lambda p: p.update(status="ready", entry=dict(om.get_account(key), access_token="login-fixture-at")))
-    clock[0] += timedelta(seconds=3)
-    click(tg, "再次检查")
-    assert "尚未保存" in output[-1][0]
-    click(tg, "保存账户")
-    assert om.get_account(key)["access_token"] == "fixture-at" and "同一身份" in output[-1][0]
-    click(tg, "更新此账户授权")
+    click(tg, "检查登录")
+    assert len(ledger["login_workers"]) == 1  # Manual checks never duplicate workers.
+    def authorize_next(_timeout):
+        clock[0] += timedelta(seconds=5)
+        monkeypatch.setattr(ctl.backend, "workbuddy_poll_login", lambda p: p.update(status="ready", entry=dict(om.get_account(key), access_token="login-fixture-at")))
+    monkeypatch.setattr(wb._login_jobs[42]["wake"], "wait", authorize_next)
+    ledger["login_workers"].pop(0)()
+    assert any("等待浏览器授权" in text for text, _ in output)
+    assert "授权已更新" in output[-1][0] and "研发号 A" in output[-1][0]
+    assert not any("保存账户" in b["text"] or "更新此账户授权" in b["text"] for _, kb in output if kb for b in buttons(kb))
+    assert states.get_state(42) is None and not wb._login_jobs
     assert om.get_account(key)["access_token"] == "login-fixture-at"
     assert "login-fixture-at" not in repr(output) and "fixture-rt" not in repr(output)
     menu.handle_callback(42, 900, "cb", "oa:wb:login")
@@ -259,35 +269,45 @@ def test_login_pending_ready_save_overwrite_cancel_and_secret_non_echo(tg, monke
     assert states.get_state(42) is None and ledger["calls"] == 0
 
 
-def test_import_invalid_retry_preview_keep_and_explicit_overwrite(tg):
-    key, _, ledger, output, _, _, _ = tg
-    menu.handle_callback(42, 900, "cb", "oa:wb:import")
-    menu.handle_text_state(42, "oa_wb_import", "not-json")
-    assert states.get_state(42)["action"] == "oa_wb_import"
-    entry = dict(om.get_account(key), access_token="import-fixture-at")
-    menu.handle_text_state(42, "oa_wb_import", json.dumps(entry))
-    assert "同身份已存在" in output[-1][0] and "import-fixture-at" not in output[-1][0]
-    click(tg, "导入新账户，保留已有")
-    assert om.get_account(key)["access_token"] == "fixture-at"
-    menu.handle_callback(42, 900, "cb", "oa:wb:import")
-    menu.handle_text_state(42, "oa_wb_import", json.dumps(entry))
-    click(tg, "更新同身份授权")
-    assert om.get_account(key)["access_token"] == "fixture-at"
-    click(tg, "确认更新并导入")
-    assert om.get_account(key)["access_token"] == "import-fixture-at" and ledger["calls"] == 0
-
-
-def test_cn_only_import_rejects_global_without_removing_existing_accounts(tg):
-    key, ctl, ledger, output, _, _, _ = tg
+@pytest.mark.parametrize("callback", ["oa:wb:import", "oa:wb:import_page:old:2",
+    "oa:wb:import_keep:old", "oa:wb:import_overwrite_ask:old", "oa:wb:import_overwrite:old"])
+def test_old_import_callbacks_are_retired_without_writes(tg, monkeypatch, callback):
+    _, ctl, ledger, output, _, _, _ = tg
     before = copy.deepcopy(config.get()["oauthAccounts"])
-    global_entry = dict(om.get_account(key), realm="global", domain="www.workbuddy.ai")
-    preview = ctl.preview_import(wb.telegram_context(42), format="workbuddy", payload=json.dumps(global_entry))
-    assert not preview.candidates and len(preview.errors) == 1
-    mixed = ctl.preview_import(wb.telegram_context(42), format="workbuddy", payload=json.dumps([om.get_account(key), global_entry]))
-    assert len(mixed.candidates) == 1 and len(mixed.errors) == 1
+    parser = Mock(side_effect=AssertionError("removed parser must not run"))
+    monkeypatch.setattr(ctl.backend, "parse_import", parser)
+    states.set_state(42, "oa_wb_import_preview", {"nonce": "old", "secret": "old-fixture-credential"})
+    assert menu.handle_callback(42, 900, "cb", callback)
+    assert states.get_state(42) is None
+    assert "JSON 导入已移除" in output[-1][0] and "old-fixture-credential" not in repr(output)
+    parser.assert_not_called()
     assert config.get()["oauthAccounts"] == before and ledger["calls"] == 0
-    menu.handle_callback(42, 900, "cb", "oa:wb:import")
-    assert "仅支持中国区" in output[-1][0] and "国际区 JSON 导入已移除" in output[-1][0]
+
+
+@pytest.mark.parametrize("action", ["oa_wb_import", "oa_wb_import_preview"])
+@pytest.mark.parametrize("kind", ["text", "document"])
+def test_old_import_input_states_do_not_parse_or_download_credentials(tg, monkeypatch, action, kind):
+    _, ctl, ledger, output, _, _, _ = tg
+    before = copy.deepcopy(config.get()["oauthAccounts"])
+    blocked = Mock(side_effect=AssertionError("removed import must not read input"))
+    monkeypatch.setattr(ctl.backend, "parse_import", blocked)
+    monkeypatch.setattr(ui, "download_file", blocked)
+    states.set_state(42, action, {"nonce": "old"})
+    if kind == "text":
+        assert menu.handle_text_state(42, action, "fixture-credential-not-to-echo")
+    else:
+        assert menu.handle_document_state(42, action, {"document": {"file_id": "fixture-credential-not-to-echo"}})
+    blocked.assert_not_called()
+    assert states.get_state(42) is None and "JSON 导入已移除" in output[-1][0]
+    assert "fixture-credential-not-to-echo" not in repr(output)
+    assert config.get()["oauthAccounts"] == before and ledger["calls"] == 0
+
+
+def test_add_menu_only_offers_workbuddy_browser_login_and_keeps_other_imports(tg):
+    menu.on_add_menu(42, 900, "cb")
+    callbacks = [b.get("callback_data") for b in buttons(tg[3][-1][1])]
+    assert [v for v in callbacks if v and v.startswith("oa:wb:")] == ["oa:wb:login", "oa:wb:login:global"]
+    assert "oa:import:cpa" in callbacks and "oa:import:sub2api" in callbacks
 
 
 def test_unused_workbuddy_has_zero_local_rows_without_inventing_tps(tg, monkeypatch):
@@ -326,18 +346,15 @@ def test_global_trial_requires_terms_then_confirmation_not_auto(tg):
     assert "250" not in repr(output) and "14 天" not in repr(output)
 
 
-def test_large_import_preview_is_fully_pageable_before_commit(tg):
-    key, _, ledger, output, _, _, _ = tg
-    menu.handle_callback(42, 900, "cb", "oa:wb:import")
-    entries = [dict(om.get_account(key), uid=f"import-id-{i}", label=f"导入号 {i:02}") for i in range(15)]
-    entries.append({"realm": "cn", "uid": "invalid-no-token"})
-    menu.handle_text_state(42, "oa_wb_import", json.dumps(entries))
-    assert "导入号 00" in output[-1][0] and "导入号 06" not in output[-1][0]
-    click(tg, "下一页")
-    assert "导入号 06" in output[-1][0]
-    click(tg, "下一页")
-    assert "导入号 14" in output[-1][0] and "INVALID_CANDIDATE" in output[-1][0]
-    assert len(om.list_accounts()) == 1 and ledger["calls"] == 0
+def test_removed_import_callback_does_not_cancel_a_new_login(tg, monkeypatch):
+    _, ctl, _, _, _, _, _ = tg
+    cancel = Mock(side_effect=AssertionError("old import button cannot cancel a new login"))
+    monkeypatch.setattr(ctl, "cancel_login_flow", cancel)
+    states.set_state(42, "oa_wb_login", {"nonce": "new-login", "flow_id": "new-flow"})
+    before = copy.deepcopy(states.get_state(42))
+    assert menu.handle_callback(42, 900, "cb", "oa:wb:import_overwrite:old")
+    assert states.get_state(42) == before
+    cancel.assert_not_called()
 
 
 def test_model_details_and_common_account_controls_for_no_email_wb(tg, monkeypatch):

@@ -88,7 +88,7 @@ def test_oauth_and_status_buttons_use_provider_custom_icons(monkeypatch):
         "oa:login:cursor": "cursor",
         "oa:login:antigravity": "antigravity",
         "oa:wb:login": "workbuddy",
-        "oa:wb:import": "workbuddy",
+        "oa:wb:login:global": "workbuddy",
     }
     for callback, provider in expected.items():
         button = next(item for item in buttons if item.get("callback_data") == callback)

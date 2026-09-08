@@ -331,10 +331,6 @@ def credential(value):
             workspace_id=value.workspaceId,
             project_id=value.projectId,
             expires_at=value.expiresAt,
-            realm=value.realm,
-            uid=value.uid,
-            enterprise_id=value.enterpriseId,
-            domain=value.domain,
         )
     if isinstance(value, JsonOAuthCredential):
         return JsonCredential(

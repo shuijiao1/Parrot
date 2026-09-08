@@ -48,6 +48,7 @@ class WorkBuddySettingsData(StrictSchema):
     autoCheckin: bool
     timezone: str
     scheduledTime: str
+    scheduledTimes: list[str]
     effectsEnabled: bool
     revision: str
 
@@ -60,5 +61,6 @@ class WorkBuddyPolicyData(StrictSchema):
     effectsEnabled: bool
     autoCheckinDefault: bool
     autoCheckinTime: str
+    autoCheckinTimes: list[str]
     timezone: str
     autoTrial: bool

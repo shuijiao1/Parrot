@@ -276,7 +276,8 @@ async def poll_oauth_login_flow(
 ) -> DataEnvelope[OAuthLoginPollData]:
     result = await asyncio.to_thread(control.poll_login_flow, context, flowId, body.flowSecret.get_secret_value())
     return DataEnvelope(data=OAuthLoginPollData(flowId=result.flow_id, status=result.status,
-                         expiresAt=result.expires_at, accountPreview=result.account_preview), meta=meta(request))
+                         expiresAt=result.expires_at, accountPreview=result.account_preview,
+                         accountId=result.account_id, saveStatus=result.save_status, revision=result.revision), meta=meta(request))
 
 
 @router.post(

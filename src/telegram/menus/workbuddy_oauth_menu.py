@@ -12,14 +12,16 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from ...management_control import ManagementError
-from ...management_control.oauth import CompleteOAuthLoginCommand, OAuthImportDecision, OAuthProvider
-from ...management_control.oauth.account_mutations import OAuthReplaceRequired
+from ...management_control.oauth import OAuthProvider
 from ...management_control.oauth.menu_bridge import control as oauth_control, telegram_context
 from .. import menu_cache, states, ui
 
 _BJT = timezone(timedelta(hours=8))
 _PREFIX = "oa:wb:"
 _NAV = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
+_LOGIN_INTERVAL = 5.0
+_login_jobs: dict[int, dict] = {}
+_login_jobs_lock = threading.RLock()
 
 
 def _parent():
@@ -344,7 +346,7 @@ def render_activity(key, nav, *, chat_id=0, query_feedback=""):
     if prior:
         lines += [result_text(prior)]
     if cn:
-        lines += ["自动签到: " + ("开启" if snap.get("auto_checkin") else "关闭"), "每天北京时间 09:05；手动停用或认证失效时暂停。"]
+        lines += ["自动签到: " + ("开启" if snap.get("auto_checkin") else "关闭"), "每天北京时间 09:05 主轮、21:05 补漏；先查状态，已签不重复提交，未知仅核对。手动停用或认证失效时暂停。"]
     if account.get("disabled_reason") not in (None, "quota") or (not account.get("enabled", True) and account.get("disabled_reason") != "quota"):
         lines.append("⚠️ 账户已停用或认证失效，活动暂停。")
     rows = [[ui.btn("🔄 查询活动/余额", _cb("refresh_activity", nav)), ui.btn("📜 操作记录", _cb("records", nav))]]
@@ -395,6 +397,11 @@ def discard_state(chat_id):
     state = states.get_state(chat_id)
     if state and state["action"] == "oa_wb_login":
         data = state["data"]
+        with _login_jobs_lock:
+            job = _login_jobs.get(chat_id)
+            if job and job["data"] is data:
+                job["stop"].set()
+                job["wake"].set()
         try:
             oauth_control.cancel_login_flow(telegram_context(chat_id), data["flow_id"], data["flow_secret"])
         except ManagementError:
@@ -455,116 +462,122 @@ def _login_start(chat_id, message_id, *, realm="cn"):
     except Exception as exc:
         ui.edit(chat_id, message_id, _error(exc), reply_markup=ui.inline_kb([[ui.btn("◀ 返回新增", "oa:add")]]))
         return
-    data = _set_state(chat_id, "oa_wb_login", {"flow_id": flow.flow_id, "flow_secret": flow.flow_secret, "realm": realm})
+    data = _set_state(chat_id, "oa_wb_login", {"flow_id": flow.flow_id, "flow_secret": flow.flow_secret,
+        "realm": realm, "auth_url": flow.auth_url, "expires_at": flow.expires_at})
     region = "国际区" if realm == "global" else "中国区"
     login_hint = "使用 Google / GitHub 在官方页面登录并授权。\n" if realm == "global" else ""
-    ui.edit(chat_id, message_id, f"🌐 <b>WorkBuddy {region}登录</b>\n{login_hint}在浏览器登录并授权后，点击检查登录。未完成可继续检查，不会消耗登录流程。\n有效期 5 分钟。",
+    ui.edit(chat_id, message_id, f"🌐 <b>WorkBuddy {region}登录</b>\n{login_hint}在浏览器登录并授权后，后台每 5 秒自动检查，成功即保存并显示身份。同一身份重新登录只更新授权，保留原有设置。\n有效期 5 分钟。",
         reply_markup=ui.inline_kb([[{"text": "🌐 打开授权页面", "url": flow.auth_url}],
             [ui.btn("🔎 检查登录", _PREFIX + "poll:" + data["nonce"])],
             [ui.btn("❌ 取消", _PREFIX + "cancel:" + data["nonce"])]]))
+    _login_poll(chat_id, message_id, data)
+
+
+def _start_login_worker(worker):
+    thread = threading.Thread(target=worker, daemon=True, name="workbuddy-login-ui")
+    thread.start()
+    return thread
+
+
+def _login_feedback(data, poll=None, error=None):
+    status = poll.status if poll is not None else "pending"
+    if status == "completed":
+        preview = poll.account_preview or {}
+        text = "✅ 授权已保存。" if poll.save_status != "replaced" else "✅ 授权已更新，原有账户设置已保留。"
+        text += "\n" + ui.escape_html(str(preview.get("label") or preview.get("nickname") or preview.get("uid") or "WorkBuddy"))
+        region = "国际区" if preview.get("realm", data.get("realm")) == "global" else "中国区"
+        text += f"\n区域: {region} · " + ("企业" if preview.get("enterprise_id") else "个人")
+        text += "\n模型和额度以各自最新同步状态为准，后续同步失败不会回滚已保存授权。"
+        return text, ui.inline_kb([[ui.btn("查看账户", "oa:view:" + ui.register_code(poll.account_id) + ":1")],
+                                  [ui.btn("◀ 返回列表", "menu:oauth")]])
+    if status in {"cancelled", "expired"}:
+        return "ℹ️ 登录流程已取消或过期，请重新开始。", ui.inline_kb([[ui.btn("◀ 返回新增", "oa:add")]])
+    text = "⌛ 等待浏览器授权，后台自动检查中；成功后直接保存。"
+    if status == "identity_pending":
+        text = "⌛ 已取得授权，正在自动确认账户身份；仅继续获取身份，不重复获取 Token。"
+    if error is not None:
+        text = _error(error) + "\n后台将继续检查，也可手动检查或取消。"
+    rows = [[{"text": "🌐 打开授权页面", "url": data["auth_url"]}]] if data.get("auth_url") else []
+    rows += [[ui.btn("🔎 检查登录", _PREFIX + "poll:" + data["nonce"])],
+             [ui.btn("❌ 取消", _PREFIX + "cancel:" + data["nonce"])]]
+    return text, ui.inline_kb(rows)
+
+
+def _run_login_job(chat_id, job):
+    data, owner = job["data"], job["owner"]
+    last_render = None
+    try:
+        while not job["stop"].is_set() and _state(chat_id, data["nonce"], "oa_wb_login") is data:
+            job["wake"].clear()
+            poll, error = None, None
+            try:
+                poll = owner.poll_login_flow(telegram_context(chat_id), data["flow_id"], data["flow_secret"])
+            except Exception as exc:
+                error = exc
+            terminal = poll is not None and poll.status in {"completed", "cancelled", "expired"}
+            expired = not terminal and time.monotonic() >= job["deadline"]
+            text, kb = _login_feedback(data, poll, error)
+            if expired:
+                text, kb = "ℹ️ 登录等待已到期，请重新开始。", ui.inline_kb([[ui.btn("◀ 返回新增", "oa:add")]])
+            with _login_jobs_lock:
+                message_id, token = job["message_id"], job["view_token"]
+            render_key = (message_id, token, text)
+
+            def render():
+                if not job["stop"].is_set() and _state(chat_id, data["nonce"], "oa_wb_login") is data:
+                    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+            if render_key != last_render:
+                try:
+                    if menu_cache.run_if_current(chat_id, message_id, token, render):
+                        last_render = render_key
+                except Exception:
+                    pass  # A Telegram delivery failure must not abort authorization.
+            if terminal or expired:
+                states.pop_state_if_current(chat_id, data)
+                if expired:
+                    try:
+                        owner.cancel_login_flow(telegram_context(chat_id), data["flow_id"], data["flow_secret"])
+                    except ManagementError:
+                        pass
+                break
+            job["wake"].wait(min(_LOGIN_INTERVAL, max(0, job["deadline"] - time.monotonic())))
+    finally:
+        with _login_jobs_lock:
+            if _login_jobs.get(chat_id) is job:
+                _login_jobs.pop(chat_id, None)
 
 
 def _login_poll(chat_id, message_id, data):
-    try:
-        poll = oauth_control.poll_login_flow(telegram_context(chat_id), data["flow_id"], data["flow_secret"])
-    except Exception as exc:
-        ui.send_result(chat_id, _error(exc) + " 可再次检查当前流程。", **_NAV)
-        return
-    if poll.status in {"cancelled", "expired", "completed"}:
-        states.pop_state(chat_id)
-        ui.edit(chat_id, message_id, "ℹ️ 登录流程已结束或过期，请重新开始。", reply_markup=ui.inline_kb([[ui.btn("◀ 返回新增", "oa:add")]]))
-        return
-    rows = [[ui.btn("🔎 再次检查登录", _PREFIX + "poll:" + data["nonce"])]]
-    text = "⌛ 等待浏览器授权，可以稍后再次检查。"
-    if poll.status == "identity_pending":
-        text = "⌛ 已取得授权，账户身份尚未确认；再次检查会继续获取身份，不重复获取 Token。"
-    elif poll.status == "ready":
-        preview = poll.account_preview or {}
-        text = "✅ 已确认账户身份，尚未保存。\n" + ui.escape_html(str(preview.get("label") or preview.get("nickname") or preview.get("uid") or "WorkBuddy"))
-        region = "国际区" if preview.get("realm", data.get("realm")) == "global" else "中国区"
-        text += f"\n区域: {region} · " + ("企业" if preview.get("enterprise_id") else "个人")
-        rows = [[ui.btn("💾 保存账户", _PREFIX + "save:" + data["nonce"])]]
-    rows.append([ui.btn("❌ 取消", _PREFIX + "cancel:" + data["nonce"])])
-    ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb(rows))
+    """Manual checks wake the one bounded worker; the TG poll loop never waits."""
+    token = menu_cache.begin_view(chat_id, message_id)
+    with _login_jobs_lock:
+        job = _login_jobs.get(chat_id)
+        if job and job["data"] is data and not job["stop"].is_set():
+            job.update(message_id=message_id, view_token=token)
+            job["wake"].set()
+            return
+        if job:
+            job["stop"].set()
+            job["wake"].set()
+        expires = data.get("expires_at")
+        remaining = max(0, min(300, (expires - datetime.now(timezone.utc)).total_seconds())) if expires else 300
+        job = {"data": data, "owner": oauth_control, "message_id": message_id, "view_token": token,
+               "deadline": time.monotonic() + remaining, "wake": threading.Event(), "stop": threading.Event()}
+        _login_jobs[chat_id] = job
+    _start_login_worker(lambda: _run_login_job(chat_id, job))
 
 
-def _login_save(chat_id, message_id, data, *, replace=False):
-    try:
-        result = oauth_control.complete_login_flow(telegram_context(chat_id), data["flow_id"], data["flow_secret"],
-            CompleteOAuthLoginCommand(completed=True, replace_plan_token=data.get("replace_plan_token") if replace else None))
-    except OAuthReplaceRequired as exc:
-        data = _set_state(chat_id, "oa_wb_login", dict(data, replace_plan_token=exc.plan_token))
-        ui.edit(chat_id, message_id, "⚠️ <b>同一身份账户已存在</b>\n确认后仅更新授权，保留备注、模型选择、并发及手动停用状态。原账户在保存成功前保持不变。",
-            reply_markup=ui.inline_kb([[ui.btn("✅ 更新此账户授权", _PREFIX + "replace:" + data["nonce"])],
-                                      [ui.btn("❌ 取消", _PREFIX + "cancel:" + data["nonce"])]]))
-        return
-    except Exception as exc:
-        ui.send_result(chat_id, _error(exc), **_NAV)
-        return
-    states.pop_state(chat_id)
-    short = ui.register_code(result.account_id)
-    ui.edit(chat_id, message_id, "✅ 授权已保存。模型和额度以各自最新同步状态为准，后续同步失败不会回滚已保存授权。",
-        reply_markup=ui.inline_kb([[ui.btn("查看账户", "oa:view:" + short + ":1")], [ui.btn("◀ 返回列表", "menu:oauth")]]))
-
-
-def render_import_preview(data, page=1):
-    candidates, errors = data["candidates"], data.get("errors") or ()
-    entries = [("account", item) for item in candidates] + [("error", item) for item in errors]
-    pages = max(1, math.ceil(len(entries) / 6))
-    page = max(1, min(page, pages))
-    conflicts = sum(bool(item.conflict_account_id) for item in candidates)
-    lines = ["📥 <b>WorkBuddy 导入预览</b>",
-             f"有效 {len(candidates)} 个（已有 {conflicts}） · 无效 {len(errors)} 个 · 第 {page}/{pages} 页",
-             "尚未保存，未刷新凭据。"]
-    for kind, item in entries[(page-1)*6:page*6]:
-        if kind == "account":
-            identity = item.identity if len(item.identity) <= 180 else item.identity[:120] + "…" + item.identity[-50:]
-            lines += [ui.escape_html(item.display_name[:100]) + (" · 同身份已存在" if item.conflict_account_id else " · 新账户"),
-                      "  <code>" + ui.escape_html(identity) + "</code>"]
-        else:
-            index = item.index + 1 if item.index is not None else "文件"
-            lines.append(f"⚠️ 第 {index} 项: {ui.escape_html(item.code)}（不会导入）")
-    rows = []
-    if pages > 1:
-        row = []
-        if page > 1:
-            row.append(ui.btn("◀ 上一页", f"{_PREFIX}import_page:{data['nonce']}:{page-1}"))
-        if page < pages:
-            row.append(ui.btn("下一页 ▶", f"{_PREFIX}import_page:{data['nonce']}:{page+1}"))
-        rows.append(row)
-    rows += [[ui.btn("✅ 导入新账户，保留已有", _PREFIX + "import_keep:" + data["nonce"])]]
-    if conflicts:
-        rows.append([ui.btn("🔄 更新同身份授权（先确认）", _PREFIX + "import_overwrite_ask:" + data["nonce"])])
-    rows.append([ui.btn("❌ 取消", _PREFIX + "cancel:" + data["nonce"])])
-    return "\n".join(lines), ui.inline_kb(rows)
-
-
-def import_payload(chat_id, payload, *, filename="pasted-json"):
+def reject_removed_import(chat_id):
+    """Retire old messages/input states without reading credentials or cancelling a new login."""
     state = states.get_state(chat_id)
-    if not state or state["action"] != "oa_wb_import":
-        return
-    try:
-        preview = oauth_control.preview_import(telegram_context(chat_id), format="workbuddy", payload=payload, filename=filename)
-    except Exception as exc:
-        ui.send_result(chat_id, _error(exc), **_NAV)
-        return
-    if not preview.candidates:
-        ui.send_result(chat_id, "⚠️ 没有有效的 WorkBuddy 凭据。请核对 JSON、区域、UID 和 access/refresh token；不会回显原文。", **_NAV)
-        return
-    data = _set_state(chat_id, "oa_wb_import_preview", {"import_id": preview.import_id, "import_secret": preview.import_secret,
-        "candidates": preview.candidates, "errors": preview.errors})
-    text, kb = render_import_preview(data)
-    ui.send(chat_id, text, reply_markup=kb)
-
-
-def handle_document(chat_id, msg):
-    doc = msg.get("document") or {}
-    try:
-        payload, path = ui.download_file(doc.get("file_id") or "", max_bytes=1024*1024)
-    except Exception:
-        ui.send_result(chat_id, "⚠️ 文件下载失败或超过 1 MiB，请重新上传 JSON。", **_NAV)
-        return
-    import_payload(chat_id, payload, filename=doc.get("file_name") or "uploaded.json")
+    if state and state["action"] in {"oa_wb_import", "oa_wb_import_preview"}:
+        states.pop_state(chat_id)
+    ui.send(chat_id, "ℹ️ WorkBuddy JSON 导入已移除，中国区和国际区均请使用网页登录；已有账户不受影响。",
+        reply_markup=ui.inline_kb([
+            [ui.provider_button("WorkBuddy 中国区登录", "oa:wb:login", "workbuddy")],
+            [ui.provider_button("WorkBuddy 国际区登录", "oa:wb:login:global", "workbuddy")],
+            [ui.btn("◀ 返回新增账户", "oa:add")]]))
 
 
 def handle_callback(chat_id, message_id, cb_id, callback):
@@ -580,26 +593,13 @@ def handle_callback(chat_id, message_id, cb_id, callback):
         if realm in {"cn", "global"}:
             _login_start(chat_id, message_id, realm=realm)
         return True
-    if kind == "import":
-        discard_state(chat_id)
-        _set_state(chat_id, "oa_wb_import", {})
-        ui.edit(chat_id, message_id, "📥 <b>WorkBuddy JSON 导入</b>\n仅支持中国区单个对象、数组或 accounts 列表，最多 200 个账户、1 MiB；国际区 JSON 导入已移除。\n每项明确 realm（cn）、uid、access_token、refresh_token；domain 若有必须与中国区一致。可附 nickname、enterprise_id、带时区的绝对到期时间 expired。\n可粘贴 JSON 或上传文件；仅做本地校验，不回显 Token、不通过刷新猜测身份。",
-            reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:add")]]))
+    if kind == "import" or kind.startswith("import_"):
+        reject_removed_import(chat_id)
         return True
-    if kind == "import_page":
-        data = _state(chat_id, parts[1] if len(parts) == 3 else "", "oa_wb_import_preview")
-        if data:
-            try:
-                page = int(parts[2])
-            except ValueError:
-                return True
-            text, kb = render_import_preview(data, page)
-            ui.edit(chat_id, message_id, text, reply_markup=kb)
-        return True
-    state_kinds = {"poll", "save", "replace", "cancel", "confirm", "terms", "unknown", "import_keep", "import_overwrite_ask", "import_overwrite"}
+    state_kinds = {"poll", "save", "replace", "cancel", "confirm", "terms", "unknown"}
     if kind in state_kinds:
         nonce = parts[1] if len(parts) == 2 else ""
-        data = _state(chat_id, nonce, "oa_wb_login", "oa_wb_confirm", "oa_wb_terms", "oa_wb_unknown", "oa_wb_import_preview")
+        data = _state(chat_id, nonce, "oa_wb_login", "oa_wb_confirm", "oa_wb_terms", "oa_wb_unknown")
         if not data:
             ui.send_result(chat_id, "⚠️ 按钮已过期，请返回原页面重新开始。", **_NAV)
             return True
@@ -613,10 +613,8 @@ def handle_callback(chat_id, message_id, cb_id, callback):
             else:
                 _parent().on_add_menu(chat_id, message_id, "")
         elif action == "oa_wb_login" and kind in {"poll", "save", "replace"}:
-            if kind == "poll":
-                _login_poll(chat_id, message_id, data)
-            elif kind == "save" or data.get("replace_plan_token"):
-                _login_save(chat_id, message_id, data, replace=kind == "replace")
+            # Old save/replace buttons now wake the same automatic flow.
+            _login_poll(chat_id, message_id, data)
         elif kind in {"terms", "unknown"} and action == ("oa_wb_terms" if kind == "terms" else "oa_wb_unknown"):
             states.pop_state(chat_id)
             _plan_action(chat_id, message_id, data["key"], data["nav"], allow_unknown=kind == "unknown", trial_confirmed=kind == "terms")
@@ -632,21 +630,6 @@ def handle_callback(chat_id, message_id, cb_id, callback):
             except Exception as exc:
                 text = _error(exc)
             ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([[ui.btn("◀ 返回活动", _cb("activity", data["nav"]))], [_back(data["nav"])]]))
-        elif action == "oa_wb_import_preview" and kind.startswith("import_"):
-            if kind == "import_overwrite_ask":
-                data = _set_state(chat_id, "oa_wb_import_preview", dict(data, overwrite_confirmed=True))
-                ui.edit(chat_id, message_id, f"⚠️ 确认更新 {sum(bool(item.conflict_account_id) for item in data['candidates'])} 个同身份账户授权，并导入其余有效新账户？\n保留备注、模型选择、并发和手动停用状态；其他身份不会被覆盖。",
-                    reply_markup=ui.inline_kb([[ui.btn("✅ 确认更新并导入", _PREFIX + "import_overwrite:" + data["nonce"])],
-                                              [ui.btn("❌ 取消", _PREFIX + "cancel:" + data["nonce"])]]))
-            elif kind == "import_keep" or (kind == "import_overwrite" and data.get("overwrite_confirmed")):
-                states.pop_state(chat_id)
-                try:
-                    result = oauth_control.commit_import(telegram_context(chat_id), data["import_id"], data["import_secret"],
-                        [OAuthImportDecision(item.candidate_id, "overwrite" if kind == "import_overwrite" else "keep") for item in data["candidates"]])
-                    text = f"✅ 导入已保存：新增 {len(result.added)} · 更新 {len(result.replaced)} · 保留 {len(result.skipped)}。\n模型／额度同步失败不回滚已保存的授权，可在账户页重查。"
-                except Exception as exc:
-                    text = _error(exc)
-                ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", "menu:oauth")]]))
         return True
     if len(parts) != 5:
         return True
@@ -680,7 +663,7 @@ def handle_callback(chat_id, message_id, cb_id, callback):
     elif kind == "auto":
         value = oauth_control.get_account(telegram_context(chat_id), key)
         enabled = not (oauth_control.account_snapshot(key) or {}).get("workbuddy_auto_checkin", False)
-        _confirm(chat_id, message_id, text=("▶️ 确认开启自动签到？\n每天北京时间 09:05 执行，仅中国区；停用或认证失效时暂停，不自动申请试用。禁 Token 刷新不影响签到。" if enabled else "⏸ 确认关闭自动签到？\n不会撤销已经发出的请求。"),
+        _confirm(chat_id, message_id, text=("▶️ 确认开启自动签到？\n每天北京时间 09:05 主轮、21:05 补漏，仅中国区；先查状态，已签不重复提交，未知仅核对。停用或认证失效时暂停，不自动申请试用。禁 Token 刷新不影响签到。" if enabled else "⏸ 确认关闭自动签到？\n不会撤销已经发出的请求。"),
             data={"kind": "auto", "key": key, "nav": nav, "enabled": enabled, "revision": value.account.revision})
     return True
 

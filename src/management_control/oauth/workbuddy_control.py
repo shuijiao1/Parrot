@@ -46,9 +46,10 @@ class WorkBuddyControlMixin:
     def workbuddy_policy(self, context):
         self._require(context, Capability.READ)
         return {"client_profile": "cli", "client_profiles_by_realm": {"cn": "cli", "global": "ide"},
-                "browser_login_realms": ["cn", "global"], "import_realms": ["cn"],
+                "browser_login_realms": ["cn", "global"], "import_realms": [],
                 "effects_enabled": self.backend.workbuddy_effects_enabled(), "auto_checkin_default": False,
-                "auto_checkin_time": "09:05", "timezone": "Asia/Shanghai", "auto_trial": False}
+                "auto_checkin_time": "09:05", "auto_checkin_times": ["09:05", "21:05"],
+                "timezone": "Asia/Shanghai", "auto_trial": False}
 
     def refresh_workbuddy_status_now(self, context, account_id):
         self._require(context, Capability.WRITE)
@@ -154,5 +155,6 @@ class WorkBuddyControlMixin:
         self._raise_conditional_status(result)
         self._audit(context, "oauth.workbuddy.settings", account_id)
         return {"auto_checkin": auto_checkin, "timezone": "Asia/Shanghai", "scheduled_time": "09:05",
+                "scheduled_times": ["09:05", "21:05"],
                 "effects_enabled": self.backend.workbuddy_effects_enabled(),
                 "revision": revision(self._account(account_id))}

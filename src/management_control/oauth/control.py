@@ -35,6 +35,7 @@ from .imports import OAuthImportControlMixin
 from .legacy_ops import OAuthLegacyOperationsControlMixin
 from .models import (
     CchMode,
+    CompleteOAuthLoginCommand,
     OAuthAccountDetail,
     OAuthAccountFilter,
     OAuthAccountPage,
@@ -403,7 +404,12 @@ class OAuthControl(
     @audit_failures("oauth.login.poll", target="oauthLogin")
     def poll_login_flow(self, context: ManagementContext, flow_id: str, flow_secret: str):
         self._require(context, Capability.SECRETS_WRITE)
-        return self._flows.workbuddy.poll(context.actor.subject_id, flow_id, flow_secret)
+        device = self._flows.workbuddy
+        poll = device.poll(context.actor.subject_id, flow_id, flow_secret)
+        if poll.status == "ready":
+            self.complete_login_flow(context, flow_id, flow_secret, CompleteOAuthLoginCommand(completed=True))
+            return device.poll(context.actor.subject_id, flow_id, flow_secret)
+        return poll
 
     @audit_failures("oauth.login.cancel", target="oauthLogin")
     def cancel_login_flow(self, context: ManagementContext, flow_id: str, flow_secret: str) -> None:

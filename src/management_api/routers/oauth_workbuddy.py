@@ -71,7 +71,7 @@ def records(accountId: AccountId, request: Request, context: ReadContext, contro
 
 
 @router.patch("/oauth/accounts/{accountId}/workbuddy/settings", operation_id="updateOAuthWorkBuddySettings",
-    response_model=DataEnvelope[WorkBuddySettingsData], responses=responses(200, {"autoCheckin": False, "timezone": "Asia/Shanghai", "scheduledTime": "09:05", "effectsEnabled": False, "revision": "fixture"}, ManagementErrorCode.REVISION_CONFLICT))
+    response_model=DataEnvelope[WorkBuddySettingsData], responses=responses(200, {"autoCheckin": False, "timezone": "Asia/Shanghai", "scheduledTime": "09:05", "scheduledTimes": ["09:05", "21:05"], "effectsEnabled": False, "revision": "fixture"}, ManagementErrorCode.REVISION_CONFLICT))
 def settings(accountId: AccountId, body: Annotated[WorkBuddySettingsRequest, Body()], request: Request,
              context: WriteContext, control: Control,
              if_match: Annotated[str | None, Header(alias="If-Match")] = None):
@@ -80,6 +80,6 @@ def settings(accountId: AccountId, body: Annotated[WorkBuddySettingsRequest, Bod
 
 
 @router.get("/oauth/workbuddy/settings", operation_id="getOAuthWorkBuddyPolicy",
-    response_model=DataEnvelope[WorkBuddyPolicyData], responses=responses(200, {"clientProfile": "cli", "clientProfilesByRealm": {"cn": "cli", "global": "ide"}, "browserLoginRealms": ["cn", "global"], "importRealms": ["cn"], "effectsEnabled": False, "autoCheckinDefault": False, "autoCheckinTime": "09:05", "timezone": "Asia/Shanghai", "autoTrial": False}))
+    response_model=DataEnvelope[WorkBuddyPolicyData], responses=responses(200, {"clientProfile": "cli", "clientProfilesByRealm": {"cn": "cli", "global": "ide"}, "browserLoginRealms": ["cn", "global"], "importRealms": [], "effectsEnabled": False, "autoCheckinDefault": False, "autoCheckinTime": "09:05", "autoCheckinTimes": ["09:05", "21:05"], "timezone": "Asia/Shanghai", "autoTrial": False}))
 def policy(request: Request, context: ReadContext, control: Control):
     return DataEnvelope(data=WorkBuddyPolicyData(**public(control.workbuddy_policy(context))), meta=meta(request))

@@ -99,14 +99,19 @@ def headers(account: dict, kind: str = "chat") -> dict[str, str]:
     realm = realm_of(account)
     ide = profile_of(account) == GLOBAL_PROFILE
     origin = billing_base_url(account)
+    client_type = "IDE" if ide else "CLI"
+    version = "2.108.1" if ide and kind == "chat" else "2.63.2"
     result = {"Content-Type": "application/json", "Accept": "application/json",
               "X-Requested-With": "XMLHttpRequest", "Origin": origin,
-              "Referer": origin + "/", "User-Agent": USER_AGENT}
+              "Referer": origin + "/", "User-Agent": USER_AGENT,
+              "X-IDE-Type": client_type, "X-IDE-Name": client_type, "X-IDE-Version": version}
     if ide:
         result.update({"User-Agent": GLOBAL_CHAT_USER_AGENT if kind == "chat" else GLOBAL_AUTH_USER_AGENT,
                        "X-Domain": "www.codebuddy.ai", "X-Product": "SaaS"})
         if kind == "chat":
-            result.update({"X-IDE-Type": "IDE", "X-IDE-Name": "IDE", "x-codebuddy-request": "1"})
+            result["x-codebuddy-request"] = "1"
+    elif kind == "chat":
+        result["X-Agent-Intent"] = "craft"
     enterprise = text(account.get("enterprise_id"), "enterprise_id")
     uid = text(account.get("uid"), "uid")
     domain = text(account.get("domain"), "domain")

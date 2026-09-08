@@ -86,7 +86,8 @@ def test_global_device_flow_pending_identity_retry_persistence_and_refresh(wire,
     assert ctl.poll_login_flow(ctx, flow.flow_id, flow.flow_secret).status == "identity_pending"
     clock[0] += timedelta(seconds=3)
     preview = ctl.poll_login_flow(ctx, flow.flow_id, flow.flow_secret)
-    assert preview.status == "ready" and preview.account_preview["realm"] == "global"
+    assert preview.status == "completed" and preview.account_preview["realm"] == "global"
+    assert preview.save_status == "created" and om.get_account(preview.account_id) is not None
     assert "fixture-global-at" not in str(preview) and "fixture-global-rt" not in str(preview)
     result = ctl.complete_login_flow(ctx, flow.flow_id, flow.flow_secret, CompleteOAuthLoginCommand(completed=True))
     saved = om.get_account(result.account_id)
@@ -175,7 +176,7 @@ def test_global_api_selects_profile_and_keeps_secrets_private(api, monkeypatch):
     assert any(a.get("realm") == "global" and a.get("workbuddy_client_profile") == "ide" for a in om.list_accounts())
 
 
-def test_global_tg_login_entry_and_preview_use_international_region(tg, monkeypatch):
+def test_global_tg_automatic_login_and_saved_identity_use_international_region(tg, monkeypatch):
     key, ctl, _, output, _, _, _ = tg
     monkeypatch.setattr(ctl.backend, "workbuddy_start_login", lambda **kwargs: {
         "realm": kwargs["realm"], "workbuddy_client_profile": kwargs["client_profile"],
@@ -186,8 +187,9 @@ def test_global_tg_login_entry_and_preview_use_international_region(tg, monkeypa
     assert "国际区登录" in output[-1][0] and "Google / GitHub" in output[-1][0]
     entry = dict(om.get_account(key), realm="global", domain="www.codebuddy.ai", workbuddy_client_profile="ide")
     monkeypatch.setattr(ctl.backend, "workbuddy_poll_login", lambda p: p.update(status="ready", entry=entry))
-    click(tg, "检查登录")
+    tg[2]["login_workers"].pop(0)()  # Authorization finishes without another click.
+    assert "授权已保存" in output[-1][0]
     assert "区域: 国际区" in output[-1][0] and "中国区" not in output[-1][0]
     assert "fixture-at" not in output[-1][0] and "fixture-rt" not in output[-1][0]
-    click(tg, "取消")
     assert states.get_state(42) is None
+    assert any(a.get("realm") == "global" for a in om.list_accounts())
