@@ -50,9 +50,9 @@ def test_management_routes_are_cloned_directly_into_the_application(monkeypatch)
     # there is no intermediate aggregate router to clone a second time.
     assert len(included) == 21
     assert all(prefix == "/api/management/v1" for _router, prefix in included)
-    assert sum(len(router.routes) for router, _prefix in included) == 212
-    # FastAPI may retain included routers instead of flattening app.routes.
-    # Verify the complete public operation contract, not that internal layout.
+    # FastAPI may retain nested includes (such as the WorkBuddy router) in
+    # router.routes as well as app.routes, rather than flattening them. Count
+    # the complete public operations below, not internal router objects.
     operations = [
         (method.upper(), path, operation["operationId"])
         for path, path_item in app.openapi()["paths"].items()
