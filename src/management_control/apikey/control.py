@@ -174,7 +174,7 @@ class ApiKeyControl:
         raw = raw_keys.get(key_id)
         if raw is None:
             raise self._not_found(key_id)
-        month = self._period_stats().get(key_id) if include_stats else None
+        month = self._period_stats(key_id).get(key_id) if include_stats else None
         models = self._model_stats(key_id) if include_stats else ()
         order = list(raw_keys).index(key_id) + 1
         return self._view(key_id, raw, order, month, models, include_secret)
@@ -618,8 +618,10 @@ class ApiKeyControl:
         while len(self._plans) >= 512:
             self._plans.pop(next(iter(self._plans)))
 
-    def _period_stats(self) -> dict[str, Mapping[str, Any]]:
+    def _period_stats(self, key_id: str | None = None) -> dict[str, Mapping[str, Any]]:
         try:
+            if key_id is not None:
+                return {key_id: self._stats.tokens_for_apikey(key_id, self._month_start_ts())}
             snapshot = self._stats.stats_period_snapshot(self._month_start_ts())
             return dict((snapshot or {}).get("by_apikey") or {})
         except Exception as exc:

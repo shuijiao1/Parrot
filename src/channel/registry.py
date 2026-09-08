@@ -23,6 +23,7 @@ from .oauth_channel import OAuthChannel
 from .openai_oauth_channel import OpenAIOAuthChannel
 from .antigravity_oauth_channel import AntigravityOAuthChannel
 from .xai_oauth_channel import XAIOAuthChannel
+from .workbuddy_oauth_channel import WorkBuddyOAuthChannel
 from .url_utils import (
     normalize_api_path,
     split_base_url,
@@ -74,10 +75,18 @@ def _rebuild_from_config_locked() -> None:
                 ch = AntigravityOAuthChannel(acc)
             elif provider == "cursor":
                 ch = CursorOAuthChannel(acc)
+            elif provider == "workbuddy":
+                ch = WorkBuddyOAuthChannel(acc)
             else:
                 ch = OAuthChannel(acc, default_models)
             if channel_state.is_retired_source(ch.key):
                 print(f"[registry] skip reused retired channel key: {ch.key}")
+                continue
+            ch.state_key = channel_state.register_oauth_generation(
+                ch.key, acc.get("generationId"),
+            )
+            if channel_state.is_deleted(ch.state_key):
+                print(f"[registry] skip retired OAuth account generation: {ch.key}")
                 continue
             new[ch.key] = ch
         except Exception as exc:

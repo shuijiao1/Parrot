@@ -161,14 +161,16 @@ def test_status_control_readonly_snapshots_page_total_and_database_status():
     assert by_id["cooldownProbe"]["intervalSeconds"] == 31
 
 
-def test_background_jobs_no_refresh_is_provably_disabled(monkeypatch):
+def test_background_jobs_no_refresh_only_disables_token_rotation(monkeypatch):
     monkeypatch.setenv("PARROT_NO_REFRESH", "1")
     control = StatusControl(config=Config(), oauth_manager=OAuth())
     jobs = {item["id"]: item for item in control.background_jobs(
         context(), page=1, page_size=20,
     ).items}
-    for job_id in ("oauthRefresh", "quotaMonitor", "oauthModelSync", "providerUsage"):
-        assert jobs[job_id]["status"] == "disabled"
+    assert jobs["oauthRefresh"]["status"] == "disabled"
+    assert jobs["quotaMonitor"]["status"] == "disabled"  # Config().quotaMonitor.enabled is false.
+    for job_id in ("oauthModelSync", "providerUsage"):
+        assert jobs[job_id]["status"] == "unknown"
 
 
 def test_common_require_only_maps_real_capability_denials(monkeypatch):

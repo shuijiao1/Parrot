@@ -36,7 +36,7 @@ from ..errors import ErrorField, ManagementError, ManagementErrorCode
 from ..operations import ManagementOperation, OperationRegistry, OperationStore
 from .discovery import discover_models, run_model_discovery
 from .preflight import validate_existing_operation
-from .validation import validated_preset
+from .validation import validate_base_url, validated_preset
 from .models import (
     _UNSET,
     ActionResult,
@@ -376,8 +376,7 @@ class ChannelControl:
     def get_channel_detail(self, context: ManagementContext, channel_id: str) -> ChannelDetail:
         channel = self.get_channel(context, channel_id)
         since = self._month_start()
-        period = log_db.stats_period_snapshot(since)
-        month = self._month_stats((period.get("by_channel") or {}).get(channel.id))
+        month = self._month_stats(log_db.tokens_for_channel(channel.id, since))
         models = tuple(copy.deepcopy(log_db.channel_model_stats(channel.id, since_ts=since)))
         return ChannelDetail(channel=channel, month_stats=month, model_stats=models)
 
@@ -502,11 +501,7 @@ class ChannelControl:
             base_url, api_path = parsed.base_url, parsed.api_path
             if cc_mimicry is None:
                 cc_mimicry = bool(command.protocol is ChannelProtocol.ANTHROPIC and preset.cc_mimicry)
-        if not base_url:
-            raise ManagementError(
-                ManagementErrorCode.VALIDATION_FAILED,
-                fields=(ErrorField("baseUrl", "missing", "Base URL is required"),),
-            )
+        validate_base_url(base_url)
         return {
             "name": name,
             "baseUrl": base_url,
@@ -587,8 +582,10 @@ class ChannelControl:
             })
         if not patch:
             raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
-        if command.name is not None and (not command.name.strip() or len(command.name.strip()) > 64):
+        if command.name is not None and not command.name.strip():
             raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
+        if command.base_url is not None:
+            validate_base_url(command.base_url)
         if command.api_key is not None and len(command.api_key.strip()) < 5:
             raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
         if command.max_concurrent is not None and command.max_concurrent < 0:
@@ -773,6 +770,7 @@ class ChannelControl:
 
     @staticmethod
     def _draft_channel(command: DraftProbeCommand):
+        validate_base_url(command.base_url)
         entry = {
             "name": command.name + "__wiz",
             "type": "api",
@@ -871,6 +869,7 @@ class ChannelControl:
         if command.channel_id: validate_existing_operation(self, context, command.channel_id)
         if not command.channel_id:
             self._authorize(context, Capability.SECRETS_WRITE)
+            if command.base_url is not None: validate_base_url(command.base_url)
         return operations.create(context, kind=_DISCOVERY_KIND, payload=command, cancellable=False)
 
     def start_draft_probe(
@@ -878,6 +877,7 @@ class ChannelControl:
     ) -> ManagementOperation:
         operations, _ = self._require_operations()
         self._authorize(context, Capability.SECRETS_WRITE)
+        validate_base_url(command.base_url)
         return operations.create(context, kind=_DRAFT_PROBE_KIND, payload=command, cancellable=False)
 
     def start_existing_probe(

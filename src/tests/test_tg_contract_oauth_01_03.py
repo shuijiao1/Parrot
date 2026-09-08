@@ -155,7 +155,7 @@ def _run_oa02(case, monkeypatch):
         om.on_refresh_usage(42, 100, "cb-refresh-usage", short, page=3, filter_key="invalid")
         return actual(case, env, final=env.final(accountKey=key))
     if op == "refresh_all_nonblocking_singleflight":
-        monkeypatch.setattr(om, "_refreshable_account_keys_for_ui", lambda accounts: [key])
+        monkeypatch.setattr(om, "_refreshable_account_keys_for_ui", lambda accounts, *, explicit=False: [key])
         monkeypatch.setattr(om.threading, "Thread", DeferredThread)
         om._BACKGROUND_REFRESH_INFLIGHT.clear()
         om.on_refresh_all(42, 100, "cb-all", page=2, filter_key="available")

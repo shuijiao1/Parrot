@@ -657,7 +657,7 @@ def test_update_check_maps_upstream_failure_without_leaking_detail(tmp_path):
     def fail_refresh():
         raise RuntimeError(f"Bearer {marker}")
 
-    fixture.update_gateway.force_refresh = fail_refresh
+    fixture.update_gateway.check_latest = fail_refresh
     with TestClient(app) as client:
         headers = bearer(create_session(client))
         response = client.post(BASE + "/updates/actions/check", headers=headers)

@@ -18,9 +18,10 @@ from . import antigravity as _antigravity
 from . import cursor as _cursor
 from . import openai as _openai
 from . import xai as _xai
+from . import workbuddy as _workbuddy
 
 # 常量：有效的 provider 值。新增 provider 时在此登记。
-VALID_PROVIDERS: tuple[str, ...] = ("claude", "openai", "xai", "cursor", "antigravity")
+VALID_PROVIDERS: tuple[str, ...] = ("claude", "openai", "xai", "cursor", "antigravity", "workbuddy")
 
 # 老数据（无 provider 字段）默认当作 claude。
 DEFAULT_PROVIDER: str = "claude"
@@ -42,6 +43,7 @@ _NON_CLAUDE_MODULES = {
     "xai": _xai,
     "cursor": _cursor,
     "antigravity": _antigravity,
+    "workbuddy": _workbuddy,
 }
 
 

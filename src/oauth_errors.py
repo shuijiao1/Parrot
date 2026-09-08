@@ -137,6 +137,27 @@ def describe_oauth_error(
     body_code = _response_error_code(exc)
     technical = _technical_from_exception(exc)
 
+    # WorkBuddy deliberately strips upstream bodies and transport text; use its
+    # typed facts instead of guessing authentication failure from an error string.
+    if prov == "workbuddy":
+        from .oauth.workbuddy.common import WorkBuddyError
+        if isinstance(exc, WorkBuddyError):
+            protected = exc.kind == "disabled"
+            persistence = exc.kind in {"save_failed_retry_save", "save_candidate_expired_relogin"}
+            title = "保护模式暂停执行" if protected else ("Token 保存未完成" if persistence else "WorkBuddy 请求失败")
+            reason = "当前不会刷新 Token 或执行签到、领取。" if protected else "上游请求或凭据保存未完成；未将未知结果当作成功。"
+            action = ("使用独立账户并解除保护后再执行。" if protected else
+                      "请重新授权此账号。" if exc.kind == "save_candidate_expired_relogin" or exc.auth_error else
+                      "稍后重试；已取得的轮换 Token 会优先重试保存，不重复刷新。" if persistence else
+                      "稍后重试或检查上游服务。")
+            return OAuthDisplayError(
+                code=f"workbuddy_{exc.kind}" if protected or persistence else "workbuddy_request_failed",
+                title=title, reason=reason, action=action,
+                retryable=exc.retryable or exc.kind == "save_failed_retry_save",
+                auth_error=exc.auth_error, status=exc.status_code or None,
+                provider=prov, operation=op, technical=technical,
+            )
+
     # Non-HTTP transport failures first.
     if isinstance(exc, httpx.TimeoutException) or (isinstance(exc, str) and "timeout" in exc.lower()):
         return OAuthDisplayError(

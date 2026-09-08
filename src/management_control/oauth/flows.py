@@ -23,6 +23,7 @@ from .models import (
     RefreshTokenCredential,
 )
 from .plans import OneShotPlanStore
+from .workbuddy_flows import WorkBuddyFlows
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +67,7 @@ class OAuthFlowService:
     ) -> None:
         self.backend = backend
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self.workbuddy = WorkBuddyFlows(backend, clock=self._clock)
         self._flows = flow_store or OneShotPlanStore(
             prefix="oflow", ttl_seconds=1800, clock=self._clock,
         )
@@ -76,7 +78,9 @@ class OAuthFlowService:
             raise ValueError("OAuth clock must be timezone-aware")
         return value
 
-    def start(self, actor_subject_id: str, provider: OAuthProvider) -> OAuthLoginFlow:
+    def start(self, actor_subject_id: str, provider: OAuthProvider, *, realm="cn", client_profile=None) -> OAuthLoginFlow:
+        if provider is OAuthProvider.WORKBUDDY:
+            return self.workbuddy.start(actor_subject_id, realm=realm, client_profile=client_profile)
         payload: dict = {"provider": provider.value}
         instruction: str | None = None
         auth_url: str | None
@@ -322,6 +326,14 @@ class OAuthFlowService:
                 entry.update(workspace_id=credential.workspace_id, chatgpt_account_id=credential.workspace_id)
             if credential.project_id:
                 entry["project_id"] = credential.project_id
+            if credential.provider is OAuthProvider.WORKBUDDY:
+                from src.oauth.workbuddy import normalize_credential
+                entry.update(realm=credential.realm, uid=credential.uid,
+                             enterprise_id=credential.enterprise_id, domain=credential.domain)
+                try:
+                    return normalize_credential(entry)
+                except ValueError:
+                    raise ManagementError(ManagementErrorCode.VALIDATION_FAILED) from None
             return entry
         if isinstance(credential, JsonCredential):
             try:
@@ -330,6 +342,12 @@ class OAuthFlowService:
                 raise ManagementError(ManagementErrorCode.VALIDATION_FAILED) from exc
             if not isinstance(value, dict):
                 raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
+            if credential.provider is OAuthProvider.WORKBUDDY:
+                from src.oauth.workbuddy import normalize_credential
+                try:
+                    return normalize_credential(value)
+                except ValueError:
+                    raise ManagementError(ManagementErrorCode.VALIDATION_FAILED) from None
             return self.credential_entry(
                 ManualCredential(
                     provider=credential.provider,

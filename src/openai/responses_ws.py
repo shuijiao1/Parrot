@@ -2247,7 +2247,9 @@ async def _try_sse_channel(
         result.output_items = tracker.get_output_items()
         return result
 
-    async def finalize_and_return() -> _WsAttemptResult:
+    async def _persist_accepted_sse_request() -> _WsAttemptResult:
+        if result.request_finalized:
+            return result
         sync_tracker_result()
         await terminalize_round(result.outcome, result.error_detail)
         if retry_attempt_id is not None:
@@ -2271,7 +2273,6 @@ async def _try_sse_channel(
                 settle=False,
             )
         request_elapsed_ms = int((time.monotonic() - start_monotonic) * 1000)
-        result.request_finalized = True
         if result.ok:
             total_ms = result.total_ms
             finalize_policy.apply_success_health_effects(
@@ -2363,7 +2364,12 @@ async def _try_sse_channel(
                 proxy_bytes_up=proxy_bytes.up,
                 proxy_bytes_down=proxy_bytes.down,
             ))
+        result.request_finalized = True
         return result
+
+    async def finalize_and_return() -> _WsAttemptResult:
+        # Protect route, retry and request writes as one owner, not individually.
+        return await await_ws_owned(_persist_accepted_sse_request())
 
     async def commit_pending() -> None:
         nonlocal committed
@@ -2388,13 +2394,14 @@ async def _try_sse_channel(
                 if tracker.response_completed:
                     result.ok = True
                     result.outcome = "success"
+                    await finalize_and_return()
                     if committed:
                         await _close_downstream(websocket, 1000, "")
-                        return await finalize_and_return()
-                    return await finalize_and_return()
+                    return result
                 result.outcome = "upstream_closed" if (committed or dispatch_committed) else "closed_before_first_byte"
                 result.error_detail = "upstream SSE ended before response.completed"
                 if committed or dispatch_committed:
+                    await finalize_and_return()
                     if not committed:
                         await commit_pending()
                     await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
@@ -2404,6 +2411,7 @@ async def _try_sse_channel(
                 result.outcome = exc.outcome
                 result.error_detail = exc.outcome
                 if committed or dispatch_committed:
+                    await finalize_and_return()
                     if not committed:
                         await commit_pending()
                     await _close_downstream(websocket, 4504, result.error_detail)
@@ -2413,6 +2421,7 @@ async def _try_sse_channel(
                 result.outcome = "transport_timeout"
                 result.error_detail = f"upstream SSE transport timeout: {exc}"
                 if committed or dispatch_committed:
+                    await finalize_and_return()
                     if not committed:
                         await commit_pending()
                     await _close_downstream(websocket, 4504, result.error_detail)
@@ -2422,6 +2431,7 @@ async def _try_sse_channel(
                 result.outcome = "transport_error" if (committed or dispatch_committed) else "closed_before_first_byte"
                 result.error_detail = f"read upstream SSE: {exc}"[:2000]
                 if committed or dispatch_committed:
+                    await finalize_and_return()
                     if not committed:
                         await commit_pending()
                     await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
@@ -2464,6 +2474,7 @@ async def _try_sse_channel(
                     result.error_code = tracker.stream_error_code
                     result.error_detail = tracker.stream_error_message or frame_text[:2000]
                     if event_type == "response.failed" or committed or dispatch_committed or is_context_error:
+                        await finalize_and_return()
                         if not committed:
                             if not is_context_error:
                                 pending.append(frame_text)
@@ -2487,31 +2498,35 @@ async def _try_sse_channel(
                         result.outcome = "blacklist_hit"
                         result.error_detail = f"blacklist: {bl_hit}"
                         if committed or dispatch_committed:
+                            await finalize_and_return()
                             if not committed:
                                 await commit_pending()
                             await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
                             return await finalize_and_return()
                         return sync_tracker_result()
 
+                if tracker.response_completed:
+                    result.ok = True
+                    result.outcome = "success"
+                    await finalize_and_return()
+                    if not committed:
+                        pending.append(frame_text)
+                        await commit_pending()
+                    else:
+                        await _send_downstream(websocket, frame_text)
+                    await _close_downstream(websocket, 1000, "")
+                    return result
+
                 if not committed:
                     pending.append(frame_text)
                     if visible:
                         await commit_pending()
-                    elif tracker.response_completed:
-                        result.ok = True
-                        result.outcome = "success"
-                        await commit_pending()
-                        await _close_downstream(websocket, 1000, "")
-                        return await finalize_and_return()
                     continue
 
                 await _send_downstream(websocket, frame_text)
-                if tracker.response_completed:
-                    result.ok = True
-                    result.outcome = "success"
-                    await _close_downstream(websocket, 1000, "")
-                    return await finalize_and_return()
     except WebSocketDisconnect:
+        if result.request_finalized:
+            return result
         result.outcome = "client_disconnected"
         result.error_detail = "client disconnected"
         if committed:
@@ -2803,7 +2818,7 @@ async def _relay_ws_session(
     relay_state["sync_result"] = sync_tracker_result
     relay_state["retry_finalized"] = False
 
-    async def finalize_accepted_request() -> _WsAttemptResult:
+    async def _persist_accepted_ws_request() -> _WsAttemptResult:
         if result.request_finalized:
             return result
         sync_tracker_result()
@@ -2840,7 +2855,6 @@ async def _relay_ws_session(
                 relay_state["retry_finalized"] = True
 
             await await_ws_owned(settle_retry_attempt())
-        result.request_finalized = True
         request_elapsed_ms = int((time.monotonic() - start_monotonic) * 1000)
 
         if result.ok:
@@ -2938,8 +2952,12 @@ async def _relay_ws_session(
                     else "error"
                 ),
             ))
+        result.request_finalized = True
         release_request_turn_serialization(body)
         return result
+
+    async def finalize_accepted_request() -> _WsAttemptResult:
+        return await await_ws_owned(_persist_accepted_ws_request())
 
     # Send first frame upstream before accepting downstream. If upstream rejects
     # before a downstream-visible event, the attempt can still fail over.
@@ -3090,11 +3108,18 @@ async def _relay_ws_session(
             if pending_visible:
                 result.closed_after_accept = True
                 _apply_ws_snapshot(result, timing, terminal=False)
+            await finalize_accepted_request()
+            if pending_visible:
                 for item in pending_visible:
-                    await _send_downstream(
-                        websocket,
-                        _identity_expose_frame(item, _identity_map),
-                    )
+                    try:
+                        await _send_downstream(
+                            websocket,
+                            _identity_expose_frame(item, _identity_map),
+                        )
+                    except WebSocketDisconnect:
+                        # The upstream terminal is already durable; a failed
+                        # downstream send must not become a new channel failure.
+                        return result
             if result.outcome == "request_invalid":
                 if result.http_status == 413:
                     await _send_request_invalid_error_frame(
@@ -3163,11 +3188,13 @@ async def _relay_ws_session(
             ):
                 result.outcome = step.outcome
                 result.error_detail = step.error_detail
+                await finalize_accepted_request()
                 await _close_downstream(websocket, 4504, result.error_detail)
                 return
             if step.outcome in ("upstream_closed", "connection_lifecycle"):
                 result.outcome = step.outcome
                 result.error_detail = step.error_detail
+                await finalize_accepted_request()
                 # 1006 is reserved and cannot be sent in a close frame.
                 downstream_close_code = (
                     step.close_code if step.close_code in (1000, 1001) else 1011
@@ -3179,6 +3206,7 @@ async def _relay_ws_session(
             if step.outcome == "blacklist_hit":
                 result.outcome = "blacklist_hit"
                 result.error_detail = step.error_detail
+                await finalize_accepted_request()
                 await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
                 return
             if step.outcome == "request_invalid":
@@ -3186,6 +3214,7 @@ async def _relay_ws_session(
                 result.http_status = int(step.http_status or 400)
                 result.error_code = step.error_code
                 result.error_detail = step.error_detail or protocol_errors.responses_max_output_context_error_message()
+                await finalize_accepted_request()
                 if result.http_status == 413:
                     await _send_request_invalid_error_frame(
                         websocket, result.error_detail, code="message_too_big", status=413,
@@ -3201,23 +3230,28 @@ async def _relay_ws_session(
                         _trim_reason(result.error_detail),
                     )
                 return
-            if step.data is not None and not step.skip_downstream:
-                await _send_downstream(websocket, step.data)
-            if step.outcome in {
+            terminal_error = step.outcome in {
                 "stream_upstream_error", "request_rejected", "response_incomplete",
-            }:
+            }
+            if terminal_error:
                 result.outcome = step.outcome
                 result.error_code = step.error_code
                 result.http_status = step.http_status
                 result.error_detail = step.error_detail
+                await finalize_accepted_request()
+            elif step.outcome == "success":
+                result.ok = True
+                result.outcome = "success"
+                await finalize_accepted_request()
+            if step.data is not None and not step.skip_downstream:
+                await _send_downstream(websocket, step.data)
+            if terminal_error:
                 close_code = 1011 if step.data is not None else step.close_code
                 close_reason = _trim_reason(result.error_detail) if step.data is not None else step.close_reason
                 if close_downstream_on_terminal:
                     await _close_downstream(websocket, close_code, close_reason)
                 return
             if step.outcome == "success":
-                result.ok = True
-                result.outcome = "success"
                 close_code = 1000 if step.data is not None else step.close_code
                 close_reason = "" if step.data is not None else step.close_reason
                 if close_downstream_on_terminal:
@@ -3249,7 +3283,7 @@ async def _relay_ws_session(
         result.error_detail = "client disconnected"
     for task in done:
         exc = task.exception()
-        if exc is None:
+        if exc is None or result.request_finalized:
             continue
         if isinstance(exc, WebSocketDisconnect):
             if tracker.response_completed:

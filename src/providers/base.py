@@ -20,6 +20,7 @@ from .capabilities import (
     OPENAI_API_CAPABILITIES,
     OPENAI_CODEX_CAPABILITIES,
     XAI_OAUTH_CAPABILITIES,
+    WORKBUDDY_OAUTH_CAPABILITIES,
     ProviderCapabilities,
 )
 from . import antigravity_codec
@@ -91,6 +92,17 @@ class OpenAIApiAdapter(ProviderAdapter):
 class CursorOAuthAdapter(ProviderAdapter):
     name = "cursor-oauth"
     capabilities = CURSOR_OAUTH_CAPABILITIES
+
+
+class WorkBuddyOAuthAdapter(ProviderAdapter):
+    name = "workbuddy-oauth"
+    capabilities = WORKBUDDY_OAUTH_CAPABILITIES
+
+    async def restore_response_bytes(self, chunk: bytes, ctx: ProviderAttemptContext) -> bytes:
+        converter = (ctx.translator_ctx or {}).get("workbuddy_stream")
+        if converter is None:
+            raise ValueError("WorkBuddy response requires its per-attempt stream decoder")
+        return converter.feed(chunk)
 
 
 class OpenAICodexAdapter(ProviderAdapter):

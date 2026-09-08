@@ -115,6 +115,9 @@ def make_stream_translator(translator_ctx: Optional[dict]):
         return None
     name = translator_ctx.get("response_translator")
     model = translator_ctx.get("model_for_response") or ""
+    if name == "chat_model_alias":
+        from .model_alias import ChatModelAliasStream
+        return ChatModelAliasStream(model)
     if name == "chat_to_responses":
         from ..openai.transform.stream_r2c import StreamTranslator as _R2C
         return _R2C(
@@ -132,7 +135,7 @@ def make_stream_translator(translator_ctx: Optional[dict]):
         )
     if name == "anthropic_to_chat":
         from ..openai.transform.stream_chat_to_anthropic import StreamTranslator as _C2A
-        return _C2A(model=model)
+        return _C2A(model=model, model_override=translator_ctx.get("response_model_override"))
     if name == "anthropic_to_responses":
         from ..openai.transform.stream_responses_to_anthropic import StreamTranslator as _R2A
         return _R2A(
@@ -166,6 +169,9 @@ def apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dic
         return obj
     name = translator_ctx.get("response_translator")
     model = translator_ctx.get("model_for_response") or ""
+    if name == "chat_model_alias":
+        from .model_alias import chat_response
+        return chat_response(obj, model)
     if name == "chat_to_responses":
         from ..openai.transform.chat_to_responses import translate_response as _t
         return _t(obj, model=model)

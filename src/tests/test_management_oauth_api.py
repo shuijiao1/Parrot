@@ -57,6 +57,15 @@ ROUTE_REQUESTS = [
     ("DELETE", f"/oauth/accounts/{ACCOUNT_ID}", None, {"If-Match": "revision"}),
     ("PUT", "/oauth/account-order", {"accountIds": [ACCOUNT_ID, INVALID_ID]}, {"If-Match": "revision"}),
     ("POST", "/oauth/login-flows", {"provider": "openai"}, {}),
+    ("POST", "/oauth/login-flows/wbflow_invalid/poll", {"flowSecret": "invalid-secret-value"}, {}),
+    ("POST", "/oauth/login-flows/wbflow_invalid/cancel", {"flowSecret": "invalid-secret-value"}, {}),
+    ("GET", f"/oauth/accounts/{ACCOUNT_ID}/workbuddy", None, {}),
+    ("POST", f"/oauth/accounts/{ACCOUNT_ID}/workbuddy/actions/refresh-status", None, {}),
+    ("POST", f"/oauth/accounts/{ACCOUNT_ID}/workbuddy/action-plans", {"action": "checkin"}, {}),
+    ("POST", f"/oauth/accounts/{ACCOUNT_ID}/workbuddy/actions/execute", {"planToken": "wbaction_invalid.invalid"}, {}),
+    ("GET", f"/oauth/accounts/{ACCOUNT_ID}/workbuddy/action-records", None, {}),
+    ("PATCH", f"/oauth/accounts/{ACCOUNT_ID}/workbuddy/settings", {"autoCheckin": False}, {}),
+    ("GET", "/oauth/workbuddy/settings", None, {}),
     ("POST", "/oauth/login-flows/oflow_invalid/complete", {"flowSecret": "invalid-secret-value", "code": "code", "state": "state"}, {}),
     ("POST", "/oauth/imports/preview", {"format": "openai", "payload": "[]"}, {}),
     ("POST", "/oauth/imports/oimport_invalid/commit", {"importSecret": "invalid-secret-value", "decisions": []}, {}),
@@ -109,11 +118,11 @@ def test_oauth_openapi_matches_owned_manifest_and_declares_security_and_secrets(
         if line
     }
     assert set(operations) == manifested
-    assert len(operations) == len(ROUTE_REQUESTS) == 32
+    assert len(operations) == len(ROUTE_REQUESTS) == 41
     assert all(value.get("tags") == ["management-oauth"] for value in operations.values())
     assert all(value.get("security") == [{"ManagementSession": []}] for value in operations.values())
     no_content = {
-        "deleteOAuthAccount", "clearOAuthAccountErrors", "clearOAuthAccountAffinity",
+        "deleteOAuthAccount", "clearOAuthAccountErrors", "clearOAuthAccountAffinity", "cancelOAuthLoginFlow",
     }
     for operation_id, operation in operations.items():
         successes = [
@@ -757,7 +766,10 @@ def test_control_login_flows_cover_every_supported_provider(provider):
     control, backend = build_control()
     context = telegram_context(42)
     flow = control.start_login_flow(context, provider)
-    if provider is OAuthProvider.CURSOR:
+    if provider is OAuthProvider.WORKBUDDY:
+        assert control.poll_login_flow(context, flow.flow_id, flow.flow_secret).status == "ready"
+        command = CompleteOAuthLoginCommand(completed=True)
+    elif provider is OAuthProvider.CURSOR:
         command = CompleteOAuthLoginCommand(completed=True)
     else:
         state = parse_qs(urlparse(flow.auth_url or "").query)["state"][0]

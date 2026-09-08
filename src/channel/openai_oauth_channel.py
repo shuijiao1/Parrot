@@ -507,7 +507,7 @@ class OpenAIOAuthChannel(Channel):
 
         # Resolve/refresh the final candidate before constructing any upstream
         # identity. A workspace still unknown after refresh fails closed.
-        access_token = await oauth_manager.ensure_valid_token(self.account_key)
+        access_token = await oauth_manager.ensure_channel_token(self)
         from .. import channel_state
         current_account_key = self.account_key
         resolved_channel_key = channel_state.resolve(self.key)
@@ -841,7 +841,7 @@ class OpenAIOAuthChannel(Channel):
         this is only a small transport-specific view of the already-established
         OAuth channel identity.
         """
-        access_token = await oauth_manager.ensure_valid_token(self.account_key)
+        access_token = await oauth_manager.ensure_channel_token(self)
         from .. import channel_state
         resolved = channel_state.resolve(self.key)
         account_key = resolved[len("oauth:"):] if resolved.startswith("oauth:") else self.account_key

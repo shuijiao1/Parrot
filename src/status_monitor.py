@@ -355,13 +355,15 @@ def _format_resolved(provider: str, incident: dict) -> str:
 # ─── 主轮询逻辑 ──────────────────────────────────────────────────
 
 
-def _process_provider(provider: str, *, push: bool) -> None:
+def _process_provider(provider: str, *, push: bool, raise_on_error: bool = False) -> None:
     """拉一次该 provider 的最新 incidents 并增量推送。
 
     push=False 仅 mark_seen + 更新内存活跃表（首轮启动用，不刷屏）。
     """
     incidents = _fetch_incidents(provider)
     if incidents is None:
+        if raise_on_error:
+            raise RuntimeError("Status refresh failed")
         return
 
     # 1. 更新内存活跃表，得到"新出现 / 刚恢复"
@@ -481,6 +483,9 @@ async def monitor_loop() -> None:
 # ─── TG 菜单辅助 ─────────────────────────────────────────────────
 
 
-def list_recent_incidents(provider: str, limit: int = 5) -> list[dict]:
-    """供 TG 菜单：拉一次最新 incidents（同步阻塞版，调用方应在 worker thread 里跑）。"""
-    return (_fetch_incidents(provider) or [])[:limit]
+def list_recent_incidents(provider: str, limit: int = 5, *, raise_on_error: bool = False) -> list[dict]:
+    """同步拉取；保留 TG 空列表降级，API 可显式区分失败与真实空列表。"""
+    incidents = _fetch_incidents(provider)
+    if incidents is None and raise_on_error:
+        raise RuntimeError("Status history fetch failed")
+    return (incidents or [])[:limit]

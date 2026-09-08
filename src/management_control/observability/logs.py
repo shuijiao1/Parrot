@@ -254,6 +254,8 @@ class LogsControl:
     @staticmethod
     def _body_item_record(item: dict, log_id: str, kind: LogBodyKind, source_revision: str) -> dict:
         result = camelize(item)
+        # Search bookkeeping is not part of the public body-item contract.
+        result.pop("matchCount", None)
         result["id"] = f"item_{int(result.get('seq') or 0)}"
         result["revision"] = revision_for({
             "logId": log_id, "kind": kind.value,

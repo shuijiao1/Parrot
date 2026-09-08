@@ -1,4 +1,4 @@
-"""Shared provider preset validation for channel mutations."""
+"""Shared URL and provider preset validation for channel actions."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from typing import Any
 
 from src.providers.catalog import ProviderPreset, get_preset
 
-from ..errors import ManagementError, ManagementErrorCode
+from ..errors import ErrorField, ManagementError, ManagementErrorCode
 
 
 def validated_preset(
@@ -22,3 +22,17 @@ def validated_preset(
     if preset is None or getattr(protocol, "value", protocol) not in preset.protocols:
         raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
     return preset
+
+
+def validate_base_url(value: str | None) -> None:
+    """Apply the existing Telegram HTTP(S) scheme rule at the shared boundary."""
+    if not value or not value.strip():
+        raise ManagementError(
+            ManagementErrorCode.VALIDATION_FAILED,
+            fields=(ErrorField("baseUrl", "missing", "Base URL is required"),),
+        )
+    if not value.strip().startswith(("http://", "https://")):
+        raise ManagementError(
+            ManagementErrorCode.VALIDATION_FAILED,
+            fields=(ErrorField("baseUrl", "invalid_scheme", "Base URL must start with http:// or https://"),),
+        )

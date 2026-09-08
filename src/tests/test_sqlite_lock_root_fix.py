@@ -1813,15 +1813,16 @@ def test_legacy_email_delete_cleans_all_accounts_atomically_and_blocks_late_quot
         }
 
     config.update(seed)
-    for account_key, channel_key in zip(account_keys, channel_keys):
+    generations = [oauth_manager.account_state_key(a) for a in (claude, openai)]
+    for account_key, channel_key, generation in zip(account_keys, channel_keys, generations):
         scorer.record_success(channel_key, "model", 1, 2, 3)
         cooldown.record_error(channel_key, "model", "old")
         affinity.upsert(f"fp-{account_key}", channel_key, "model")
         affinity.client_upsert(f"client-{account_key}", channel_key, "model")
         state_db.quota_save(account_key, {"fetched_at": 1}, email=email)
         with concurrency._slots_guard:
-            concurrency._slots[channel_key] = concurrency.ChannelSlot(
-                key=channel_key, max_concurrent=1, in_flight=1,
+            concurrency._slots[generation] = concurrency.ChannelSlot(
+                key=generation, max_concurrent=1, in_flight=1,
             )
     snapshots = []
 
@@ -1838,26 +1839,29 @@ def test_legacy_email_delete_cleans_all_accounts_atomically_and_blocks_late_quot
         config._reload_callbacks.remove(callback)
 
     assert snapshots == [(0, {"anthropic": [], "openai": []})]
-    for account_key, channel_key in zip(account_keys, channel_keys):
-        assert channel_state.is_deleted(channel_key)
+    for account_key, channel_key, generation in zip(account_keys, channel_keys, generations):
+        assert channel_state.is_deleted(generation)
+        assert not channel_state.is_deleted(channel_key)
         assert scorer.get_stats(channel_key, "model") is None
         assert cooldown.get_state(channel_key, "model") is None
         assert affinity.get(f"fp-{account_key}") is None
         assert affinity.client_get(f"client-{account_key}") is None
         assert state_db.quota_load(account_key) is None
 
-        scorer.record_success(channel_key, "late", 4, 5, 6)
-        cooldown.record_error(channel_key, "late", "late")
-        affinity.upsert(f"late-fp-{account_key}", channel_key, "late")
-        affinity.client_upsert(f"late-client-{account_key}", channel_key, "late")
-        state_db.quota_save(account_key, {"fetched_at": 2}, email=email)
-        state_db.quota_patch_passive(account_key, {"five_hour_util": 9}, email=email)
+        scorer.record_success(generation, "late", 4, 5, 6)
+        cooldown.record_error(generation, "late", "late")
+        affinity.upsert(f"late-fp-{account_key}", generation, "late")
+        affinity.client_upsert(f"late-client-{account_key}", generation, "late")
+        state_db.quota_save(account_key, {"fetched_at": 2}, email=email, expected_state_key=generation)
+        state_db.quota_patch_passive(account_key, {"five_hour_util": 9}, email=email, expected_state_key=generation)
         assert scorer.get_stats(channel_key, "late") is None
         assert cooldown.get_state(channel_key, "late") is None
         assert state_db.quota_load(account_key) is None
 
-    for channel_key in channel_keys:
-        concurrency.release(channel_key)
-        assert channel_state.is_deleted(channel_key)
-    with pytest.raises(ValueError, match="restart before reusing"):
-        oauth_manager.add_account(dict(openai))
+    for generation in generations:
+        concurrency.release(generation)
+        assert channel_state.is_deleted(generation)
+    oauth_manager.add_account(dict(openai))
+    replacement = oauth_manager.get_account(account_keys[1])
+    assert replacement is not None
+    assert oauth_manager.account_state_key(replacement) != generations[1]

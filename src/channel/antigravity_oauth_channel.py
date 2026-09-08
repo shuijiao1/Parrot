@@ -222,7 +222,7 @@ class AntigravityOAuthChannel(Channel):
         )
         translator_ctx["antigravity_stream_requested"] = stream
 
-        access_token = await oauth_manager.ensure_valid_token(self.account_key)
+        access_token = await oauth_manager.ensure_channel_token(self)
         headers = self._build_headers(access_token, stream=stream)
         url = (
             f"{self.base_url}/{ag_provider.API_VERSION}:streamGenerateContent?alt=sse"

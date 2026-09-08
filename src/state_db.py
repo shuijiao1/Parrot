@@ -329,19 +329,19 @@ def quota_set_observation_times(account_key:str,*,last_passive_update_at:int|Non
         if fetched_at is not None:row["fetched_at"]=fetched_at
         if codex_window_observations is not None:row["codex_window_observations"]=codex_window_observations
     _mut("oauth_quota_cache",op)
-def _quota_write(account_key:str, operation):
+def _quota_write(account_key:str, operation, *, expected_state_key:str|None=None):
     from . import channel_state
     with channel_state.mutation_lock:
-        source=f"oauth:{account_key}"; target=channel_state.resolve(source)
+        source=expected_state_key or f"oauth:{account_key}"; target=channel_state.resolve(source)
         if channel_state.is_deleted(source) or channel_state.is_deleted(target): return None
         resolved=target[len("oauth:"):] if target.startswith("oauth:") else account_key
         return _mut("oauth_quota_cache",lambda d:operation(d,resolved))
 
-def quota_save(account_key:str,data:dict[str,Any],*,email:str|None=None)->None:
+def quota_save(account_key:str,data:dict[str,Any],*,email:str|None=None,expected_state_key:str|None=None)->None:
     cols=("five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","fable_util","fable_reset","extra_used","extra_limit","extra_util","raw_data")
     def op(d,target):
         row=_quota_defaults(dict(d.get(target) or {}));row.update({"account_key":target,"email":email or _quota_display_email(target),"fetched_at":int(data.get("fetched_at",now_ms()))});row.update({k:data.get(k) for k in cols});d[target]=row
-    _quota_write(account_key,op)
+    _quota_write(account_key,op,expected_state_key=expected_state_key)
 def quota_delete(value:str)->None:
     from . import channel_state
     with channel_state.mutation_lock:
@@ -353,13 +353,13 @@ def quota_delete(value:str)->None:
                 for k,r in list(d.items()):
                     if r.get("email")==value:d.pop(k,None)
         _mut("oauth_quota_cache",op)
-def quota_patch_passive(account_key:str,patch:dict,*,email:str|None=None)->None:
+def quota_patch_passive(account_key:str,patch:dict,*,email:str|None=None,expected_state_key:str|None=None)->None:
     safe={k:v for k,v in patch.items() if k in {"five_hour_util","five_hour_reset","seven_day_util","seven_day_reset"}}
     if not safe:return
     def op(d,target):
         row=_quota_defaults(dict(d.get(target) or {"account_key":target,"email":email or _quota_display_email(target),"fetched_at":0}));row.update(safe);row["last_passive_update_at"]=now_ms();d[target]=row
-    _quota_write(account_key,op)
-def quota_save_openai_snapshot(account_key:str,snap:dict,normalized:dict|None=None,*,email:str|None=None)->None:
+    _quota_write(account_key,op,expected_state_key=expected_state_key)
+def quota_save_openai_snapshot(account_key:str,snap:dict,normalized:dict|None=None,*,email:str|None=None,expected_state_key:str|None=None)->None:
     from .oauth import openai as provider
     if normalized is None:normalized=provider.normalize_codex_snapshot(snap)
     fetched=int(snap.get("fetched_at") or now_ms()); now=int(time.time())
@@ -377,7 +377,7 @@ def quota_save_openai_snapshot(account_key:str,snap:dict,normalized:dict|None=No
             except (TypeError,ValueError):existing={}
             merged=provider.merge_codex_window_observations(existing,incoming);row["codex_window_observations"]=json.dumps(merged,ensure_ascii=False,separators=(",",":"),sort_keys=True)
         d[target]=row
-    _quota_write(account_key,op)
+    _quota_write(account_key,op,expected_state_key=expected_state_key)
 
 def quota_rename_account_key(old_key:str,new_key:str,*,email:str|None=None)->int:
     if old_key==new_key:return 0
@@ -552,6 +552,56 @@ def compaction_owner_delete_owner(owner_identity:str)->int:
         for key in keys:d.pop(key,None)
         return len(keys)
     return _mut("codex_compaction_owners",op,strict=True)
+
+# WorkBuddy action intents/results are durable, never quota-cache observations.
+_WORKBUDDY_ACTION_FIELDS = frozenset({
+    "id", "owner", "action", "business_date", "activity_id", "attempt_id", "attempt",
+    "actor", "source", "credential_generation", "confirmed_at", "created_at", "updated_at",
+    "status", "phase", "code", "http_status", "awarded_credits", "balance_updated", "reconciled",
+})
+
+def workbuddy_action_load(key: str):
+    return _get("workbuddy_actions", key)
+
+def workbuddy_action_begin(key: str, row: dict, *, retry_failed: bool = False) -> dict:
+    value = {name: value for name, value in row.items() if name in _WORKBUDDY_ACTION_FIELDS}
+    def op(data):
+        old = data.get(key)
+        if old and not (retry_failed and old.get("status") in {"failed", "rejected"}):
+            return {"created": False, "record": dict(old)}
+        value.update(id=key, status="pending", phase="prepared",
+                     attempt=int((old or {}).get("attempt") or 0) + 1)
+        data[key] = value
+        return {"created": True, "record": value}
+    return _mut("workbuddy_actions", op, strict=True)
+
+def workbuddy_action_finish(key: str, attempt_id: str, fields: dict) -> dict:
+    patch = {name: value for name, value in fields.items() if name in {
+        "status", "phase", "code", "http_status", "awarded_credits", "balance_updated", "reconciled"}}
+    if patch.get("status") not in {"succeeded", "already_done", "failed", "rejected", "unknown"}:
+        raise ValueError("invalid WorkBuddy action result")
+    def op(data):
+        old = data.get(key)
+        if not old or old.get("attempt_id") != attempt_id:
+            raise ValueError("WorkBuddy action generation conflict")
+        value = dict(old, **patch, updated_at=now_ms())
+        data[key] = value
+        return value
+    return _mut("workbuddy_actions", op, strict=True)
+
+def workbuddy_action_history(owner: str, *, limit: int | None = 50) -> list[dict]:
+    values = [row for row in _all("workbuddy_actions") if row.get("owner") == owner]
+    ordered = sorted(values, key=lambda row: row.get("created_at", 0), reverse=True)
+    return ordered if limit is None else ordered[:max(1, min(limit, 200))]
+
+def workbuddy_action_cleanup(before_ms: int) -> int:
+    def op(data):
+        keys = [key for key, row in data.items() if row.get("action") == "checkin"
+                and row.get("status") not in {"pending", "unknown"} and row.get("updated_at", 0) < before_ms]
+        for key in keys:
+            data.pop(key, None)
+        return len(keys)
+    return _mut("workbuddy_actions", op, strict=True)
 
 # Explicit durable interfaces used by updater/checker/status monitor.
 def updater_load()->dict:

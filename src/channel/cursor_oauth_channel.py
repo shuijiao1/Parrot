@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 from .. import cache_hints, oauth_manager
 from ..cursor_bridge import catalog as cursor_catalog
+from .. import model_names
 from ..cursor_bridge import runtime as cursor_runtime
 from ..openai.channel.api_channel import OpenAIApiChannel
 from ..openai.transform import anthropic_to_chat, guard
@@ -135,10 +136,11 @@ class CursorOAuthChannel(OpenAIApiChannel):
         return None
 
     def supports_model(self, requested_model: str) -> Optional[str]:
-        return requested_model if requested_model in self.models else None
+        real = model_names.upstream_id(self.provider, requested_model)
+        return real if real in self.models else None
 
     def list_client_models(self) -> list[str]:
-        return list(self.models)
+        return [model_names.public_id(self.provider, model) for model in self.models]
 
     def cursor_metadata(self, model: str) -> dict[str, Any]:
         return cursor_catalog.metadata_from_record(self._record(model))
@@ -206,7 +208,7 @@ class CursorOAuthChannel(OpenAIApiChannel):
                 param="model",
                 scope="candidate",
             )
-        access_token = await oauth_manager.ensure_valid_token(self.account_key)
+        access_token = await oauth_manager.ensure_channel_token(self)
         cursor_runtime.update_account(self.account_key, access_token)
 
         if ingress_protocol == "anthropic":
@@ -280,6 +282,18 @@ class CursorOAuthChannel(OpenAIApiChannel):
         wants_fast = service_tier in {"priority", "fast"} or requested_body.get("_parrot_wants_fast_mode") is True
         thinking = _thinking_override(requested_body, payload)
         effort = payload.get("reasoning_effort")
+        if (
+            resolved_model.startswith("claude-")
+            and effort is None
+            and thinking is None
+            and requested_body.get("thinking") is None
+            and not wants_fast
+        ):
+            # Canonical Claude ids may not resolve without a Cursor preset.
+            # Match explicit high using catalog slugs, without changing other
+            # providers/models or overriding explicit thinking/fast controls.
+            effort = "high"
+            payload["reasoning_effort"] = effort
         if not cursor_catalog.normalize_effort(effort) and (wants_fast or thinking is not None):
             available = [str(item) for item in record.get("reasoning_efforts") or []]
             effort = "medium" if "medium" in available else "high" if "high" in available else None
@@ -331,7 +345,9 @@ class CursorOAuthChannel(OpenAIApiChannel):
             "cursor_actual_model": actual_model,
             "cursor_long_context": bool(payload.get("cursor_long_context")),
         })
-        request.translator_ctx = ctx
+        request.translator_ctx = model_names.response_context(
+            self.provider, resolved_model, ctx, ingress=ingress_protocol,
+        )
         return request
 
     def _headers(self) -> dict[str, str]:

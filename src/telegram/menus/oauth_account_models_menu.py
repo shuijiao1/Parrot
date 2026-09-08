@@ -7,6 +7,7 @@ import threading
 import time
 from typing import Optional
 
+from ... import model_names
 from ...management_control.oauth.menu_bridge import (
     control as oauth_control,
     model_metadata,
@@ -16,6 +17,10 @@ from .. import menu_cache, states, ui
 
 _PAGE_SIZE = 6
 _BULK_ACTION = "oam_bulk_disable"
+
+
+def _model_label(account_key: str, model: str) -> str:
+    return model_names.for_channel(f"oauth:{account_key}", model)
 
 
 def _context(raw: str) -> tuple[str, int, int, str]:
@@ -111,6 +116,9 @@ def _summary_lines(record: dict | None, *, use_max_context: bool = False) -> lis
     if context:
         suffix = "（Max Context 默认）" if use_max_context else ""
         facts.append(f"上下文：{context}{suffix}")
+    max_input = _format_tokens(record.get("maxInputTokens"))
+    if max_input:
+        facts.append(f"最大输入：{max_input}")
     efforts = [str(value) for value in record.get("reasoningEfforts") or [] if str(value)]
     if record.get("reasoning") is True or record.get("supportsThinking") is True or efforts: facts.append("🧠")
     input_modalities = {str(value).lower() for value in record.get("inputModalities") or []}
@@ -234,7 +242,7 @@ def render(account_key: str, *, model_page: int = 1, account_page: int = 1,
     for offset, model in enumerate(page_models):
         global_index = start + offset + 1
         icon, text, _ = statuses[start + offset]
-        lines.append(f"{global_index}. {icon} <code>{ui.escape_html(model)}</code> - {text}")
+        lines.append(f"{global_index}. {icon} <code>{ui.escape_html(_model_label(account_key, model))}</code> - {text}")
         use_max_context = bool(
             provider == "cursor"
             and oauth_control.cursor_max_context_default_snapshot(account, model)
@@ -370,7 +378,7 @@ def _bulk_render(data: dict) -> tuple[str, dict] | None:
         disabled = model in selected
         lines.append(
             f"{global_index}. {'🚫' if disabled else '✅'} "
-            f"<code>{ui.escape_html(model)}</code> - "
+            f"<code>{ui.escape_html(_model_label(account_key, model))}</code> - "
             f"{'将停用' if disabled else '保持启用'}"
         )
         number_row.append(ui.btn(
@@ -515,13 +523,14 @@ def _detail_render(account_key: str, model: str, *, model_page: int,
     record = dict(binding.metadata) if binding else {}
     icon, status, fault = _status(account_key, model, disabled)
     state = oauth_control.cooldown_state_snapshot(account_key, model) or {}
-    lines = [f"🧬 <b>模型详情</b>", "", f"完整 ID: <code>{ui.escape_html(model)}</code>"]
+    lines = [f"🧬 <b>模型详情</b>", "", f"完整 ID: <code>{ui.escape_html(_model_label(account_key, model))}</code>"]
     detail_fields = [
-        ("显示名称", record.get("name")), ("描述", record.get("description") or record.get("tagline")),
+        ("显示名称", _model_label(account_key, model) if _model_label(account_key, model) != model else record.get("name")), ("描述", record.get("description") or record.get("tagline")),
         ("上下文", _format_tokens(record.get("contextWindow"))), ("Max Context", _format_tokens(record.get("contextWindowMaxMode"))),
+        ("最大输入", _format_tokens(record.get("maxInputTokens"))),
         ("最大输出", _format_tokens(record.get("maxOutputTokens"))),
         ("输入模态", "、".join(record.get("inputModalities") or [])), ("输出模态", "、".join(record.get("outputModalities") or [])),
-        ("思考档位", "、".join(record.get("reasoningEfforts") or [])), ("别名", "、".join(record.get("aliases") or [])),
+        ("思考档位", "、".join(record.get("reasoningEfforts") or [])), ("别名", "、".join(_model_label(account_key, alias) for alias in record.get("aliases") or [])),
         ("服务档位（账户目录）", _service_tier_text(record)),
         ("最低 Codex CLI", record.get("minimalClientVersion")),
     ]

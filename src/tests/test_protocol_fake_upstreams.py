@@ -2355,6 +2355,84 @@ async def test_cc_v258_529_reuses_body_context_and_isolates_concurrent_requests(
         m["config"].update(lambda cfg: cfg.__setitem__("retry", old_retry))
 
 
+@pytest.mark.parametrize("ingress_protocol", ["chat", "responses", "anthropic"])
+@pytest.mark.parametrize("stream", [False, True], ids=["json", "sse"])
+async def test_xai_stream_only_response_content_type_tracks_downstream(
+    m, monkeypatch, ingress_protocol, stream,
+):
+    """Aggregated JSON must not inherit SSE MIME; actual streams keep it."""
+    from src import oauth_manager
+    from src.channel.xai_oauth_channel import XAIOAuthChannel
+
+    _setup(m)
+    _install_keys(m, _default_key())
+    channel = XAIOAuthChannel({
+        "provider": "xai",
+        "email": "header-contract@example.test",
+        "subject": "header-contract-subject",
+        "models": ["grok-4.5"],
+    })
+    _install_channels(m, [channel])
+
+    async def valid_token(_account_key):
+        return "fake-header-contract-token"
+
+    monkeypatch.setattr(oauth_manager, "ensure_valid_token", valid_token)
+    router = MockRouter()
+    expected_text = "stream-only header contract"
+
+    def handler(req: httpx.Request):
+        assert _json_request(req)["stream"] is True
+        response = _responses_sse_response(expected_text)
+        response.headers.update({
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "X-Request-Id": "stream-only-header-request",
+            "Request-Id": "stream-only-request-alias",
+            "OpenAI-Model": "grok-4.5",
+        })
+        return response
+
+    router.register(channel.base_url, handler)
+    body = {"model": "grok-4.5", "stream": stream, "max_tokens": 32}
+    if ingress_protocol == "responses":
+        body["input"] = [{"role": "user", "content": "ping"}]
+    else:
+        body["messages"] = [{"role": "user", "content": "ping"}]
+
+    if ingress_protocol == "anthropic":
+        response, client, _route = await _call_anthropic_core(m, router, body)
+    else:
+        response, client = await _call_openai_handler(m, router, ingress_protocol, body)
+    try:
+        assert response.status_code == 200
+        assert response.headers["x-request-id"] == "stream-only-header-request"
+        assert response.headers["request-id"] == "stream-only-request-alias"
+        assert response.headers["openai-model"] == "grok-4.5"
+        if stream:
+            assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
+            payload = await _consume_streaming_to_string(response)
+            assert expected_text in payload
+            terminal = {
+                "chat": "[DONE]",
+                "responses": "response.completed",
+                "anthropic": "message_stop",
+            }[ingress_protocol]
+            assert terminal in payload
+        else:
+            assert response.headers["content-type"] == "application/json"
+            payload = json.loads(response.body)
+            assert expected_text in json.dumps(payload)
+            if ingress_protocol == "chat":
+                assert payload["object"] == "chat.completion"
+            elif ingress_protocol == "responses":
+                assert payload["object"] == "response"
+                assert payload["status"] == "completed"
+            else:
+                assert payload["type"] == "message"
+    finally:
+        await client.aclose()
+
+
 async def test_xai_direct_503_retries_same_channel_without_health_penalty(m, monkeypatch):
     """Direct api.x.ai 503 is the REST counterpart of xAI SDK UNAVAILABLE."""
     _setup(m)

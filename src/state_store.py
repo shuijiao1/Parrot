@@ -31,7 +31,7 @@ RUNTIME_DOMAINS = (
 DURABLE_DOMAINS = (
     "xai_video_jobs", "codex_compaction_owners", "codex_identity_tombstones",
     "codex_logical_sessions", "app_self_update", "app_update_state",
-    "status_seen_updates", "status_muted_incidents",
+    "status_seen_updates", "status_muted_incidents", "workbuddy_actions",
 )
 
 

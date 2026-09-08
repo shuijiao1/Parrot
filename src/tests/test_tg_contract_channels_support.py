@@ -113,6 +113,7 @@ def _clear_domain_state() -> None:
         channel_state._deleted_keys.clear()
         channel_state._generation_targets.clear()
         channel_state._legacy_api_generations.clear()
+        channel_state._legacy_oauth_generations.clear()
     ui._code_to_name.clear()
 
 
@@ -139,6 +140,9 @@ def _install_config(initial: dict[str, Any]) -> None:
         }
         for key in CONFIG_KEYS:
             cfg[key] = deepcopy(initial.get(key, defaults[key]))
+        # Model-permission menus read OAuth models as well as API channels.
+        # Accounts left by a prior lifecycle test are not part of this fixture.
+        cfg["oauthAccounts"] = deepcopy(initial.get("oauthAccounts", []))
         # This setting participates in generation retirement but is intentionally
         # outside the segment's business-state snapshot. Pin the production
         # default so a prior test cannot change the captured frozen limit.

@@ -39,6 +39,13 @@ class OAuthQueryControlMixin:
     def quota_snapshot(self, account_id: str) -> dict | None:
         return self.backend.quota_load(account_id)
 
+    def workbuddy_snapshot(self, account_id: str) -> dict:
+        """Redacted local view for Telegram; never refreshes or performs an action."""
+        return self.backend.workbuddy_snapshot(account_id)
+
+    def workbuddy_refresh_enabled_snapshot(self) -> bool:
+        return self.backend.workbuddy_refresh_enabled()
+
     def now_ms(self) -> int:
         return self.backend.now_ms()
 

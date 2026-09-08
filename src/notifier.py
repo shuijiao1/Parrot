@@ -47,9 +47,10 @@ _PROVIDER_CUSTOM_EMOJI = {
     "xai": "5819115571463068721",
     "cursor": "6062261319426390107",
     "antigravity": "6077644693984779782",
+    "workbuddy": "6120617435214132136",
 }
 _PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦", "cursor": "🖱️", "antigravity": "✨"}
-_PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity"}
+_PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity", "workbuddy": "WorkBuddy"}
 
 
 def _provider_key(provider: str | None) -> str:

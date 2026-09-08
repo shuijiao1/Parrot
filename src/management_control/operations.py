@@ -248,6 +248,18 @@ class OperationStore:
             self._items[operation_id] = operation
             return self._snapshot(operation)
 
+    def seal_cancellation(self, operation_id: str) -> None:
+        """Atomically cross an irreversible dispatch boundary, or reject cancellation.
+
+        Only a running, not-cancelled worker can seal. A concurrent cancel wins
+        before this lock or is refused afterward; neither path claims to undo a POST.
+        """
+        with self._lock:
+            operation = self._items.get(operation_id)
+            if operation is None or operation.status is not OperationStatus.RUNNING:
+                raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
+            self._items[operation_id] = replace(operation, cancellable=False)
+
     def update_progress(
         self,
         operation_id: str,

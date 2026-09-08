@@ -12,6 +12,7 @@
 写操作由 `_write_lock` 序列化；跨月自动切换连接。
 """
 
+import copy
 import hashlib
 import heapq
 import json
@@ -21,6 +22,7 @@ import shutil
 import sqlite3
 import threading
 import time
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import cmp_to_key
@@ -3797,6 +3799,18 @@ def _sealed_month_signature(path: str, conn: sqlite3.Connection) -> tuple[Any, .
     )
 
 
+def _sealed_read_signature(path: str, conn: sqlite3.Connection) -> tuple[Any, ...]:
+    signature = list(_sealed_month_signature(path, conn))
+    wal = signature[2]
+    if wal is not None:
+        # SQLite may chmod the WAL even on a read-only open. Its ctime alone
+        # does not signal a commit; keep inode/size/mtime and the content digest.
+        # A missing or empty WAL has no frames and describes the same DB state.
+        signature[2] = None if wal[2] == 0 else wal[:4] + wal[5:]
+    return tuple(signature)
+
+
+
 def _aggregate_lifetime_month(conn: sqlite3.Connection) -> dict:
     """Aggregate one SQLite snapshot; attempt costs stay SQL-grouped."""
 
@@ -3838,21 +3852,25 @@ def _aggregate_lifetime_month(conn: sqlite3.Connection) -> dict:
 
 
 def _sealed_lifetime_month(path: str, pricing_signature: str) -> dict:
+    file_before_open = _file_stat_signature(path)
     conn = _open_readonly(path)
     try:
-        before = _sealed_month_signature(path, conn)
+        before = _sealed_read_signature(path, conn)
+        stable_open = file_before_open == before[1] and before[1] is not None
         cached = _lifetime_sealed_cache.get(path)
-        if cached is not None and cached[0] == before and cached[1] == pricing_signature:
+        if stable_open and cached is not None and cached[0] == before and cached[1] == pricing_signature:
             return dict(cached[2])
         value = _aggregate_lifetime_month(conn)
-        after = _sealed_month_signature(path, conn)
+        after = _sealed_read_signature(path, conn)
         # Cache only a provably stable snapshot. A concurrent late settlement is
         # returned as SQLite observed it but forces the next call to recompute.
         if (
-            before == after
+            stable_open and before == after
             and pricing_signature == _lifetime_pricing_signature()
         ):
             _lifetime_sealed_cache[path] = (after, pricing_signature, dict(value))
+        else:
+            _lifetime_sealed_cache.pop(path, None)
         return value
     finally:
         conn.close()
@@ -5038,133 +5056,120 @@ def _request_connect_sql(conn: sqlite3.Connection) -> str:
         legacy += " AND response_headers_wait_ms IS NULL"
     return f"CASE WHEN ({legacy}) THEN NULL ELSE connect_time_ms END"
 
-def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
-    """Aggregate proxy usage stats across monthly log DBs.
+def _aggregate_proxy_month(conn: sqlite3.Connection, since: float) -> list[dict]:
+    """Return the existing per-month raw aggregates without changing their SQL."""
+    request_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(request_log)").fetchall()
+    }
+    tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    batches: list[Any] = []
 
-    Includes the requested proxy metrics:
-      requests/successes/failures, tokens, connect/first-byte/idle/total
-      sum+sample-count pairs and averages, plus proxied request/response bytes.
-    """
-    lim = max(1, int(limit or 20))
-    since = 0.0 if since_ts is None else float(since_ts)
-    acc: dict[str, dict] = {}
-    if _log_dir is None or not os.path.isdir(_log_dir):
-        return []
+    # Modern rows are route-round facts. This attributes an immutable
+    # attempt's tokens to the proxy that actually owned its terminal
+    # round, rather than copying the root request's final proxy onto
+    # every upstream call in a failover chain.
+    proxy_cols: set[str] = set()
+    route_stats_available = "proxy_chain" in tables
+    if route_stats_available:
+        proxy_cols = {
+            row[1] for row in conn.execute(
+                "PRAGMA table_info(proxy_chain)"
+            ).fetchall()
+        }
+        route_stats_available = {
+            "request_id", "proxy_name", "started_at",
+        } <= proxy_cols
 
-    for conn, close_fn in _iter_month_conns_all(since):
-        try:
-            request_cols = {
-                row[1] for row in conn.execute("PRAGMA table_info(request_log)").fetchall()
-            }
-            tables = {
-                row[0] for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
+    if route_stats_available:
+        retry_cols = (
+            {
+                row[1] for row in conn.execute(
+                    "PRAGMA table_info(retry_chain)"
                 ).fetchall()
             }
-            batches: list[Any] = []
+            if "retry_chain" in tables else set()
+        )
+        usage_cols = (
+            {
+                row[1] for row in conn.execute(
+                    "PRAGMA table_info(upstream_attempt_usage)"
+                ).fetchall()
+            }
+            if "upstream_attempt_usage" in tables else set()
+        )
+        can_join_retry = (
+            "retry_chain" in tables
+            and {"id", "final_round_id"} <= retry_cols
+            and {"retry_attempt_id", "round_id"} <= proxy_cols
+        )
+        can_join_usage = (
+            can_join_retry
+            and "upstream_attempt_usage" in tables
+            and {
+                "id", "retry_attempt_id", "input_tokens",
+                "output_tokens", "cache_creation_tokens",
+                "cache_read_tokens",
+            } <= usage_cols
+        )
+        can_join_root = (
+            "final_round_id" in request_cols and "round_id" in proxy_cols
+        )
 
-            # Modern rows are route-round facts. This attributes an immutable
-            # attempt's tokens to the proxy that actually owned its terminal
-            # round, rather than copying the root request's final proxy onto
-            # every upstream call in a failover chain.
-            proxy_cols: set[str] = set()
-            route_stats_available = "proxy_chain" in tables
-            if route_stats_available:
-                proxy_cols = {
-                    row[1] for row in conn.execute(
-                        "PRAGMA table_info(proxy_chain)"
-                    ).fetchall()
-                }
-                route_stats_available = {
-                    "request_id", "proxy_name", "started_at",
-                } <= proxy_cols
-
-            if route_stats_available:
-                retry_cols = (
-                    {
-                        row[1] for row in conn.execute(
-                            "PRAGMA table_info(retry_chain)"
-                        ).fetchall()
-                    }
-                    if "retry_chain" in tables else set()
-                )
-                usage_cols = (
-                    {
-                        row[1] for row in conn.execute(
-                            "PRAGMA table_info(upstream_attempt_usage)"
-                        ).fetchall()
-                    }
-                    if "upstream_attempt_usage" in tables else set()
-                )
-                can_join_retry = (
-                    "retry_chain" in tables
-                    and {"id", "final_round_id"} <= retry_cols
-                    and {"retry_attempt_id", "round_id"} <= proxy_cols
-                )
-                can_join_usage = (
-                    can_join_retry
-                    and "upstream_attempt_usage" in tables
-                    and {
-                        "id", "retry_attempt_id", "input_tokens",
-                        "output_tokens", "cache_creation_tokens",
-                        "cache_read_tokens",
-                    } <= usage_cols
-                )
-                can_join_root = (
-                    "final_round_id" in request_cols and "round_id" in proxy_cols
-                )
-
-                joins: list[str] = []
-                if can_join_retry:
-                    joins.append(
-                        "LEFT JOIN retry_chain r ON r.id=pc.retry_attempt_id "
+        joins: list[str] = []
+        if can_join_retry:
+            joins.append(
+                "LEFT JOIN retry_chain r ON r.id=pc.retry_attempt_id "
                         "AND r.final_round_id=pc.round_id"
-                    )
-                if can_join_usage:
-                    joins.append(
-                        "LEFT JOIN upstream_attempt_usage a "
+            )
+        if can_join_usage:
+            joins.append(
+                "LEFT JOIN upstream_attempt_usage a "
                         "ON a.retry_attempt_id=r.id"
-                    )
-                if can_join_root:
-                    joins.append(
-                        "LEFT JOIN request_log q ON q.request_id=pc.request_id "
+            )
+        if can_join_root:
+            joins.append(
+                "LEFT JOIN request_log q ON q.request_id=pc.request_id "
                         "AND q.final_round_id=pc.round_id"
-                    )
-                else:
-                    joins.append("LEFT JOIN request_log q ON 1=0")
+            )
+        else:
+            joins.append("LEFT JOIN request_log q ON 1=0")
 
-                def route_col(name: str) -> str:
-                    return f"pc.{name}" if name in proxy_cols else "NULL"
+        def route_col(name: str) -> str:
+            return f"pc.{name}" if name in proxy_cols else "NULL"
 
-                def route_token(name: str) -> str:
-                    root = f"q.{name}" if name in request_cols else "0"
-                    if can_join_usage:
-                        return (
-                            f"CASE WHEN a.id IS NOT NULL THEN a.{name} "
+        def route_token(name: str) -> str:
+            root = f"q.{name}" if name in request_cols else "0"
+            if can_join_usage:
+                return (
+                    f"CASE WHEN a.id IS NOT NULL THEN a.{name} "
                             f"WHEN q.request_id IS NOT NULL THEN {root} ELSE 0 END"
-                        )
-                    return f"CASE WHEN q.request_id IS NOT NULL THEN {root} ELSE 0 END"
+                )
+            return f"CASE WHEN q.request_id IS NOT NULL THEN {root} ELSE 0 END"
 
-                outcome = route_col("outcome")
-                error_detail = route_col("error_detail")
-                raw_connect = route_col("connect_ms")
-                first = route_col("first_byte_ms")
-                idle = route_col("idle_ms")
-                total = route_col("total_ms")
-                bytes_up = route_col("bytes_up")
-                bytes_down = route_col("bytes_down")
-                legacy_header_timeout = (
-                    f"((lower(COALESCE({outcome},''))='first_byte_timeout' "
+        outcome = route_col("outcome")
+        error_detail = route_col("error_detail")
+        raw_connect = route_col("connect_ms")
+        first = route_col("first_byte_ms")
+        idle = route_col("idle_ms")
+        total = route_col("total_ms")
+        bytes_up = route_col("bytes_up")
+        bytes_down = route_col("bytes_down")
+        legacy_header_timeout = (
+            f"((lower(COALESCE({outcome},''))='first_byte_timeout' "
                     f"OR lower(COALESCE({error_detail},'')) "
                     f"LIKE '%first byte timeout%') "
                     f"AND lower(COALESCE({error_detail},'')) "
                     f"LIKE '%response header%' AND {total} IS NULL)"
-                )
-                connect = (
-                    f"CASE WHEN {legacy_header_timeout} THEN NULL "
+        )
+        connect = (
+            f"CASE WHEN {legacy_header_timeout} THEN NULL "
                     f"ELSE {raw_connect} END"
-                )
-                route_rows = conn.execute(f"""
+        )
+        route_rows = conn.execute(f"""
                     SELECT pc.proxy_name,
                            COUNT(*) AS requests,
                            SUM(CASE WHEN {outcome}='success'
@@ -5195,26 +5200,26 @@ def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
                       AND pc.started_at >= ?
                     GROUP BY pc.proxy_name
                 """, (since,)).fetchall()
-                batches.extend(route_rows)
+        batches.extend(route_rows)
 
-            # Historical rows may predate route-round or attempt-ledger data.
-            # Keep their original request-level projection, but exclude modern
-            # requests already represented above so tokens/bytes are not doubled.
-            connect_expr = _request_connect_sql(conn)
-            idle_sum_expr = (
-                "SUM(CASE WHEN idle_time_ms IS NOT NULL THEN idle_time_ms ELSE 0 END)"
-                if "idle_time_ms" in request_cols else "0"
-            )
-            idle_n_expr = (
-                "SUM(CASE WHEN idle_time_ms IS NOT NULL THEN 1 ELSE 0 END)"
-                if "idle_time_ms" in request_cols else "0"
-            )
-            legacy_only = (
-                "AND NOT EXISTS (SELECT 1 FROM proxy_chain pc_old "
+    # Historical rows may predate route-round or attempt-ledger data.
+    # Keep their original request-level projection, but exclude modern
+    # requests already represented above so tokens/bytes are not doubled.
+    connect_expr = _request_connect_sql(conn)
+    idle_sum_expr = (
+        "SUM(CASE WHEN idle_time_ms IS NOT NULL THEN idle_time_ms ELSE 0 END)"
+        if "idle_time_ms" in request_cols else "0"
+    )
+    idle_n_expr = (
+        "SUM(CASE WHEN idle_time_ms IS NOT NULL THEN 1 ELSE 0 END)"
+        if "idle_time_ms" in request_cols else "0"
+    )
+    legacy_only = (
+        "AND NOT EXISTS (SELECT 1 FROM proxy_chain pc_old "
                 "WHERE pc_old.request_id=request_log.request_id)"
-                if route_stats_available else ""
-            )
-            legacy_rows = conn.execute(f"""
+        if route_stats_available else ""
+    )
+    legacy_rows = conn.execute(f"""
                 SELECT proxy_name,
                        COUNT(*) AS requests,
                        SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS successes,
@@ -5238,7 +5243,94 @@ def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
                   {legacy_only}
                 GROUP BY proxy_name
             """, (since,)).fetchall()
-            batches.extend(legacy_rows)
+    batches.extend(legacy_rows)
+
+    return [dict(row) for row in batches]
+
+
+_proxy_stats_cache_lock = threading.Lock()
+_proxy_stats_sealed_cache: dict[str, tuple[tuple[Any, ...], tuple[dict, ...]]] = {}
+
+
+def _reset_proxy_stats_cache_for_tests() -> None:
+    with _proxy_stats_cache_lock:
+        _proxy_stats_sealed_cache.clear()
+
+
+def _proxy_stats_month_signature(path: str, conn: sqlite3.Connection) -> tuple[Any, ...]:
+    return _sealed_read_signature(path, conn)
+
+def _sealed_proxy_stats_month(path: str) -> list[dict]:
+    """Reuse unchanged historical sums/counts, single-flight across TG/API reads."""
+    with _proxy_stats_cache_lock:
+        # The iterator's connection may have been opened before waiting for the
+        # lock. Open our own snapshot after fingerprinting, so a replaced file
+        # cannot label an old connection's rows with the replacement's identity.
+        file_before_open = _file_stat_signature(path)
+        conn = _open_readonly(path)
+        try:
+            before = _proxy_stats_month_signature(path, conn)
+            stable_open = file_before_open == before[1] and before[1] is not None
+            cached = _proxy_stats_sealed_cache.get(path)
+            if stable_open and cached is not None and cached[0] == before:
+                return [dict(row) for row in cached[1]]
+            value = _aggregate_proxy_month(conn, 0.0)
+            after = _proxy_stats_month_signature(path, conn)
+            if stable_open and before == after:
+                _proxy_stats_sealed_cache[path] = (
+                    after, tuple(dict(row) for row in value),
+                )
+            else:
+                # Late settlements or replacement during this read must cause
+                # the next caller to recompute, not freeze a mixed snapshot.
+                _proxy_stats_sealed_cache.pop(path, None)
+            return value
+        finally:
+            conn.close()
+
+
+def _proxy_stats_month(
+    conn: sqlite3.Connection, since: float, sealed_paths: set[str],
+) -> list[dict]:
+    # Arbitrary time windows retain their exact uncached query semantics. This
+    # also bounds the cache to one entry per historical file, not per timestamp.
+    if since != 0.0:
+        return _aggregate_proxy_month(conn, since)
+    raw_path = next(
+        (str(row[2]) for row in conn.execute("PRAGMA database_list").fetchall()
+         if row[1] == "main"),
+        "",
+    )
+    if not raw_path:
+        return _aggregate_proxy_month(conn, since)
+    path = str(Path(raw_path).resolve())
+    current_path, _ = _current_db_path()
+    if path == str(Path(current_path).resolve()):
+        return _aggregate_proxy_month(conn, since)
+    sealed_paths.add(path)
+    return _sealed_proxy_stats_month(path)
+
+
+def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
+    """Aggregate proxy usage stats across monthly log DBs.
+
+    Unchanged historical months share a process-local cache for full-history
+    reads. The current Beijing month and filtered reads are always fresh.
+
+    Includes the requested proxy metrics:
+      requests/successes/failures, tokens, connect/first-byte/idle/total
+      sum+sample-count pairs and averages, plus proxied request/response bytes.
+    """
+    lim = max(1, int(limit or 20))
+    since = 0.0 if since_ts is None else float(since_ts)
+    acc: dict[str, dict] = {}
+    sealed_paths: set[str] = set()
+    if _log_dir is None or not os.path.isdir(_log_dir):
+        return []
+
+    for conn, close_fn in _iter_month_conns_all(since):
+        try:
+            batches = _proxy_stats_month(conn, since, sealed_paths)
 
             for r in batches:
                 name = r["proxy_name"]
@@ -5267,6 +5359,11 @@ def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
                 close_fn()
             except Exception:
                 pass
+
+    if since == 0.0:
+        with _proxy_stats_cache_lock:
+            for path in set(_proxy_stats_sealed_cache) - sealed_paths:
+                _proxy_stats_sealed_cache.pop(path, None)
 
     out: list[dict] = []
     for b in acc.values():
@@ -5721,6 +5818,41 @@ def _management_query_parts(
     return where, values, projection, order
 
 
+@contextmanager
+def _management_search_snapshot(conn: sqlite3.Connection):
+    # SAVEPOINT also works when a caller already owns a transaction. RELEASE
+    # never commits that outer transaction; this helper executes only reads.
+    conn.execute("SAVEPOINT parrot_management_search")
+    try:
+        yield
+    finally:
+        conn.execute("RELEASE SAVEPOINT parrot_management_search")
+
+
+_MANAGEMENT_SEARCH_COLS = (
+    "request_id, created_at, api_key_name, requested_model, final_model, "
+    "final_channel_key, error_message, status, total_time_ms"
+)
+
+
+def _management_hydrate_page(
+    conn: sqlite3.Connection, projection: str, request_ids: list[str],
+) -> dict[str, dict]:
+    """Read display-only facts for at most the selected page, retaining order outside SQL."""
+    rows: dict[str, dict] = {}
+    for start in range(0, len(request_ids), 256):
+        batch = request_ids[start:start + 256]
+        placeholders = ",".join("?" for _ in batch)
+        for row in conn.execute(
+            f"SELECT {projection} FROM request_log WHERE request_id IN ({placeholders})",
+            batch,
+        ).fetchall():
+            rows[str(row["request_id"])] = _sanitize_request_timing(row)
+    if any(request_id not in rows for request_id in request_ids):
+        raise HistoricalLogError("selected search page changed within its read snapshot")
+    return rows
+
+
 def _management_logs_page_one(
     conn: sqlite3.Connection,
     *,
@@ -5765,23 +5897,25 @@ def _management_logs_page_one(
             int(count_row["n"] or 0) if count_row else 0,
         )
 
-    cursor = conn.execute(
-        f"SELECT {projection} FROM request_log {where} ORDER BY {order}", values,
-    )
-    matched = 0
-    page_rows: list[dict] = []
-    while True:
-        batch = cursor.fetchmany(_MANAGEMENT_TEXT_BATCH_SIZE)
-        if not batch:
-            break
-        for raw in batch:
-            row = _sanitize_request_timing(raw)
-            if not _management_text_matches(row, query):
-                continue
-            if offset <= matched < offset + size:
-                page_rows.append(row)
-            matched += 1
-    return page_rows, matched
+    with _management_search_snapshot(conn):
+        cursor = conn.execute(
+            f"SELECT {_MANAGEMENT_SEARCH_COLS} FROM request_log {where} ORDER BY {order}", values,
+        )
+        matched = 0
+        page_ids: list[str] = []
+        while True:
+            batch = cursor.fetchmany(_MANAGEMENT_TEXT_BATCH_SIZE)
+            if not batch:
+                break
+            for raw in batch:
+                row = _sanitize_request_timing(raw)
+                if not _management_text_matches(row, query):
+                    continue
+                if offset <= matched < offset + size:
+                    page_ids.append(str(row["request_id"]))
+                matched += 1
+        hydrated = _management_hydrate_page(conn, projection, page_ids)
+        return [hydrated[request_id] for request_id in page_ids], matched
 
 
 def _management_stream(cursor: sqlite3.Cursor):
@@ -6001,6 +6135,9 @@ def management_logs_page(
                 conn.close()
 
     opened: list[tuple[sqlite3.Connection, bool]] = []
+    snapshots = ExitStack()
+    search_sources: dict[str, tuple[sqlite3.Connection, str]] = {}
+    page_refs: list[tuple[str, str]] = []
     heap: list[tuple[Any, int, dict[str, Any], str, Any]] = []
     key_factory = cmp_to_key(lambda left, right: _management_merge_compare(
         left, right, sort=sort, descending=bool(descending),
@@ -6013,6 +6150,8 @@ def management_logs_page(
             month, _path, _live = source
             conn, close = _open_management_log_source(source)
             opened.append((conn, close))
+            if query:
+                snapshots.enter_context(_management_search_snapshot(conn))
             where, values, projection, order = _management_query_parts(
                 conn,
                 statuses=statuses,
@@ -6034,8 +6173,11 @@ def management_logs_page(
                 total += int(count_row["n"] or 0) if count_row else 0
                 limit = " LIMIT ?"
                 parameters.append(target)
+            if query:
+                search_sources[month] = (conn, projection)
+            candidate_projection = _MANAGEMENT_SEARCH_COLS if query else projection
             cursor = conn.execute(
-                f"SELECT {projection} FROM request_log {where} "
+                f"SELECT {candidate_projection} FROM request_log {where} "
                 f"ORDER BY {order}{limit}",
                 parameters,
             )
@@ -6055,6 +6197,8 @@ def management_logs_page(
             if not query or _management_text_matches(row, query):
                 if offset <= matched < target:
                     page_rows.append(row)
+                    if query:
+                        page_refs.append((month, str(row["request_id"])))
                 matched += 1
             following = next(stream, None)
             if following is not None:
@@ -6065,16 +6209,28 @@ def management_logs_page(
                 )
             if not query and matched >= target:
                 break
+        if query:
+            hydrated = {
+                month: _management_hydrate_page(
+                    conn, projection,
+                    [request_id for source_month, request_id in page_refs if source_month == month],
+                )
+                for month, (conn, projection) in search_sources.items()
+            }
+            page_rows = [hydrated[month][request_id] for month, request_id in page_refs]
         return page_rows, matched if query else total
     except sqlite3.Error as exc:
         raise HistoricalLogError(f"management log page failed: {exc}") from exc
     finally:
-        for conn, close in opened:
-            if close:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+        try:
+            snapshots.close()
+        finally:
+            for conn, close in opened:
+                if close:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
 
 def _management_filter_options_on_conn(
@@ -6135,6 +6291,36 @@ def _management_filter_options_on_conn(
     return result
 
 
+_filter_options_cache_lock = threading.Lock()
+_filter_options_sealed_cache: dict[str, tuple[tuple[Any, ...], dict]] = {}
+
+
+def _reset_filter_options_cache_for_tests() -> None:
+    with _filter_options_cache_lock:
+        _filter_options_sealed_cache.clear()
+
+
+def _sealed_filter_options_month(path: str) -> dict[str, dict[str, int]]:
+    with _filter_options_cache_lock:
+        file_before_open = _file_stat_signature(path)
+        conn = _open_readonly(path)
+        try:
+            before = _sealed_read_signature(path, conn)
+            stable_open = file_before_open == before[1] and before[1] is not None
+            cached = _filter_options_sealed_cache.get(path)
+            if stable_open and cached is not None and cached[0] == before:
+                return copy.deepcopy(cached[1])
+            value = _management_filter_options_on_conn(conn)
+            after = _sealed_read_signature(path, conn)
+            if stable_open and before == after:
+                _filter_options_sealed_cache[path] = (after, copy.deepcopy(value))
+            else:
+                _filter_options_sealed_cache.pop(path, None)
+            return value
+        finally:
+            conn.close()
+
+
 def management_log_filter_options() -> dict[str, list[dict[str, Any]]]:
     """Aggregate filter option counts across every retained strict month DB."""
 
@@ -6142,10 +6328,15 @@ def management_log_filter_options() -> dict[str, list[dict[str, Any]]]:
         "apiKeys": {}, "channels": {}, "statuses": {}, "protocols": {},
         "models": {},
     }
+    sealed_paths: set[str] = set()
     for source in _management_log_sources():
         conn, close = _open_management_log_source(source)
         try:
-            partial = _management_filter_options_on_conn(conn)
+            if source[2] or source[1] is None:
+                partial = _management_filter_options_on_conn(conn)
+            else:
+                sealed_paths.add(source[1])
+                partial = _sealed_filter_options_month(source[1])
             for public, values in partial.items():
                 target = aggregate[public]
                 for value, count in values.items():
@@ -6160,6 +6351,9 @@ def management_log_filter_options() -> dict[str, list[dict[str, Any]]]:
         finally:
             if close:
                 conn.close()
+    with _filter_options_cache_lock:
+        for path in set(_filter_options_sealed_cache) - sealed_paths:
+            _filter_options_sealed_cache.pop(path, None)
     return {
         public: [
             {"value": value, "count": count}
@@ -6796,33 +6990,7 @@ def _accumulate_usage_costs(
                     )
 
 
-def stats_summary(
-    since_ts: float,
-    group_by: str | None = None,
-    summary_top_limit: int = 3,
-    group_limit: int = 10,
-    family: str | None = None,
-    include_cost: bool = True,
-    include_family_slices: bool = False,
-) -> dict:
-    """跨月统计聚合。
-
-    返回结构：
-      {
-        "overall": {汇总字段},
-        "by_channel": [{"key": str, "metrics": {...}}, ...],   # group_by=None: top {summary_top_limit}
-        "by_model":   [...],                                    # group_by="model": 展开 top {group_limit}
-        "by_apikey":  [...],
-        "recent_errors":       [...],   # 5 条
-        "recent_calls":        [...],   # 3 条
-        "recent_cache_misses": [...],   # 3 条（status=success 且 cache_read_tokens=0）
-      }
-
-    group_by 决定哪个维度展开到 group_limit；其它两个维度保持 summary_top_limit。
-    group_by=None 时三个维度都只取 summary_top_limit。
-    """
-    include_cost = bool(include_cost and model_pricing.settings().enabled)
-    conns = _iter_month_conns(since_ts)
+def _new_summary_month_agg(collect_families: bool) -> tuple:
     overall_agg = _new_overall_agg()
     by_channel: dict[str, dict] = {}
     by_model: dict[str, dict] = {}
@@ -6830,14 +6998,23 @@ def stats_summary(
     recent_errors: list[dict] = []
     recent_calls: list[dict] = []
     recent_cache_misses: list[dict] = []
-    need_groups = bool(summary_top_limit > 0 or group_by in _GROUP_BY_COLS)
-    collect_families = bool(include_family_slices and family is None)
     family_aggs: dict[str, tuple[dict, dict, dict, dict]] = {
         fam: (_new_overall_agg(), {}, {}, {}) for fam in _FAMILY_UPSTREAM
     } if collect_families else {}
     object_cost_maps: tuple[dict[str, dict], dict[str, dict]] | None = (
         ({}, {}) if collect_families else None
     )
+
+    return (overall_agg, by_channel, by_model, by_apikey, recent_errors, recent_calls, recent_cache_misses, family_aggs, object_cost_maps)
+
+
+def _aggregate_summary_month(
+    conn: sqlite3.Connection, since_ts: float, family: str | None,
+    include_cost: bool, need_groups: bool, collect_families: bool,
+) -> tuple:
+    """Unfinalized per-month sums/counts, extrema, cost buckets and recent rows."""
+    raw = _new_summary_month_agg(collect_families)
+    (overall_agg, by_channel, by_model, by_apikey, recent_errors, recent_calls, recent_cache_misses, family_aggs, object_cost_maps) = raw
 
     def _agg_group(target: dict, conn, col_expr: str) -> None:
         connect_expr = _request_connect_sql(conn)
@@ -6908,11 +7085,9 @@ def stats_summary(
             _accumulate_group(bucket, r)
             _merge_tps(bucket, r)
 
-    try:
-        for conn, _ in conns:
-            connect_expr = _request_connect_sql(conn)
-            row = conn.execute(
-                f"""SELECT
+    connect_expr = _request_connect_sql(conn)
+    row = conn.execute(
+        f"""SELECT
                      COUNT(*) AS total,
                      SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
                      SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
@@ -6934,14 +7109,14 @@ def stats_summary(
                      SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_total,
                      {_tps_agg_sql()}
                    FROM request_log WHERE created_at >= ?{_family_where(family)}""",
-                (since_ts, *_family_params(family)),
-            ).fetchone()
-            _accumulate(overall_agg, row)
-            _merge_tps(overall_agg, row)
+        (since_ts, *_family_params(family)),
+    ).fetchone()
+    _accumulate(overall_agg, row)
+    _merge_tps(overall_agg, row)
 
-            if family_aggs:
-                family_rows = conn.execute(
-                    f"""SELECT upstream_protocol AS family_protocol,
+    if family_aggs:
+        family_rows = conn.execute(
+            f"""SELECT upstream_protocol AS family_protocol,
                          COUNT(*) AS total,
                          SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
                          SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
@@ -6964,90 +7139,90 @@ def stats_summary(
                          {_tps_agg_sql()}
                        FROM request_log WHERE created_at >= ?
                        GROUP BY family_protocol""",
-                    (since_ts,),
-                ).fetchall()
-                for family_row in family_rows:
-                    fam = _family_from_protocol(family_row["family_protocol"])
-                    if fam not in family_aggs:
-                        continue
-                    fam_overall = family_aggs[fam][0]
-                    _accumulate(fam_overall, family_row)
-                    _merge_tps(fam_overall, family_row)
-
-            if need_groups:
-                _agg_group(by_channel, conn, _GROUP_BY_COLS["channel"])
-                _agg_group(by_model,   conn, _GROUP_BY_COLS["model"])
-                _agg_group(by_apikey,  conn, _GROUP_BY_COLS["apikey"])
-                _agg_family_groups(conn, _GROUP_BY_COLS["channel"], 1)
-                _agg_family_groups(conn, _GROUP_BY_COLS["model"], 2)
-                _agg_family_groups(conn, _GROUP_BY_COLS["apikey"], 3)
-            _replace_summary_tokens_with_attempts(
-                conn, since_ts, family, overall_agg,
-                by_channel, by_model, by_apikey,
-                family_targets=family_aggs or None,
-            )
-            if include_cost:
-                if need_groups:
-                    _accumulate_usage_costs(
-                        conn,
-                        since_ts,
-                        family,
-                        overall_agg,
-                        by_channel,
-                        by_model,
-                        by_apikey,
-                        family_targets=family_aggs or None,
-                        object_cost_targets=object_cost_maps,
-                    )
-                else:
-                    _accumulate_filtered_costs(
-                        conn,
-                        since_ts,
-                        "1=1",
-                        (),
-                        overall_agg,
-                        family=family,
-                    )
-
-            if not need_groups:
+            (since_ts,),
+        ).fetchall()
+        for family_row in family_rows:
+            fam = _family_from_protocol(family_row["family_protocol"])
+            if fam not in family_aggs:
                 continue
+            fam_overall = family_aggs[fam][0]
+            _accumulate(fam_overall, family_row)
+            _merge_tps(fam_overall, family_row)
 
-            for r in conn.execute(
-                """SELECT created_at, api_key_name, requested_model,
+    if need_groups:
+        _agg_group(by_channel, conn, _GROUP_BY_COLS["channel"])
+        _agg_group(by_model,   conn, _GROUP_BY_COLS["model"])
+        _agg_group(by_apikey,  conn, _GROUP_BY_COLS["apikey"])
+        _agg_family_groups(conn, _GROUP_BY_COLS["channel"], 1)
+        _agg_family_groups(conn, _GROUP_BY_COLS["model"], 2)
+        _agg_family_groups(conn, _GROUP_BY_COLS["apikey"], 3)
+    _replace_summary_tokens_with_attempts(
+        conn, since_ts, family, overall_agg,
+        by_channel, by_model, by_apikey,
+        family_targets=family_aggs or None,
+    )
+    if include_cost:
+        if need_groups:
+            _accumulate_usage_costs(
+                conn,
+                since_ts,
+                family,
+                overall_agg,
+                by_channel,
+                by_model,
+                by_apikey,
+                family_targets=family_aggs or None,
+                object_cost_targets=object_cost_maps,
+            )
+        else:
+            _accumulate_filtered_costs(
+                conn,
+                since_ts,
+                "1=1",
+                (),
+                overall_agg,
+                family=family,
+            )
+
+    if not need_groups:
+        return raw
+
+    for r in conn.execute(
+        """SELECT created_at, api_key_name, requested_model,
                           final_channel_key, error_message,
                           ingress_protocol, upstream_protocol, upstream_transport
                    FROM request_log WHERE status='error' AND created_at >= ?{_family_where_sql}
                    ORDER BY created_at DESC LIMIT 5""".format(_family_where_sql=_family_where(family)),
-                (since_ts, *_family_params(family)),
-            ).fetchall():
-                recent_errors.append(dict(r))
+        (since_ts, *_family_params(family)),
+    ).fetchall():
+        recent_errors.append(dict(r))
 
-            recent_rows = conn.execute(
-                f"""SELECT {_compatible_recent_cols(conn, include_cost=include_cost)}
+    recent_rows = conn.execute(
+        f"""SELECT {_compatible_recent_cols(conn, include_cost=include_cost)}
                    FROM request_log WHERE created_at >= ?{_family_where(family)}
                    ORDER BY created_at DESC LIMIT 3""",
-                (since_ts, *_family_params(family)),
-            ).fetchall()
-            recent_calls.extend(
-                _sanitize_request_timing(row) for row in recent_rows
-            )
+        (since_ts, *_family_params(family)),
+    ).fetchall()
+    recent_calls.extend(
+        _sanitize_request_timing(row) for row in recent_rows
+    )
 
-            # 最近未命中样本（cc-proxy 同款）：成功但 cache_read_tokens=0。
-            # pricing 关闭时不能为了菜单读取任何响应正文。
-            recent_pricing_exprs = _request_pricing_exprs(conn)
-            has_request_detail = "request_detail" in _existing_tables(conn)
-            cache_miss_response_expr = (
-                "CASE WHEN COALESCE(final_channel_key, '') LIKE 'oauth:xai:%' "
+    # 最近未命中样本（cc-proxy 同款）：成功但 cache_read_tokens=0。
+    # pricing 关闭时不能为了菜单读取任何响应正文。
+    recent_pricing_exprs = _request_pricing_exprs(conn)
+    has_request_detail = "request_detail" in _existing_tables(conn)
+    cache_miss_response_expr = (
+        "CASE WHEN COALESCE(final_channel_key, '') LIKE 'oauth:xai:%' "
                 "THEN (SELECT substr(response_body, -"
                 f"{_XAI_COST_BODY_TAIL_CHARS}"
                 ") FROM request_detail rd "
                 "WHERE rd.request_id=request_log.request_id) "
                 "ELSE NULL END AS response_body"
-                if include_cost and has_request_detail
-                else "NULL AS response_body"
-            )
-            for r in conn.execute(
-                f"""SELECT request_id, created_at, api_key_name, requested_model,
+        if include_cost and has_request_detail
+        else "NULL AS response_body"
+    )
+    for r in conn.execute(
+        f"""SELECT request_id, created_at, api_key_name, requested_model,
                           final_model, final_channel_key, is_stream, msg_count, tool_count,
                           input_tokens, output_tokens,
                           cache_creation_tokens, cache_read_tokens,
@@ -7063,15 +7238,171 @@ def stats_summary(
                    WHERE created_at >= ?{_family_where(family)}
                      AND status='success' AND cache_read_tokens=0
                    ORDER BY created_at DESC LIMIT 3""",
-                (since_ts, *_family_params(family)),
-            ).fetchall():
-                recent_cache_misses.append(dict(r))
+        (since_ts, *_family_params(family)),
+    ).fetchall():
+        recent_cache_misses.append(dict(r))
+    return raw
+
+
+def _merge_summary_bucket(target: dict, source: dict) -> None:
+    """Merge raw additive facts and extrema, never finalized averages."""
+    for key, value in source.items():
+        if key == "service_tier_counts":
+            tiers = target.setdefault(key, {})
+            for tier, count in value.items():
+                tiers[tier] = tiers.get(tier, 0) + count
+        elif key in ("max_tps", "min_tps"):
+            if value is not None:
+                previous = target.get(key)
+                target[key] = value if previous is None else (
+                    max(previous, value) if key == "max_tps" else min(previous, value)
+                )
+        else:
+            target[key] = (target.get(key) or 0) + (value or 0)
+
+
+def _merge_summary_map(target: dict, source: dict) -> None:
+    for key, value in source.items():
+        if key not in target:
+            # Preserve insertion order and absence of optional extrema/tier keys.
+            target[key] = copy.deepcopy(value)
+        else:
+            _merge_summary_bucket(target[key], value)
+
+
+def _merge_summary_month(target: tuple, source: tuple) -> None:
+    _merge_summary_bucket(target[0], source[0])
+    for index in (1, 2, 3):
+        _merge_summary_map(target[index], source[index])
+    for index in (4, 5, 6):
+        target[index].extend(source[index])
+    for family, values in source[7].items():
+        destinations = target[7][family]
+        _merge_summary_bucket(destinations[0], values[0])
+        for index in (1, 2, 3):
+            _merge_summary_map(destinations[index], values[index])
+    if source[8] is not None:
+        for index in (0, 1):
+            _merge_summary_map(target[8][index], source[8][index])
+
+
+_summary_cache_lock = threading.Lock()
+_summary_sealed_cache: dict[tuple, tuple[tuple[Any, ...], str, tuple]] = {}
+
+
+def _reset_summary_cache_for_tests() -> None:
+    with _summary_cache_lock:
+        _summary_sealed_cache.clear()
+
+
+def _sealed_summary_month(
+    path: str, family: str | None, include_cost: bool,
+    need_groups: bool, collect_families: bool,
+) -> tuple:
+    # Bounded key space: known families and boolean query shapes only. Pricing
+    # revisions replace the value rather than growing another cache dimension.
+    key = (path, family, include_cost, need_groups, collect_families)
+    with _summary_cache_lock:
+        pricing = _lifetime_pricing_signature() if include_cost else ""
+        file_before_open = _file_stat_signature(path)
+        conn = _open_readonly(path)
+        try:
+            before = _sealed_read_signature(path, conn)
+            stable_open = file_before_open == before[1] and before[1] is not None
+            cached = _summary_sealed_cache.get(key)
+            if stable_open and cached is not None and cached[:2] == (before, pricing):
+                return copy.deepcopy(cached[2])
+            value = _aggregate_summary_month(
+                conn, 0.0, family, include_cost, need_groups, collect_families,
+            )
+            after = _sealed_read_signature(path, conn)
+            pricing_after = _lifetime_pricing_signature() if include_cost else ""
+            if stable_open and before == after and pricing == pricing_after:
+                _summary_sealed_cache[key] = (after, pricing, copy.deepcopy(value))
+            else:
+                _summary_sealed_cache.pop(key, None)
+            return value
+        finally:
+            conn.close()
+
+
+def _summary_month(
+    conn: sqlite3.Connection, since_ts: float, family: str | None,
+    include_cost: bool, need_groups: bool, collect_families: bool,
+    sealed_paths: set[str],
+) -> tuple:
+    # Moving/nonzero windows keep their existing live SQL. This change targets
+    # full-history repeats without caching unbounded timestamp combinations.
+    if since_ts == 0.0 and _log_dir is not None and family in (None, *_FAMILY_UPSTREAM):
+        raw_path = next(
+            (str(row[2]) for row in conn.execute("PRAGMA database_list").fetchall()
+             if row[1] == "main"),
+            "",
+        )
+        if raw_path:
+            path = str(Path(raw_path).resolve())
+            current_path, _ = _current_db_path()
+            if path != str(Path(current_path).resolve()):
+                sealed_paths.add(path)
+                return _sealed_summary_month(
+                    path, family, include_cost, need_groups, collect_families,
+                )
+    return _aggregate_summary_month(
+        conn, since_ts, family, include_cost, need_groups, collect_families,
+    )
+
+
+def stats_summary(
+    since_ts: float,
+    group_by: str | None = None,
+    summary_top_limit: int = 3,
+    group_limit: int = 10,
+    family: str | None = None,
+    include_cost: bool = True,
+    include_family_slices: bool = False,
+) -> dict:
+    """跨月统计聚合。
+
+    返回结构：
+      {
+        "overall": {汇总字段},
+        "by_channel": [{"key": str, "metrics": {...}}, ...],   # group_by=None: top {summary_top_limit}
+        "by_model":   [...],                                    # group_by="model": 展开 top {group_limit}
+        "by_apikey":  [...],
+        "recent_errors":       [...],   # 5 条
+        "recent_calls":        [...],   # 3 条
+        "recent_cache_misses": [...],   # 3 条（status=success 且 cache_read_tokens=0）
+      }
+
+    group_by 决定哪个维度展开到 group_limit；其它两个维度保持 summary_top_limit。
+    group_by=None 时三个维度都只取 summary_top_limit。
+    """
+    include_cost = bool(include_cost and model_pricing.settings().enabled)
+    conns = _iter_month_conns(since_ts)
+    need_groups = bool(summary_top_limit > 0 or group_by in _GROUP_BY_COLS)
+    collect_families = bool(include_family_slices and family is None)
+    raw = _new_summary_month_agg(collect_families)
+    (overall_agg, by_channel, by_model, by_apikey, recent_errors, recent_calls, recent_cache_misses, family_aggs, object_cost_maps) = raw
+    sealed_paths: set[str] = set()
+    try:
+        for conn, _ in conns:
+            partial = _summary_month(
+                conn, since_ts, family, include_cost, need_groups, collect_families,
+                sealed_paths,
+            )
+            _merge_summary_month(raw, partial)
     finally:
         for conn, close_fn in conns:
             try:
                 close_fn()
             except Exception:
                 pass
+
+    if since_ts == 0.0:
+        with _summary_cache_lock:
+            for key in list(_summary_sealed_cache):
+                if key[0] not in sealed_paths:
+                    _summary_sealed_cache.pop(key, None)
 
     recent_errors.sort(key=lambda r: r["created_at"], reverse=True)
     recent_errors = recent_errors[:5]

@@ -50,11 +50,19 @@ def test_management_routes_are_cloned_directly_into_the_application(monkeypatch)
     # there is no intermediate aggregate router to clone a second time.
     assert len(included) == 21
     assert all(prefix == "/api/management/v1" for _router, prefix in included)
-    assert sum(len(router.routes) for router, _prefix in included) == 203
-    assert len([
-        route for route in app.routes
-        if route.path.startswith("/api/management/v1")
-    ]) == 203
+    assert sum(len(router.routes) for router, _prefix in included) == 212
+    # FastAPI may retain included routers instead of flattening app.routes.
+    # Verify the complete public operation contract, not that internal layout.
+    operations = [
+        (method.upper(), path, operation["operationId"])
+        for path, path_item in app.openapi()["paths"].items()
+        if path.startswith("/api/management/v1")
+        for method, operation in path_item.items()
+        if method in {"get", "post", "delete", "put", "patch"}
+    ]
+    assert len(operations) == 212
+    assert len({(method, path) for method, path, _operation in operations}) == 212
+    assert {operation for _method, _path, operation in operations} == EXPECTED_OPERATIONS
 
     source = Path("server.py").read_text()
     assert "install_management_routers(app)" in source
@@ -72,10 +80,10 @@ def test_server_mounts_all_domain_routers_and_preserves_lifecycle_order():
     ]
     operation_ids = [operation_id for _method, _path, operation_id in operations]
     method_paths = [(method, path) for method, path, _operation_id in operations]
-    assert len(operations) == 203
-    assert len(set(operation_ids)) == 203
-    assert len(set(method_paths)) == 203
-    assert len({path for _method, path in method_paths}) == 147
+    assert len(operations) == 212
+    assert len(set(operation_ids)) == 212
+    assert len(set(method_paths)) == 212
+    assert len({path for _method, path in method_paths}) == 156
     assert set(operation_ids) == EXPECTED_OPERATIONS
 
     source = Path("server.py").read_text()

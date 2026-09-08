@@ -539,14 +539,14 @@ class StatusControl:
             ("oauthRefresh", None, no_refresh),
             (
                 "quotaMonitor", quota_cfg.get("intervalSeconds"),
-                no_refresh or not bool(quota_cfg.get("enabled", False)),
+                not bool(quota_cfg.get("enabled", False)),
             ),
-            ("oauthModelSync", model_sync_interval, no_refresh),
+            ("oauthModelSync", model_sync_interval, False),
             (
                 "cooldownProbe", recovery_cfg.get("intervalSeconds"),
                 not bool(recovery_cfg.get("enabled", True)),
             ),
-            ("providerUsage", None, no_refresh),
+            ("providerUsage", None, False),
         ]
         rows = [{
             "id": name,

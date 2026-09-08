@@ -409,6 +409,7 @@ def update_api_key(
     "/api-keys/{keyId}",
     operation_id="deleteApiKey",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,  # Older FastAPI infers NoneType from the return annotation.
     responses={
         204: {"description": "API key deleted", "headers": {"X-Request-Id": {"schema": {"type": "string"}, "example": "request-example"}}},
         **_errors(

@@ -386,10 +386,10 @@ def test_runtime_not_started_returns_false_without_inflight(m):
     assert pu.account_id(ch) not in pu._INFLIGHT
 
 
-def test_no_refresh_disables_server_mount_helper_and_lifecycle_order(m, monkeypatch):
+def test_no_token_refresh_keeps_usage_enabled_and_lifecycle_order(m, monkeypatch):
     pu = m["provider_usage"]
     monkeypatch.setenv("PARROT_NO_REFRESH", "1")
-    assert not pu.is_enabled()
+    assert pu.is_enabled()
     monkeypatch.setenv("PARROT_NO_REFRESH", "0")
     assert pu.is_enabled()
     server_path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(__file__))), "server.py")

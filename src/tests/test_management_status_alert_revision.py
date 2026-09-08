@@ -87,10 +87,10 @@ class FakeIncidentFeedAndMuteStore:
     def forget_provider(self, provider):
         self.active[provider] = []
 
-    def refresh_provider(self, provider):
+    def refresh_provider(self, provider, *, raise_on_error=False):
         return None
 
-    def list_recent(self, provider, limit):
+    def list_recent(self, provider, limit, *, raise_on_error=False):
         return copy.deepcopy(self.recent.get(provider, []))[:limit]
 
     def mute(self, provider, incident_id, name=""):

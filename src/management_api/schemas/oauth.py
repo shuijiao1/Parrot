@@ -7,7 +7,7 @@ import binascii
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 
 from src.management_control.oauth.models import (
     OAuthAccountFilter,
@@ -87,12 +87,13 @@ class OAuthAccountDetailData(StrictSchema):
     runtimeErrors: list[OAuthRuntimeErrorData]
     credentialConfigured: bool
     lastModelSync: datetime | None = None
+    workbuddy: dict | None = None
 
 
 class ManualOAuthCredential(StrictSchema):
     kind: Literal["manual"]
     provider: OAuthProvider
-    email: str = Field(min_length=1, max_length=320)
+    email: str = Field(default="", max_length=320)
     accessToken: SecretStr = Field(min_length=1, json_schema_extra={"writeOnly": True})
     refreshToken: SecretStr = Field(min_length=1, json_schema_extra={"writeOnly": True})
     displayName: str | None = Field(default=None, max_length=200)
@@ -100,6 +101,19 @@ class ManualOAuthCredential(StrictSchema):
     workspaceId: str | None = Field(default=None, max_length=500)
     projectId: str | None = Field(default=None, max_length=500)
     expiresAt: str | None = Field(default=None, max_length=64)
+    realm: Literal["cn", "global"] | None = None
+    uid: str | None = Field(default=None, min_length=1, max_length=256)
+    enterpriseId: str | None = Field(default=None, max_length=256)
+    domain: str | None = Field(default=None, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_identity(self):
+        if self.provider is OAuthProvider.WORKBUDDY:
+            if not self.uid or not (self.realm or self.domain):
+                raise ValueError("WorkBuddy requires uid and region/domain")
+        elif not self.email.strip():
+            raise ValueError("email is required for this provider")
+        return self
 
 
 class JsonOAuthCredential(StrictSchema):
@@ -158,6 +172,14 @@ class OAuthIdentityConflictEnvelope(StrictSchema):
 
 class StartOAuthLoginFlowRequest(StrictSchema):
     provider: OAuthProvider
+    realm: Literal["cn", "global"] | None = None
+    clientProfile: Literal["cli", "ide"] | None = None
+
+    @model_validator(mode="after")
+    def validate_provider_fields(self):
+        if self.provider is not OAuthProvider.WORKBUDDY and (self.realm is not None or self.clientProfile is not None):
+            raise ValueError("realm/clientProfile are WorkBuddy-only login options")
+        return self
 
 
 class OAuthLoginFlowData(StrictSchema):
@@ -167,6 +189,17 @@ class OAuthLoginFlowData(StrictSchema):
     authUrl: str | None = None
     instruction: str | None = None
     expiresAt: datetime
+
+
+class PollOAuthLoginFlowRequest(StrictSchema):
+    flowSecret: SecretStr = Field(min_length=16, max_length=200, json_schema_extra={"writeOnly": True})
+
+
+class OAuthLoginPollData(StrictSchema):
+    flowId: str
+    status: Literal["pending", "identity_pending", "ready", "completed", "cancelled", "expired"]
+    expiresAt: datetime
+    accountPreview: dict | None = None
 
 
 class CompleteOAuthLoginFlowRequest(StrictSchema):
@@ -188,7 +221,7 @@ _MAX_IMPORT_DECODED_PAYLOAD_BYTES = 1_500_000
 
 
 class PreviewOAuthImportRequest(StrictSchema):
-    format: Literal["openai", "cpa", "sub2api"]
+    format: Literal["openai", "cpa", "sub2api", "workbuddy"]
     payloadEncoding: Literal["json", "base64"] = "json"
     payload: SecretStr = Field(
         min_length=1,

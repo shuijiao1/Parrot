@@ -68,8 +68,8 @@ class StatusGateway(Protocol):
     def snapshot_active(self) -> dict[str, list[dict[str, Any]]]: ...
     def list_muted(self) -> list[dict[str, Any]]: ...
     def forget_provider(self, provider: str) -> None: ...
-    def refresh_provider(self, provider: str) -> None: ...
-    def list_recent(self, provider: str, limit: int) -> list[dict[str, Any]]: ...
+    def refresh_provider(self, provider: str, *, raise_on_error: bool = False) -> None: ...
+    def list_recent(self, provider: str, limit: int, *, raise_on_error: bool = False) -> list[dict[str, Any]]: ...
     def mute(self, provider: str, incident_id: str, name: str = "") -> None: ...
     def unmute(self, provider: str, incident_id: str) -> None: ...
     def provider_tag(self, provider: str) -> str: ...
@@ -88,12 +88,17 @@ class ModuleStatusGateway:
     def forget_provider(self, provider: str) -> None:
         status_monitor.forget_provider(provider)
 
-    def refresh_provider(self, provider: str) -> None:
+    def refresh_provider(self, provider: str, *, raise_on_error: bool = False) -> None:
         first = provider not in status_monitor._initialized_providers
-        status_monitor._process_provider(provider, push=not first)
+        if raise_on_error:
+            status_monitor._process_provider(provider, push=not first, raise_on_error=True)
+        else:
+            status_monitor._process_provider(provider, push=not first)
         status_monitor._initialized_providers.add(provider)
 
-    def list_recent(self, provider: str, limit: int) -> list[dict[str, Any]]:
+    def list_recent(self, provider: str, limit: int, *, raise_on_error: bool = False) -> list[dict[str, Any]]:
+        if raise_on_error:
+            return status_monitor.list_recent_incidents(provider, limit=limit, raise_on_error=True)
         return status_monitor.list_recent_incidents(provider, limit=limit)
 
     def mute(self, provider: str, incident_id: str, name: str = "") -> None:
@@ -438,7 +443,7 @@ class StatusAlertControl:
         else:
             for item_provider in providers:
                 try:
-                    incidents = self._status.list_recent(item_provider, 200)
+                    incidents = self._status.list_recent(item_provider, 200, raise_on_error=True)
                 except Exception as exc:
                     raise ManagementError(ManagementErrorCode.UPSTREAM_ERROR, retryable=True) from exc
                 rows.extend(
@@ -571,7 +576,7 @@ class StatusAlertControl:
             targets = [item for item in payload["targets"] if item in STATUS_PROVIDERS]
             try:
                 for index, provider in enumerate(targets, start=1):
-                    self._status.refresh_provider(provider)
+                    self._status.refresh_provider(provider, raise_on_error=True)
                     store.update_progress(
                         operation_id,
                         current=index,

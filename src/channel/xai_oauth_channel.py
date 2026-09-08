@@ -179,7 +179,7 @@ class XAIOAuthChannel(Channel):
 
     async def build_media_headers(self) -> dict[str, str]:
         """Reuse the existing OAuth lifecycle and return JSON Imagine headers."""
-        access_token = await oauth_manager.ensure_valid_token(self.account_key)
+        access_token = await oauth_manager.ensure_channel_token(self)
         headers = self._build_headers(access_token)
         headers["accept"] = "application/json"
         return headers
@@ -248,7 +248,7 @@ class XAIOAuthChannel(Channel):
         )
         payload = _sanitize_xai_payload(payload, stream=True)
 
-        access_token = await oauth_manager.ensure_valid_token(self.account_key)
+        access_token = await oauth_manager.ensure_channel_token(self)
         headers = self._build_headers(access_token)
         prompt_cache_key = str(payload.get("prompt_cache_key") or "").strip()
         if prompt_cache_key:

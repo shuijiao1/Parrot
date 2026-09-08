@@ -97,10 +97,12 @@ class _State:
 class StreamTranslator:
     """OpenAI Chat SSE → Anthropic SSE."""
 
-    def __init__(self, *, model: str, created_ts: Optional[int] = None):
+    def __init__(self, *, model: str, created_ts: Optional[int] = None,
+                 model_override: Optional[str] = None):
+        self._model_override = model_override
         self.state = _State(
             message_id=_gen_id("msg_"),
-            model=model,
+            model=model_override or model,
             created_ts=int(created_ts or time.time()),
         )
         self._buf = b""
@@ -150,7 +152,7 @@ class StreamTranslator:
 
         if isinstance(evt.get("id"), str) and evt.get("id"):
             self.state.message_id = evt["id"]
-        if isinstance(evt.get("model"), str) and evt.get("model"):
+        if not self._model_override and isinstance(evt.get("model"), str) and evt.get("model"):
             self.state.model = evt["model"]
         if isinstance(evt.get("created"), int):
             self.state.created_ts = int(evt["created"])

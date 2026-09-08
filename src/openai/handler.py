@@ -681,9 +681,13 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
             f"[scheduler] no channels ingress={ingress_protocol} model={model}: "
             f"{exclusion_summary}"
         )
+        # Resolve once so the log and downstream response describe the same error.
+        err_type = errors.ErrTypeOpenAI.NOT_FOUND if _model_never_supported(model) \
+            else errors.ErrTypeOpenAI.SERVER
+        status = 404 if err_type == errors.ErrTypeOpenAI.NOT_FOUND else 503
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,
-            http_status=503, affinity_hit=(1 if result.affinity_hit else 0),
+            http_status=status, affinity_hit=(1 if result.affinity_hit else 0),
             total_ms=int((time.monotonic() - start_monotonic) * 1000),
         )
         # 节流告警
@@ -697,10 +701,6 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
             f"筛选详情: <code>{ek(exclusion_summary)}</code>\n"
             "请按筛选详情检查渠道状态。",
         )
-        # 区分 model-not-exist（任何家族都没有的模型）与 no-candidates
-        err_type = errors.ErrTypeOpenAI.NOT_FOUND if _model_never_supported(model) \
-            else errors.ErrTypeOpenAI.SERVER
-        status = 404 if err_type == errors.ErrTypeOpenAI.NOT_FOUND else 503
         return errors.json_error_openai(status, err_type, msg)
 
     ts = time.strftime("%H:%M:%S", time.localtime(start_time))

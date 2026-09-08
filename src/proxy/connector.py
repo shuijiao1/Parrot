@@ -22,6 +22,7 @@ import httpcore
 import httpx
 import socksio
 
+from ..async_owned import await_owned
 from .ss2022 import (
     SSError,
     create_ss_connection,
@@ -552,13 +553,7 @@ class SS2022DuplexBridge:
         return self._close_task
 
     async def _await_close_task(self, task: asyncio.Task[None]) -> None:
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            try:
-                await task
-            finally:
-                raise
+        await await_owned(task)
 
     @staticmethod
     def _shutdown(sock: socket.socket, how: int) -> None:
@@ -766,13 +761,7 @@ class _TLSOverSS2022Stream(httpcore.AsyncNetworkStream):
                 self._close_impl(),
                 name="tls-over-ss2022-close",
             )
-        try:
-            await asyncio.shield(self._close_task)
-        except asyncio.CancelledError:
-            try:
-                await self._close_task
-            finally:
-                raise
+        await await_owned(self._close_task)
 
     async def start_tls(self, *args, **kwargs):
         raise NotImplementedError("already TLS")

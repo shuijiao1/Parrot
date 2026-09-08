@@ -27,6 +27,7 @@ import secrets
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
@@ -49,6 +50,8 @@ from .oauth import antigravity as antigravity_provider
 from .oauth import cursor as cursor_provider
 from .oauth import openai as openai_provider
 from .oauth import xai as xai_provider
+from .oauth import workbuddy as workbuddy_provider
+from .oauth.workbuddy import runtime as workbuddy_runtime
 from .openai.codex_constants import (
     codex_backend_base_url,
     codex_cli_version,
@@ -154,7 +157,7 @@ def _is_antigravity_acc(acc: dict) -> bool:
 
 
 def _is_openai_family_provider(provider: str) -> bool:
-    return provider in ("openai", "xai", "cursor", "antigravity")
+    return provider in ("openai", "xai", "cursor", "antigravity", "workbuddy")
 
 
 def _canonical_key(acc: dict) -> str:
@@ -337,8 +340,8 @@ def account_key_to_email(account_key: str) -> str:
     except AmbiguousOAuthAccountKey:
         acc = None
     if acc is not None:
-        if _acc_provider(acc) == "cursor":
-            return str(acc.get("label") or acc.get("email") or "")
+        if _acc_provider(acc) in {"cursor", "workbuddy"}:
+            return str(acc.get("label") or acc.get("nickname") or acc.get("email") or acc.get("uid") or "")
         return str(acc.get("email") or "")
     provider, identity = _split_ak(account_key)
     if provider in ("openai", "xai", "antigravity") and ":" in identity:
@@ -459,7 +462,44 @@ def _rename_runtime_oauth_identity(old_account_key: str, new_account_key: str, *
     )
 
 
-def _save_token_fields(account_key: str, new: dict) -> bool:
+def account_state_key(account: dict) -> str:
+    """Capture an account's runtime incarnation before starting external work."""
+    from . import channel_state
+    return channel_state.register_oauth_generation(
+        f"oauth:{_canonical_key(account)}", account.get("generationId"),
+    )
+
+
+@contextmanager
+def account_generation_guard(expected_state_key: str | None):
+    """Serialize short local effects against deletion/re-add; never hold over I/O."""
+    from . import channel_state
+    with config.serialized_updates(), channel_state.mutation_lock:
+        if expected_state_key is None:
+            yield True
+            return
+        target = channel_state.resolve(expected_state_key)
+        current = next((a for a in config.get().get("oauthAccounts", [])
+                        if f"oauth:{_canonical_key(a)}" == target), None)
+        yield bool(
+            not channel_state.is_deleted(expected_state_key)
+            and current is not None and account_state_key(current) == expected_state_key
+        )
+
+
+def _oauth_retirement_plan(channel_keys: set[str]) -> dict[str, list[str]]:
+    from . import channel_state
+    for account in config.get().get("oauthAccounts", []):
+        key = f"oauth:{_canonical_key(account)}"
+        if key in channel_keys and channel_state.resolve(key) == key:
+            account_state_key(account)
+    # An obsolete alias manually reinserted in config is not the live renamed
+    # account. Deleting that stale entry must not retire its destination.
+    return {key: (sorted(channel_state.oauth_generations(key))
+                  if channel_state.resolve(key) == key else []) for key in channel_keys}
+
+
+def _save_token_fields(account_key: str, new: dict, *, expected_state_key: str | None = None) -> bool:
     """Persist one refresh result only if its exact account generation survives.
 
     A refresh may finish after the account was renamed or deleted.  The
@@ -470,7 +510,9 @@ def _save_token_fields(account_key: str, new: dict) -> bool:
     """
     from . import channel_state
 
-    with config.serialized_updates(), channel_state.mutation_lock:
+    with account_generation_guard(expected_state_key) as current:
+        if not current:
+            return False
         return _save_token_fields_serialized(account_key, new)
 
 
@@ -522,6 +564,9 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> bool:
     if _acc_provider(old_acc) != _normalize_provider(source_provider):
         return False
 
+    new = dict(new)
+    # Preserve legacy incarnations when a refresh completes identity metadata.
+    new["generationId"] = channel_state.generation_id(account_state_key(old_acc))
     old_acc_snapshot = copy.deepcopy(old_acc) if old_acc is not None else None
     old_load_balancing = copy.deepcopy(
         config.get().get("loadBalancing", {})
@@ -695,7 +740,7 @@ def _do_refresh_mock(refresh_token: str) -> dict:
     }
 
 
-def _refresh_sync_locked(account_key: str, force: bool) -> str:
+def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: str | None = None) -> str:
     """同步刷新（持 threading.Lock，跨线程跨 loop 串行）。
 
     force=False 时进入锁后做一次"双重检查"：若另一并发刷新已完成且 token 仍有效则跳过实际请求。
@@ -705,6 +750,9 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
     # 任一方刷新会轮换 access_token/refresh_token，击穿线上 token 导致小夕 401。
     # 三条刷新入口（proactive_refresh_loop / ensure_valid_token / force_refresh）
     # 最终都汇到这里，单点拦截即全堵。返回现有 token，绝不发刷新请求。
+    with account_generation_guard(expected_state_key) as current:
+        if not current:
+            raise ValueError("OAuth account generation was deleted")
     if os.environ.get("PARROT_NO_REFRESH") == "1":
         _acc = get_account(_resolve_existing_account_key_or_raise(account_key))
         if _acc and _acc.get("access_token"):
@@ -716,9 +764,18 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
     email = account_key_to_email(account_key)
     lock = _get_refresh_lock(account_key)
     with lock:
-        acc = get_account(account_key)
-        if acc is None:
-            raise ValueError(f"unknown OAuth account: {account_key}")
+        with account_generation_guard(expected_state_key) as current:
+            if not current:
+                raise ValueError("OAuth account generation was deleted")
+            acc = copy.deepcopy(get_account(account_key))
+            if acc is None:
+                raise ValueError(f"unknown OAuth account: {account_key}")
+            expected_state_key = account_state_key(acc)
+
+        # WorkBuddy owns unknown-expiry backoff and an unsaved rotated candidate.
+        # It must see pending persistence before returning an apparently healthy old AT.
+        if provider_of(acc) == "workbuddy":
+            return workbuddy_runtime.refresh_locked(copy.deepcopy(acc), account_key, force)
 
         # 双重检查：force 路径不做（强制刷）
         if not force:
@@ -885,7 +942,7 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
             except Exception as exc:
                 print(f"[oauth] claude refresh: profile fetch failed for {email}: {exc}")
 
-        if not _save_token_fields(account_key, new_fields):
+        if not _save_token_fields(account_key, new_fields, expected_state_key=expected_state_key):
             print(
                 f"[oauth] discarded refresh result for retired generation: "
                 f"{account_key}"
@@ -893,18 +950,36 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
         return new_fields["access_token"]
 
 
-async def ensure_valid_token(account_key: str) -> str:
+async def ensure_channel_token(channel) -> str:
+    """Do not let an already selected retired Channel refresh its replacement."""
+    expected = getattr(channel, "state_key", None)
+    if expected is None:
+        return await ensure_valid_token(channel.account_key)
+    token = await ensure_valid_token(channel.account_key, expected_state_key=expected)
+    with account_generation_guard(expected) as current:
+        if not current:
+            raise ValueError("OAuth account generation was deleted")
+    return token
+
+
+async def ensure_valid_token(account_key: str, *, expected_state_key: str | None = None) -> str:
     """调用方：OAuthChannel.build_upstream_request。
 
     返回可用的 access_token。剩余 ≥ 5min 且身份完整时返回缓存；否则持锁刷新。
     旧 OpenAI 账号缺 workspace 时也需刷新一次，不能因 token 尚有效而跳过补全。
     同一 account_key 的并发请求由 threading.Lock 串行（跨 event loop 安全）。
     """
-    account_key = _resolve_existing_account_key_or_raise(account_key)
-    acc = get_account(account_key)
-    if acc is None:
-        raise ValueError(f"unknown OAuth account: {account_key}")
+    with account_generation_guard(expected_state_key) as current:
+        if not current:
+            raise ValueError("OAuth account generation was deleted")
+        account_key = _resolve_existing_account_key_or_raise(account_key)
+        acc = copy.deepcopy(get_account(account_key))
+        if acc is None:
+            raise ValueError(f"unknown OAuth account: {account_key}")
+        expected_state_key = account_state_key(acc)
 
+    if provider_of(acc) == "workbuddy":
+        return await asyncio.to_thread(_refresh_sync_locked, account_key, False, expected_state_key=expected_state_key)
     expired = _parse_iso(acc.get("expired"))
     if (
         expired
@@ -913,12 +988,14 @@ async def ensure_valid_token(account_key: str) -> str:
     ):
         return acc["access_token"]
 
-    return await asyncio.to_thread(_refresh_sync_locked, account_key, False)
+    return await asyncio.to_thread(_refresh_sync_locked, account_key, False, expected_state_key=expected_state_key)
 
 
-async def force_refresh(account_key: str) -> str:
+async def force_refresh(account_key: str, *, expected_state_key: str | None = None) -> str:
     """无视剩余时间，强制刷一次（用于 401/403 重试前 / 管理员手动触发）。"""
-    return await asyncio.to_thread(_refresh_sync_locked, account_key, True)
+    if expected_state_key is None:
+        return await asyncio.to_thread(_refresh_sync_locked, account_key, True)
+    return await asyncio.to_thread(_refresh_sync_locked, account_key, True, expected_state_key=expected_state_key)
 
 
 # ─── Profile & Usage ─────────────────────────────────────────────
@@ -1079,6 +1156,13 @@ async def fetch_usage(account_key: str) -> dict:
     provider = provider_of(account_key)
 
     access_token = await ensure_valid_token(account_key)
+
+    if provider == "workbuddy":
+        account = copy.deepcopy(get_account(account_key) or {})
+        usage = await asyncio.to_thread(workbuddy_provider.fetch_usage_sync, access_token,
+                                       account=account, account_key=account_key)
+        usage["workbuddy"]["credential_fingerprint"] = workbuddy_runtime.credential_fingerprint(account)
+        return workbuddy_runtime.preserve_snapshot(account_key, usage, state_db.quota_load(account_key))
 
     if provider == "xai":
         return await xai_provider.fetch_cli_billing_usage(
@@ -1340,6 +1424,7 @@ async def ensure_quota_fresh(account_key: str, *, timeout_s: float = 5.0) -> boo
                 age_s = (state_db.now_ms() - fetched_at_ms) / 1000.0
                 if age_s < throttle_s:
                     return False
+        expected_state_key = account_state_key(get_account(account_key) or {})
         try:
             usage = await fetch_usage_snapshot(
                 account_key, usage_timeout_s=timeout_s, detail_timeout_s=timeout_s,
@@ -1352,8 +1437,11 @@ async def ensure_quota_fresh(account_key: str, *, timeout_s: float = 5.0) -> boo
             return False
         try:
             usage = preserve_antigravity_cached_summary(account_key, usage)
-            state_db.quota_save(account_key, flatten_usage(usage),
-                                email=account_key_to_email(account_key))
+            with account_generation_guard(expected_state_key) as current:
+                if not current:
+                    return False
+                state_db.quota_save(account_key, flatten_usage(usage),
+                                    email=account_key_to_email(account_key))
         except Exception as exc:
             print(f"[oauth] ensure_quota_fresh save failed for {account_key}: {exc}")
             return False
@@ -1361,7 +1449,7 @@ async def ensure_quota_fresh(account_key: str, *, timeout_s: float = 5.0) -> boo
         # 立即收敛状态；否则 UI 会显示已超当前配置阈值但账户仍保持 enabled，
         # 直到后台轮询下一轮才禁用。
         try:
-            evaluate_and_toggle_by_usage(account_key, usage)
+            evaluate_and_toggle_by_usage(account_key, usage, expected_state_key=expected_state_key)
         except Exception as exc:
             print(f"[oauth] ensure_quota_fresh evaluate failed for {account_key}: {exc}")
     return True
@@ -2493,7 +2581,17 @@ def _evaluate_antigravity_credits(
     return {**base, "action": "resumed", "disabled_until": None}
 
 
-def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
+def evaluate_and_toggle_by_usage(account_key: str, usage: dict, *,
+                                 threshold: float | None = None, fresh: bool = True,
+                                 expected_state_key: str | None = None) -> dict:
+    with account_generation_guard(expected_state_key) as current:
+        if not current:
+            return {"action": "noop_stale", "utils": extract_utils_percent(usage),
+                    "any_over": False, "hit_windows": [], "disabled_until": None}
+        return _evaluate_and_toggle_by_usage_current(account_key, usage, threshold=threshold, fresh=fresh)
+
+
+def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
                                  *, threshold: float | None = None,
                                  fresh: bool = True) -> dict:
     """核心策略：拿到新鲜 usage 后评估禁用/恢复，并执行状态切换。
@@ -2573,6 +2671,11 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
             usage,
             threshold=float(threshold),
             fresh=fresh,
+        )
+
+    if provider == "workbuddy":
+        return workbuddy_runtime.evaluate_credits(
+            account_key, acc, usage, fresh=fresh, expected_generation=expected_quota_generation,
         )
 
     if provider == "antigravity":
@@ -3092,7 +3195,11 @@ def _replace_exact_identity_in_config(
     provider = _normalize_provider(entry.get("provider"))
     incoming = copy.deepcopy(entry)
     incoming["provider"] = provider
-    required = ("email", "access_token", "refresh_token")
+    if provider == "workbuddy":
+        incoming.update(workbuddy_provider.normalize_credential(
+            incoming, source=str(incoming.get("workbuddy_identity_source") or "import"),
+        ))
+    required = ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("email", "access_token", "refresh_token")
     missing = [key for key in required if not incoming.get(key)]
     if missing:
         raise ValueError(f"missing required fields: {missing}")
@@ -3133,6 +3240,11 @@ def _replace_exact_identity_in_config(
     replacement.update(incoming)
     if "maxConcurrent" in current:
         replacement["maxConcurrent"] = copy.deepcopy(current["maxConcurrent"])
+    if provider == "workbuddy":
+        for key in ("label", "workbuddy_auto_checkin", "disabledModels", "account_model_catalog",
+                    "last_model_sync", "last_model_sync_source", "last_model_sync_error", "last_model_sync_attempt"):
+            if key in current:
+                replacement[key] = copy.deepcopy(current[key])
     if current.get("disabled_reason") == "auth_error":
         replacement["enabled"] = True
         replacement["disabled_reason"] = None
@@ -3190,7 +3302,11 @@ def replace_exact_identity(
     provider = _normalize_provider(entry.get("provider"))
     incoming = copy.deepcopy(entry)
     incoming["provider"] = provider
-    required = ("email", "access_token", "refresh_token")
+    if provider == "workbuddy":
+        incoming.update(workbuddy_provider.normalize_credential(
+            incoming, source=str(incoming.get("workbuddy_identity_source") or "import"),
+        ))
+    required = ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("email", "access_token", "refresh_token")
     missing = [key for key in required if not incoming.get(key)]
     if missing:
         raise ValueError(f"missing required fields: {missing}")
@@ -3201,7 +3317,7 @@ def replace_exact_identity(
 
     def mutate(cfg):
         result.update(_replace_exact_identity_in_config(
-            cfg, expected_account_key, entry, expected_account=expected_account,
+            cfg, expected_account_key, incoming, expected_account=expected_account,
         ))
 
     with config.serialized_updates():
@@ -3322,7 +3438,12 @@ def _add_account_serialized(
     an exact canonical identity and guard legacy subject/email migration.
     """
     active_config = candidate_config if candidate_config is not None else config.get()
-    required = ("email", "access_token", "refresh_token")
+    provider = _normalize_provider(entry.get("provider") or entry.get("type"))
+    if provider == "workbuddy":
+        entry = dict(entry, **workbuddy_provider.normalize_credential(
+            entry, source=str(entry.get("workbuddy_identity_source") or "import"),
+        ))
+    required = ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("email", "access_token", "refresh_token")
     missing = [k for k in required if not entry.get(k)]
     if missing:
         raise ValueError(f"missing required fields: {missing}")
@@ -3340,7 +3461,7 @@ def _add_account_serialized(
         "refresh_token": entry["refresh_token"],
         "expired": entry.get("expired", ""),
         "last_refresh": entry.get("last_refresh", _format_utc(datetime.now(timezone.utc))),
-        "type": entry.get("type", provider if provider in ("openai", "xai", "cursor", "antigravity") else "claude"),
+        "type": entry.get("type", provider if provider in ("openai", "xai", "cursor", "antigravity", "workbuddy") else "claude"),
         "enabled": entry.get("enabled", True),
         "disabled_reason": entry.get("disabled_reason"),
         "disabled_until": entry.get("disabled_until"),
@@ -3387,6 +3508,11 @@ def _add_account_serialized(
         normalized["models_etag_profile"] = str(
             entry.get("models_etag_profile") or ""
         )
+    elif provider == "workbuddy":
+        for key in workbuddy_provider.ACCOUNT_FIELDS:
+            if key in entry:
+                normalized[key] = copy.deepcopy(entry[key])
+        normalized.setdefault("workbuddy_auto_checkin", False)
     # xAI 专属字段（缺失时保持空串；subject 用于稳定 account_key）
     elif provider == "xai":
         subject = str(entry.get("subject") or entry.get("sub") or "")
@@ -3486,7 +3612,7 @@ def _add_account_serialized(
     added = {"v": False}
     existing_target = None
     for a in active_config.get("oauthAccounts", []):
-        if provider == "openai":
+        if provider in {"openai", "workbuddy"}:
             if _acc_provider(a) == provider and _canonical_key(a) == normalized_key:
                 existing_target = a
                 break
@@ -3510,6 +3636,12 @@ def _add_account_serialized(
     from . import channel_state
     if existing_target is None or rename_new_key:
         channel_state.assert_reusable(f"oauth:{normalized_key}")
+    # New additions always get a fresh incarnation, even when copied credentials
+    # carry the deleted account's generationId. Relogin/rename keeps its owner.
+    normalized["generationId"] = (
+        channel_state.generation_id(account_state_key(existing_target))
+        if existing_target is not None else uuid.uuid4().hex
+    )
     if rename_new_key:
         for account in active_config.get("oauthAccounts", []):
             if account is not existing_target and _canonical_key(account) == normalized_key:
@@ -3548,7 +3680,7 @@ def _add_account_serialized(
     def mutate(cfg):
         accounts = cfg.setdefault("oauthAccounts", [])
         target: dict | None = None
-        if provider == "openai":
+        if provider in {"openai", "workbuddy"}:
             for a in accounts:
                 if _acc_provider(a) != provider:
                     continue
@@ -3577,7 +3709,7 @@ def _add_account_serialized(
                     break
 
         if target is not None:
-            if provider not in ("openai", "xai", "cursor", "antigravity"):
+            if provider not in ("openai", "xai", "cursor", "antigravity", "workbuddy"):
                 raise ValueError(
                     f"account already exists: provider={provider} email={email}"
                 )
@@ -3607,7 +3739,10 @@ def _add_account_serialized(
                     "cursor_profile_id", "cursor_email_verified",
                 )
             }
+            keep_workbuddy = {key: copy.deepcopy(target.get(key)) for key in ("label", "workbuddy_auto_checkin") if key in target}
             target.update(normalized)
+            if provider == "workbuddy":
+                target.update(keep_workbuddy)
             if keep_models is not None and not entry.get("models"):
                 target["models"] = keep_models
             for key, value in keep_model_policy.items():
@@ -3615,7 +3750,7 @@ def _add_account_serialized(
                     target[key] = value
             if keep_max is not None and "maxConcurrent" not in entry:
                 target["maxConcurrent"] = keep_max
-            if provider == "cursor" and keep_disabled_reason in {"user", "quota"}:
+            if provider in {"cursor", "workbuddy"} and keep_disabled_reason in {"user", "quota"}:
                 target["enabled"] = keep_enabled
                 target["disabled_reason"] = keep_disabled_reason
                 target["disabled_until"] = keep_disabled_until
@@ -3805,16 +3940,14 @@ def delete_invalid_accounts_batch_if_unchanged(
     from . import cooldown as _cooldown, scorer as _scorer
 
     with config.serialized_updates(), channel_state.mutation_lock:
-        retirement_plan = {
-            channel_key: sorted(channel_state.alias_sources(channel_key)) + [channel_key]
-            for channel_key in channel_keys
-        }
+        retirement_plan = _oauth_retirement_plan(channel_keys)
+        retired_keys = {key for keys in retirement_plan.values() for key in keys}
         frozen_limits = {
             generation_key: concurrency.capture_rename_limit(generation_key)
             for generation_keys in retirement_plan.values()
             for generation_key in generation_keys
         }
-        for channel_key in channel_keys:
+        for channel_key in retired_keys:
             channel_state.retire_deleted(channel_key)
 
         def mutate(cfg: dict) -> None:
@@ -3857,11 +3990,11 @@ def delete_invalid_accounts_batch_if_unchanged(
         try:
             config.update(mutate, skip_if_unchanged=True)
         except BaseException:
-            for channel_key in channel_keys:
+            for channel_key in retired_keys:
                 channel_state.restore_deleted(channel_key)
             raise
         if result.get("status") != "deleted":
-            for channel_key in channel_keys:
+            for channel_key in retired_keys:
                 channel_state.restore_deleted(channel_key)
             return result
 
@@ -3870,7 +4003,7 @@ def delete_invalid_accounts_batch_if_unchanged(
                 concurrency.retire_channel(
                     generation_key,
                     frozen_max=frozen_limits[generation_key],
-                    deleted_target=channel_key,
+                    deleted_target=generation_key,
                 )
 
         for account_key in account_keys:
@@ -3889,6 +4022,7 @@ def delete_invalid_accounts_batch_if_unchanged(
             except Exception:
                 pass
             forget_openai_probe(account_key)
+            workbuddy_runtime.forget(account_key)
             if account_key.startswith("cursor:"):
                 try:
                     from .cursor_bridge import runtime as cursor_bridge_runtime
@@ -3969,21 +4103,19 @@ def _delete_account_serialized(account_key: str) -> None:
     from . import affinity as _affinity, channel_state, concurrency
     from . import cooldown as _cooldown, scorer as _scorer
     with channel_state.mutation_lock:
-        retirement_plan = {
-            channel_key: sorted(channel_state.alias_sources(channel_key)) + [channel_key]
-            for channel_key in channel_keys
-        }
+        retirement_plan = _oauth_retirement_plan(channel_keys)
+        retired_keys = {key for keys in retirement_plan.values() for key in keys}
         frozen_limits = {
             generation_key: concurrency.capture_rename_limit(generation_key)
             for generation_keys in retirement_plan.values()
             for generation_key in generation_keys
         }
-        for channel_key in channel_keys:
+        for channel_key in retired_keys:
             channel_state.retire_deleted(channel_key)
         try:
             config.update(mutate)
         except BaseException:
-            for channel_key in channel_keys:
+            for channel_key in retired_keys:
                 channel_state.restore_deleted(channel_key)
             raise
         for channel_key, generation_keys in retirement_plan.items():
@@ -3991,7 +4123,7 @@ def _delete_account_serialized(account_key: str) -> None:
                 concurrency.retire_channel(
                     generation_key,
                     frozen_max=frozen_limits[generation_key],
-                    deleted_target=channel_key,
+                    deleted_target=generation_key,
                 )
 
         for cleanup_key in cleanup_keys:
@@ -4013,6 +4145,7 @@ def _delete_account_serialized(account_key: str) -> None:
                 pass
             # OpenAI probe 节流桶（fetch_usage 统一路径后新增）
             forget_openai_probe(cleanup_key)
+            workbuddy_runtime.forget(cleanup_key)
             if cleanup_key.startswith("cursor:"):
                 try:
                     from .cursor_bridge import runtime as cursor_bridge_runtime
@@ -4519,6 +4652,8 @@ def ensure_openai_metadata_fresh_sync(account_keys: list[str] | str, *,
 def _provider_default_models(provider: str) -> tuple[list[str], str]:
     """Return an explicit provider fallback; OpenAI falls back only to its profile."""
     cfg = config.get()
+    if provider == "workbuddy":
+        return [], "workbuddy:awaiting-account-catalog"
     section = {
         "openai": "openaiOAuth",
         "xai": "xaiOAuth",
@@ -4737,6 +4872,7 @@ def _discovery_generation(account: dict) -> str:
         client_identity = ""
     raw = "\0".join((
         _canonical_key(account), provider,
+        str(account.get("generationId") or ""),
         str(account.get("access_token") or ""),
         str(account.get("project_id") or account.get("workspace_id") or ""),
         client_identity,
@@ -5794,14 +5930,20 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
     """
     out: dict[str, str] = {}
     for acc in list_accounts()[:]:
-        email = acc.get("email")
+        provider = provider_of(acc)
+        email = acc.get("email") or (account_key_to_email(_account_key(acc)) if provider == "workbuddy" else "")
         if not email:
             continue
         ak = _account_key(acc)
+        if provider == "workbuddy" and not workbuddy_provider.refresh_allowed():
+            out[ak] = "skipped:protected"
+            continue
         disp = (
             str(acc.get("label") or email)
-            if provider_of(acc) == "cursor" else email
+            if provider in {"cursor", "workbuddy"} else email
         )
+        if provider == "workbuddy":
+            email = ak  # IDs, not nicknames, key the result map for this provider.
         if not acc.get("enabled", True):
             out[email] = "skipped:disabled"
             continue
@@ -5823,17 +5965,24 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
                 print(f"[oauth] openai metadata refresh failed for {ak}: {exc}")
 
         expired = _parse_iso(acc.get("expired"))
-        if expired is None:
+        if expired is None and provider != "workbuddy":
             out[email] = "skipped:no_expired"
             continue
 
-        remaining = (expired - datetime.now(timezone.utc)).total_seconds()
+        remaining = (expired - datetime.now(timezone.utc)).total_seconds() if expired else 0
+        if provider == "workbuddy" and not workbuddy_runtime.refresh_due(acc, ak, refresh_threshold_seconds):
+            out[email] = "skipped:backoff_or_healthy"
+            continue
         if remaining >= refresh_threshold_seconds:
             out[email] = "skipped:healthy"
             continue
 
+        expected_state_key = account_state_key(acc)
         try:
-            await force_refresh(ak)
+            if provider == "workbuddy" and expired is None:
+                await ensure_valid_token(ak)
+            else:
+                await force_refresh(ak)
             out[email] = "refreshed"
             usage_flat: dict | None = None
             usage: dict | None = None
@@ -5842,9 +5991,13 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
                 usage_flat = flatten_usage(usage)
                 # 统一用 quota_save 写入；OpenAI 主动拉取来自 wham/usage，
                 # 不覆盖响应头实时采样保存在 codex_* 列里的细节。
-                usage = preserve_antigravity_cached_summary(ak, usage)
-                usage_flat = flatten_usage(usage)
-                state_db.quota_save(ak, usage_flat, email=email)
+                with account_generation_guard(expected_state_key) as current:
+                    if not current:
+                        out[email] = "skipped:deleted_generation"
+                        continue
+                    usage = preserve_antigravity_cached_summary(ak, usage)
+                    usage_flat = flatten_usage(usage)
+                    state_db.quota_save(ak, usage_flat, email=email)
             except Exception as exc:
                 print(f"[oauth] usage fetch after refresh failed for {ak}: {exc}")
 
@@ -5861,8 +6014,12 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
             disabled_line = ""
             if err.auth_error:
                 try:
-                    set_enabled(ak, False, reason="auth_error")
-                    disabled_line = "\n账号已被自动禁用 (auth_error)。请到「🔐 管理 OAuth」重新登录或粘贴新 JSON。"
+                    with account_generation_guard(expected_state_key) as current:
+                        if not current:
+                            out[email] = "skipped:deleted_generation"
+                            continue
+                        set_enabled(ak, False, reason="auth_error")
+                        disabled_line = "\n账号已被自动禁用 (auth_error)。请到「🔐 管理 OAuth」重新登录或粘贴新 JSON。"
                 except Exception:
                     disabled_line = "\n⚠ 自动禁用写入失败，请查看 systemd 日志。"
             else:
@@ -5904,7 +6061,7 @@ async def quota_monitor_once() -> dict:
 
     out: dict[str, str] = {}
     for acc in list_accounts()[:]:
-        email = acc.get("email")
+        email = acc.get("email") or (account_key_to_email(_account_key(acc)) if provider_of(acc) == "workbuddy" else "")
         if not email:
             continue
         ak = _account_key(acc)
@@ -5914,14 +6071,19 @@ async def quota_monitor_once() -> dict:
             continue
 
         reason_before = acc.get("disabled_reason")
+        expected_state_key = account_state_key(acc)
         try:
             usage = await fetch_usage_snapshot(ak)
         except Exception as exc:
             out[email] = f"fetch_failed:{exc}"
             continue
 
-        usage = preserve_antigravity_cached_summary(ak, usage)
-        state_db.quota_save(ak, flatten_usage(usage), email=email)
+        with account_generation_guard(expected_state_key) as current:
+            if not current:
+                out[email] = "skipped:deleted_generation"
+                continue
+            usage = preserve_antigravity_cached_summary(ak, usage)
+            state_db.quota_save(ak, flatten_usage(usage), email=email)
 
         # OpenAI quota 恢复必须有本轮主动 fetch_usage 拿到的窗口数据；空 usage
         # 不足以证明恢复。不要用 last_passive_update_at 判定这里的新鲜度：旧的
@@ -5931,7 +6093,8 @@ async def quota_monitor_once() -> dict:
         if provider == "openai" and reason_before == "quota":
             fresh_for_resume = _usage_has_any_quota_signal(usage)
 
-        result = evaluate_and_toggle_by_usage(ak, usage, threshold=threshold, fresh=fresh_for_resume)
+        result = evaluate_and_toggle_by_usage(ak, usage, threshold=threshold, fresh=fresh_for_resume,
+                                             expected_state_key=expected_state_key)
         utils = result["utils"]
         action = result["action"]
 
@@ -5985,9 +6148,9 @@ async def preload_openai_reset_credit_details_once() -> dict[str, str]:
     """Warm OpenAI usage/card caches once without delaying app readiness.
 
     ``quota_monitor_loop`` owns this one-shot work, so no second scheduler or
-    thread is introduced. It also runs when periodic quota monitoring is off;
-    the process-wide ``PARROT_NO_REFRESH`` startup guard still skips the whole
-    loop when operators explicitly disable refreshes.
+    thread is introduced. It also runs when periodic quota monitoring is off.
+    ``PARROT_NO_REFRESH`` blocks credential rotation, not these read-only usage
+    queries; token acquisition still passes through the central refresh guard.
     """
     out: dict[str, str] = {}
     for acc in list_accounts()[:]:
@@ -6001,11 +6164,16 @@ async def preload_openai_reset_credit_details_once() -> dict[str, str]:
         if reason in ("user", "auth_error"):
             out[ak] = f"skipped:{reason}"
             continue
+        expected_state_key = account_state_key(acc)
         try:
             usage = await fetch_usage_snapshot(
                 ak, usage_timeout_s=5.0, detail_timeout_s=5.0,
             )
-            state_db.quota_save(ak, flatten_usage(usage), email=email)
+            with account_generation_guard(expected_state_key) as current:
+                if not current:
+                    out[ak] = "skipped:deleted_generation"
+                    continue
+                state_db.quota_save(ak, flatten_usage(usage), email=email)
             out[ak] = "refreshed"
         except asyncio.CancelledError:
             raise
@@ -6016,13 +6184,19 @@ async def preload_openai_reset_credit_details_once() -> dict[str, str]:
 
 
 async def proactive_refresh_loop() -> None:
-    """后台任务：初次等 30s，之后每 60s 触发一次 refresh_once。"""
+    """每60s按保护开关刷新Token，并独立运行用户已开启的自动签到。"""
     await asyncio.sleep(30)
     while True:
         try:
-            await proactive_refresh_once()
+            if os.environ.get("PARROT_NO_REFRESH") != "1":
+                await proactive_refresh_once()
         except Exception as exc:
             print(f"[oauth_manager] proactive_refresh_once error: {exc}")
+        try:
+            from .oauth.workbuddy.actions import auto_checkin_once
+            await asyncio.to_thread(auto_checkin_once)
+        except Exception as exc:
+            print(f"[oauth_manager] WorkBuddy auto-checkin error: {type(exc).__name__}")
         await asyncio.sleep(60)
 
 

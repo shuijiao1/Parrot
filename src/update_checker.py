@@ -190,16 +190,16 @@ def _pick_latest(releases: list, *, include_prerelease: bool) -> Optional[dict]:
     return fallback
 
 
-def _check_once(*, push: bool = True) -> None:
-    """单次检查并视情况推送 + 写状态。"""
+def _check_once(*, push: bool = True, raise_on_error: bool = False) -> None:
+    """单次检查；API 可选择不推送并显式报告抓取失败，TG/后台默认不变。"""
     cfg = _cfg()
     if not cfg["enabled"] or not cfg["repo"]:
         return
     url = f"{cfg['apiBase']}/repos/{cfg['repo']}/releases?per_page=20"
     releases = _http_get_json(url)
-    if releases is None:
-        return
     if not isinstance(releases, list):
+        if raise_on_error:
+            raise RuntimeError("Release check failed")
         return
     latest = _pick_latest(releases, include_prerelease=cfg["includePrerelease"])
     if not latest:

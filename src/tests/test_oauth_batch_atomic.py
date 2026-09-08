@@ -270,9 +270,9 @@ def test_invalid_delete_second_apply_failure_keeps_accounts_and_lb_unpublished(
     assert json.loads(path.read_text(encoding="utf-8")) == before
     assert writes == []
     assert callbacks == []
-    channels = {f"oauth:{item[0]}" for item in expected}
-    assert set(events["retire_deleted"]) == channels
-    assert set(events["restore_deleted"]) == channels
+    generations = {oauth_manager.account_state_key(item[1]) for item in expected}
+    assert set(events["retire_deleted"]) == generations
+    assert set(events["restore_deleted"]) == generations
     assert events["retire_channel"] == []
     assert events["scorer"] == []
 
@@ -336,9 +336,10 @@ def test_invalid_delete_success_publishes_config_lb_once_then_cleans_runtime(
 
     account_ids = {item[0] for item in expected}
     channels = {f"oauth:{account_id}" for account_id in account_ids}
-    assert set(events["retire_deleted"]) == channels
+    generations = {oauth_manager.account_state_key(item[1]) for item in expected}
+    assert set(events["retire_deleted"]) == generations
     assert events["restore_deleted"] == []
-    assert {item[0] for item in events["retire_channel"]} == channels
+    assert {item[0] for item in events["retire_channel"]} == generations
     assert set(events["scorer"]) == channels
     assert set(events["cooldown"]) == channels
     assert set(events["server_affinity"]) == channels

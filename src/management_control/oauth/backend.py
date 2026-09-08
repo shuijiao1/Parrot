@@ -665,6 +665,9 @@ class OAuthBackend:
     def parse_import(
         self, kind: str, payload, *, filename: str = "",
     ) -> list[OpenAIImportCandidate]:
+        if kind == "workbuddy":
+            from src.oauth.workbuddy.auth import parse_import_payload
+            return parse_import_payload(payload)
         return parse_openai_import_payload(kind, payload, filename=filename)
 
     def cursor_catalog_records(self, account: dict) -> list[dict]:
@@ -759,3 +762,47 @@ class OAuthBackend:
     def antigravity_token_url(self): return antigravity_provider.token_url()
     def antigravity_redirect_uri(self): return antigravity_provider.redirect_uri()
     def antigravity_api_base_url(self): return antigravity_provider.api_base_url()
+
+    def workbuddy_start_login(self, *, realm="cn", client_profile=None):
+        from src.oauth.workbuddy import start_login_sync
+        return start_login_sync(realm=realm, client_profile=client_profile)
+
+    def workbuddy_poll_login(self, payload):
+        from src.oauth.workbuddy import poll_login_sync
+        return poll_login_sync(payload)
+
+    def workbuddy_effects_enabled(self):
+        from src.oauth.workbuddy import effects_allowed
+        return effects_allowed()
+
+    def workbuddy_refresh_enabled(self):
+        from src.oauth.workbuddy import refresh_allowed
+        return refresh_allowed()
+
+    def workbuddy_snapshot(self, account_id: str):
+        from src.oauth.workbuddy.runtime import public_snapshot
+        return public_snapshot(self.get_account_exact(account_id), self.quota_load(account_id))
+
+    def workbuddy_inspect_action(self, account_id, action, **kwargs):
+        from src.oauth.workbuddy.actions import inspect
+        return inspect(account_id, action, **kwargs)
+
+    def workbuddy_execute_action(self, account_id, action, **kwargs):
+        from src.oauth.workbuddy.actions import execute
+        return execute(account_id, action, **kwargs)
+
+    def workbuddy_reconcile_pending(self, account_id):
+        from src.oauth.workbuddy.actions import reconcile_pending
+        return reconcile_pending(account_id)
+
+    def workbuddy_action_history(self, account_id, *, limit=50):
+        from src.oauth.workbuddy.actions import history
+        return history(account_id, limit=limit)
+
+    def workbuddy_credential_generation(self, account):
+        from src.oauth.workbuddy.runtime import credential_fingerprint
+        return credential_fingerprint(account)
+
+    def workbuddy_update_settings(self, account_id, current, auto_checkin):
+        return oauth_manager.mutate_account_if_unchanged(account_id, current,
+            lambda account: account.update(workbuddy_auto_checkin=auto_checkin))

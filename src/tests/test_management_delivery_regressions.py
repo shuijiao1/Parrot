@@ -5,6 +5,7 @@ import asyncio
 import copy
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import pytest
@@ -12,6 +13,7 @@ from fastapi.testclient import TestClient
 
 import server
 from src import config, log_db, oauth_manager
+from src.tests.test_log_db_round_handles import isolated_log_db
 from src.tests.test_management_channels_api import _reset_channels
 
 PREFIX = "/api/management/v1"
@@ -147,6 +149,49 @@ def test_oauth_local_cost_uses_real_billing_ticks(actual_management, ticks):
     assert local["requestCount"] == 1
     assert local["inputTokens"] == 10 and local["outputTokens"] == 3
     assert local["costUsd"] == (None if ticks is None else ticks / 10_000_000_000)
+
+
+@pytest.mark.parametrize("hour_bjt", [12, 3], ids=["month-start-eight-hours", "utc-still-previous-year"])
+def test_oauth_local_stats_use_telegram_bjt_month(actual_management, isolated_log_db, monkeypatch, hour_bjt):
+    client, runtime = actual_management
+    bjt = timezone(timedelta(hours=8))
+    month_start = datetime(2026, 1, 1, tzinfo=bjt)
+    now = month_start + timedelta(hours=hour_bjt)
+    monkeypatch.setattr(runtime.control_owner().oauth, "_clock", lambda: now.astimezone(timezone.utc))
+    account = {
+        "provider": "xai", "subject": f"month-boundary-{hour_bjt}",
+        "email": "month@example.test", "enabled": True,
+        "access_token": "month-regression-not-real", "models": [],
+    }
+    config.update(lambda current: current.update({"oauthAccounts": [account]}))
+    account_id = oauth_manager.get_account_key(account)
+    channel_key = "oauth:" + account_id
+    expected = {"requestCount": 0, "inputTokens": 0, "outputTokens": 0}
+    for index, seconds in enumerate((-1, 0, 3600, 9 * 3600)):
+        created_at = month_start + timedelta(seconds=seconds)
+        if created_at > now:
+            continue
+        handle = log_db.insert_pending(
+            f"month-{hour_bjt}-{index}", "127.0.0.1", "month-key", "month-model",
+            False, 1, 0, {}, {}, created_at=created_at.timestamp(),
+        )
+        log_db.finish_success(
+            handle, channel_key, "oauth", "month-model",
+            input_tokens=10 + index, output_tokens=3 + index,
+        )
+        if seconds >= 0:
+            expected["requestCount"] += 1
+            expected["inputTokens"] += 10 + index
+            expected["outputTokens"] += 3 + index
+    # The frozen TG rule is the first day at 00:00 UTC+8, not UTC midnight.
+    telegram_stats = log_db.tokens_for_channel(channel_key, month_start.timestamp())
+    assert telegram_stats["total"] == expected["requestCount"]
+    assert telegram_stats["input"] == expected["inputTokens"]
+    assert telegram_stats["output"] == expected["outputTokens"]
+    response = client.get(PREFIX + "/oauth/accounts/" + quote(account_id, safe=""))
+    assert response.status_code == 200, response.text
+    local = response.json()["data"]["localStats"]
+    assert {field: local[field] for field in expected} == expected
 
 
 @pytest.mark.parametrize("generated", [False, True])

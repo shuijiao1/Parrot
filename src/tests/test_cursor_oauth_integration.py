@@ -514,6 +514,134 @@ def test_cursor_channel_maps_chat_and_anthropic_controls(monkeypatch):
     assert responses_req.translator_ctx["response_translator"] == "responses_to_chat"
 
 
+def _cursor_effort_request(ingress: str, model: str, effort: str | None = None) -> dict:
+    body = {"model": model, "stream": True}
+    if ingress == "responses":
+        body.update({"input": "hello", "max_output_tokens": 128})
+        if effort is not None:
+            body["reasoning"] = {"effort": effort}
+    else:
+        body.update({"messages": [{"role": "user", "content": "hello"}], "max_tokens": 128})
+        if effort is not None:
+            if ingress == "anthropic":
+                body["output_config"] = {"effort": effort}
+            else:
+                body["reasoning_effort"] = effort
+    return body
+
+
+@pytest.mark.parametrize("ingress", ["chat", "responses", "anthropic"])
+@pytest.mark.parametrize("thinking_only", [False, True])
+def test_cursor_claude_default_matches_explicit_high(monkeypatch, ingress, thinking_only):
+    account = _install_account()
+    model = "claude-fable-5"
+    expected = "claude-fable-5-thinking-high"
+    if thinking_only:
+        model = "claude-haiku-4-5"
+        expected = "claude-4.5-haiku-thinking"
+        record = copy.deepcopy(account["cursor_model_catalog"]["models"][0])
+        record.update({
+            "id": model,
+            "legacy_slugs": ["claude-4.5-haiku", expected],
+        })
+        account["cursor_model_catalog"]["models"].append(record)
+        account["models"].append(model)
+
+    async def valid_token(_account_key):
+        return account["access_token"]
+
+    monkeypatch.setattr(oauth_manager, "ensure_valid_token", valid_token)
+    channel = CursorOAuthChannel(account)
+    source = _cursor_effort_request(ingress, model)
+    original = copy.deepcopy(source)
+    default_req = asyncio.run(channel.build_upstream_request(source, model, ingress_protocol=ingress))
+    explicit_req = asyncio.run(channel.build_upstream_request(
+        _cursor_effort_request(ingress, model, "high"), model, ingress_protocol=ingress,
+    ))
+    default_body = json.loads(default_req.body)
+    assert source == original
+    assert default_body == json.loads(explicit_req.body)
+    assert default_body["model"] == expected
+    assert default_body["reasoning_effort"] == "high"
+    assert default_req.translator_ctx["cursor_client_model"] == model
+    assert default_req.translator_ctx["cursor_actual_model"] == expected
+    assert expected in channel.cursor_metadata(model)["variants"]
+    if thinking_only:
+        assert "defaultReasoningEffort" not in channel.cursor_metadata(model)
+        assert channel.cursor_metadata(model)["reasoningEfforts"] == []
+
+
+@pytest.mark.parametrize("ingress", ["chat", "responses", "anthropic"])
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+def test_cursor_claude_default_preserves_explicit_effort(monkeypatch, ingress, effort):
+    account = _install_account()
+
+    async def valid_token(_account_key):
+        return account["access_token"]
+
+    monkeypatch.setattr(oauth_manager, "ensure_valid_token", valid_token)
+    request = asyncio.run(CursorOAuthChannel(account).build_upstream_request(
+        _cursor_effort_request(ingress, "claude-fable-5", effort),
+        "claude-fable-5", ingress_protocol=ingress,
+    ))
+    body = json.loads(request.body)
+    expected = "claude-fable-5-low" if effort == "low" else f"claude-fable-5-thinking-{effort}"
+    assert body["reasoning_effort"] == effort
+    assert body["model"] == expected
+
+
+@pytest.mark.parametrize(
+    ("ingress", "controls", "expected"),
+    [
+        ("chat", {"reasoning_effort": "none"}, "claude-fable-5-low"),
+        ("responses", {"reasoning": {"effort": "minimal"}}, "claude-fable-5-low"),
+        ("chat", {"service_tier": "priority"}, "claude-fable-5-medium"),
+        ("responses", {"_parrot_wants_fast_mode": True}, "claude-fable-5-medium"),
+        ("anthropic", {"thinking": {"type": "disabled"}}, "claude-fable-5-medium"),
+        ("anthropic", {"thinking": {"type": "enabled", "budget_tokens": 8000}}, "claude-fable-5-thinking-medium"),
+    ],
+)
+def test_cursor_claude_default_preserves_thinking_and_fast(monkeypatch, ingress, controls, expected):
+    account = _install_account()
+
+    async def valid_token(_account_key):
+        return account["access_token"]
+
+    monkeypatch.setattr(oauth_manager, "ensure_valid_token", valid_token)
+    source = _cursor_effort_request(ingress, "claude-fable-5")
+    source.update(controls)
+    request = asyncio.run(CursorOAuthChannel(account).build_upstream_request(
+        source, "claude-fable-5", ingress_protocol=ingress,
+    ))
+    assert json.loads(request.body)["model"] == expected
+
+
+@pytest.mark.parametrize("ingress", ["chat", "responses", "anthropic"])
+@pytest.mark.parametrize("model", ["composer-2.5", "gpt-5.5"])
+def test_cursor_claude_default_does_not_change_other_models(monkeypatch, ingress, model):
+    account = _install_account()
+
+    async def valid_token(_account_key):
+        return account["access_token"]
+
+    monkeypatch.setattr(oauth_manager, "ensure_valid_token", valid_token)
+    request = asyncio.run(CursorOAuthChannel(account).build_upstream_request(
+        _cursor_effort_request(ingress, model), model, ingress_protocol=ingress,
+    ))
+    body = json.loads(request.body)
+    assert body["model"] == model
+    assert "reasoning_effort" not in body
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [("claude-fable-5", "high"), ("composer-2.5", None), ("gpt-5.5", "medium")],
+)
+def test_cursor_claude_default_metadata_matches_channel_policy(model, expected):
+    channel = CursorOAuthChannel(_install_account())
+    assert channel.cursor_metadata(model).get("defaultReasoningEffort") == expected
+
+
 def test_cursor_channel_does_not_claim_image_transport():
     from src.protocols.matrix import capabilities_for_channel
 

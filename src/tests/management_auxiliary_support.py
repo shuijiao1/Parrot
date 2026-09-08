@@ -128,10 +128,10 @@ class FakeStatus:
         self.forgotten.append(provider)
         self.active[provider] = []
 
-    def refresh_provider(self, provider):
+    def refresh_provider(self, provider, *, raise_on_error=False):
         self.refreshes.append(provider)
 
-    def list_recent(self, provider, limit):
+    def list_recent(self, provider, limit, *, raise_on_error=False):
         return copy.deepcopy(self.active.get(provider, []))[:limit]
 
     def mute(self, provider, incident_id, name=""):
@@ -184,6 +184,9 @@ class FakeUpdates:
 
     def is_newer(self, version):
         return bool(version and version != self.current_version)
+
+    def check_latest(self):
+        return None
 
     def force_refresh(self):
         return None

@@ -91,8 +91,8 @@ class RefreshJob:
 
 
 def is_enabled() -> bool:
-    """与 OAuth 主动刷新/双实例测试共用 PARROT_NO_REFRESH 禁用语义。"""
-    return os.environ.get("PARROT_NO_REFRESH") != "1"
+    """Usage/balance queries do not rotate OAuth tokens; keep them available."""
+    return True
 
 
 def spec_for(channel: Any) -> AdapterSpec | None:

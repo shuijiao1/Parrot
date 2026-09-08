@@ -484,6 +484,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "xai": "5819115571463068721",
             "cursor": "6062261319426390107",
             "antigravity": "6077644693984779782",
+            "workbuddy": "6120617435214132136",
         },
         "providerBtnEmoji": {
             "openai": "🅾️",

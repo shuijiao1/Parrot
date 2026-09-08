@@ -132,10 +132,8 @@ class OAuthAccountMutationControlMixin:
         replace_plan_token: str | None = None,
         flow_binding: tuple[str, str] | None = None,
     ) -> OAuthMutationResult:
-        required = [
-            field for field in ("email", "access_token", "refresh_token")
-            if not entry.get(field)
-        ]
+        fields_required = ("uid", "access_token", "refresh_token") if entry.get("provider") == "workbuddy" else ("email", "access_token", "refresh_token")
+        required = [field for field in fields_required if not entry.get(field)]
         if required:
             raise ManagementError(
                 ManagementErrorCode.VALIDATION_FAILED,
@@ -206,7 +204,22 @@ class OAuthAccountMutationControlMixin:
     ) -> OAuthMutationResult:
         self._require(context, Capability.SECRETS_WRITE)
         try:
-            if command.replace_plan_token:
+            if flow_id.startswith("wbflow_"):
+                if command.completed is not True:
+                    raise ManagementError(ManagementErrorCode.INVALID_REQUEST)
+                device = self._flows.workbuddy
+                with device.lease(context.actor.subject_id, flow_id, flow_secret) as plan:
+                    entry = device.ready(plan)
+                    if command.replace_plan_token:
+                        result = self._commit_replace_plan(
+                            context, command.replace_plan_token, candidate=entry,
+                            flow_binding=(flow_id, flow_secret),
+                        )
+                    else:
+                        result = self._create_entry(context, entry, flow_binding=(flow_id, flow_secret))
+                    device.finish(context.actor.subject_id, flow_id, flow_secret, completed=True)
+                    plan.payload.clear()
+            elif command.replace_plan_token:
                 result = self._commit_replace_plan(
                     context,
                     command.replace_plan_token,

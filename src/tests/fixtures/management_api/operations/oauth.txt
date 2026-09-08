@@ -5,6 +5,15 @@ updateOAuthAccount
 deleteOAuthAccount
 reorderOAuthAccounts
 startOAuthLoginFlow
+pollOAuthLoginFlow
+cancelOAuthLoginFlow
+getOAuthWorkBuddyAccount
+refreshOAuthWorkBuddyStatus
+planOAuthWorkBuddyAction
+executeOAuthWorkBuddyAction
+listOAuthWorkBuddyActions
+updateOAuthWorkBuddySettings
+getOAuthWorkBuddyPolicy
 completeOAuthLoginFlow
 previewOAuthImport
 commitOAuthImport

@@ -34,6 +34,20 @@ class OAuthAccountOrchestrationControlMixin:
                     fields=(ErrorField("credential", "LEGACY_IDENTITY_MIGRATION", email),),
                 )
 
+    def prepare_account_save(
+        self,
+        context: ManagementContext,
+        entry: dict,
+    ) -> tuple[str, dict] | None:
+        """Validate identity before a caller stages any overwrite confirmation.
+
+        This preflight does not write or reserve an account. Add/replace retain
+        their commit-time guard because the account set can change while waiting.
+        """
+        self._require(context, Capability.SECRETS_WRITE)
+        self._ensure_legacy_identity_safe(entry)
+        return self.backend.find_exact_identity(entry)
+
     @staticmethod
     def _run_coroutine_sync(factory):
         """Run a coroutine from sync Control code, even under a caller event loop."""
@@ -242,20 +256,20 @@ class OAuthAccountOrchestrationControlMixin:
         effects.update(usage=None, usage_error=None, quota_action=None)
 
         provider = self.backend.provider_of(entry)
-        if provider not in {"openai", "cursor"}:
+        if provider not in {"openai", "cursor", "workbuddy"}:
             return effects
         try:
             if usage is None:
                 refreshed = self._refresh_usage_account(
                     account_id,
-                    email=str(entry.get("email") or ""),
+                    email=str(entry.get("email") or self.backend.account_email(account_id)),
                     tolerate_evaluation_error=True,
                 )
             else:
                 saved, quota_action = self._save_and_evaluate_usage(
                     account_id,
                     usage,
-                    email=str(entry.get("email") or ""),
+                    email=str(entry.get("email") or self.backend.account_email(account_id)),
                     tolerate_evaluation_error=True,
                 )
                 refreshed = {"usage": saved, "quota_action": quota_action}

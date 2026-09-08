@@ -1,4 +1,7 @@
 fastapi>=0.110
+# Management schemas use Pydantic 2 validators, JsonValue and StringConstraints.
+# Keep the explicitly tested compatibility floor; never accept Pydantic 1 via FastAPI.
+pydantic>=2.10.6,<3
 uvicorn>=0.29
 httpx[socks]>=0.27
 # Cursor OAuth AgentService bridge (protobuf over bidirectional HTTP/2).
@@ -22,6 +25,8 @@ socksio>=1.0,<2
 # starlette: imported directly in src/openai/responses_ws.py (WebSocketDisconnect/WebSocketState).
 # Pulled in via fastapi, but we use its API directly, so declare it explicitly.
 starlette>=0.46
+# Directly used to shield terminal/cleanup owners from ASGI level cancellation.
+anyio>=3.6.2,<5
 # python-socks: hidden runtime dependency. websockets dynamically imports python_socks when
 # connecting through a SOCKS5 proxy (src/failover.py + src/openai/responses_ws.py).
 # Without it: ImportError: connecting through a SOCKS proxy requires python-socks.

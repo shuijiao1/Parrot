@@ -21,7 +21,7 @@ from src.telegram.menus import (  # noqa: E402
 )
 
 
-PROVIDERS = ("claude", "openai", "xai", "cursor", "antigravity")
+PROVIDERS = ("claude", "openai", "xai", "cursor", "antigravity", "workbuddy")
 
 
 def test_provider_and_family_helpers_emit_custom_icons():
@@ -46,6 +46,20 @@ def test_provider_and_family_helpers_emit_custom_icons():
     openai_button = ui.family_button("openai", "family", suffix=" 协议")
     assert openai_button["text"] == "OpenAI、Grok、Cursor、Antigravity 协议"
     assert openai_button["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("openai")
+
+
+def test_workbuddy_custom_icon_is_consistent_in_defaults_messages_and_buttons(monkeypatch):
+    from src import config, notifier
+
+    expected = "6120617435214132136"
+    assert config.DEFAULT_CONFIG["telegramUi"]["providerCustomEmoji"]["workbuddy"] == expected
+    monkeypatch.setattr(ui, "_telegram_ui_provider_table", lambda name: {})
+    monkeypatch.setattr(notifier, "_telegram_ui_provider_table", lambda name: {})
+    assert ui.provider_custom_emoji_id("workbuddy") == expected
+    assert ui.provider_custom_emoji_html("workbuddy") == f'<tg-emoji emoji-id="{expected}">✉</tg-emoji>'
+    assert notifier.provider_tag("workbuddy") == ui.provider_tag("workbuddy")
+    assert ui.provider_button("WorkBuddy", "oa:wb:login", "workbuddy")["icon_custom_emoji_id"] == expected
+    assert "WorkBuddy" not in ui.family_label("openai")
 
 
 def test_oauth_and_status_buttons_use_provider_custom_icons(monkeypatch):
@@ -73,6 +87,8 @@ def test_oauth_and_status_buttons_use_provider_custom_icons(monkeypatch):
         "oa:set_rt:xai": "xai",
         "oa:login:cursor": "cursor",
         "oa:login:antigravity": "antigravity",
+        "oa:wb:login": "workbuddy",
+        "oa:wb:import": "workbuddy",
     }
     for callback, provider in expected.items():
         button = next(item for item in buttons if item.get("callback_data") == callback)

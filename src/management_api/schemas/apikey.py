@@ -127,7 +127,7 @@ class ApiKeyCreateRequest(StrictSchema):
 class ApiKeySecretData(StrictSchema):
     apiKey: ApiKeyData
     secret: str = Field(
-        json_schema_extra={"writeOnly": True, "examples": ["<one-time-secret>"]},
+        json_schema_extra={"examples": ["<one-time-secret>"]},
     )
 
 
@@ -164,7 +164,7 @@ class ApiKeyUpdateRequest(StrictSchema):
 class ApiKeyReplacementPlanData(StrictSchema):
     planId: str
     planToken: str = Field(
-        json_schema_extra={"writeOnly": True, "examples": ["<one-time-plan-token>"]},
+        json_schema_extra={"examples": ["<one-time-plan-token>"]},
     )
     keyId: str
     revision: str

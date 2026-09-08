@@ -17,7 +17,7 @@ mutation_lock = threading.RLock()
 _transition_keys: set[str] = set()
 _aliases: dict[str, str] = {}
 _deleted_keys: set[str] = set()
-# API channels keep their public/logical key (``api:<name>``), while request
+# Channels keep their public/logical key (``api:<name>`` / ``oauth:<identity>``), while request
 # attempts carry an opaque generation key.  Generation keys resolve to the
 # logical key only while their generation is live; a deleted generation is
 # tombstoned independently, so a same-name replacement cannot accept its late
@@ -25,6 +25,8 @@ _deleted_keys: set[str] = set()
 _generation_targets: dict[str, str] = {}
 _legacy_api_generations: dict[str, str] = {}
 _GENERATION_PREFIX = "api-generation:"
+_OAUTH_GENERATION_PREFIX = "oauth-generation:"
+_legacy_oauth_generations: dict[str, str] = {}
 
 
 def register_api_generation(channel_key: str, generation_id: str | None) -> str:
@@ -33,22 +35,31 @@ def register_api_generation(channel_key: str, generation_id: str | None) -> str:
     New entries persist ``generationId``.  Legacy entries without it receive a
     stable identity for this process (ordinary registry rebuilds reuse it).
     """
+    return _register_generation(channel_key, generation_id, _GENERATION_PREFIX, _legacy_api_generations)
+
+
+def register_oauth_generation(channel_key: str, generation_id: str | None) -> str:
+    """Use the same isolated attempt identity for OAuth account lifecycles."""
+    return _register_generation(channel_key, generation_id, _OAUTH_GENERATION_PREFIX, _legacy_oauth_generations)
+
+
+def _register_generation(channel_key: str, generation_id: str | None,
+                         prefix: str, legacy: dict[str, str]) -> str:
     import uuid
 
     with mutation_lock:
         generation = str(generation_id or "").strip()
         if not generation:
-            generation = _legacy_api_generations.setdefault(
-                channel_key, uuid.uuid4().hex,
-            )
-        generation_key = f"{_GENERATION_PREFIX}{generation}"
+            generation = legacy.setdefault(channel_key, uuid.uuid4().hex)
+        generation_key = f"{prefix}{generation}"
         existing = _generation_targets.get(generation_key)
         if (
             existing is not None
             and existing != channel_key
             and resolve(existing) != channel_key
+            and not (existing in _transition_keys and channel_key in _transition_keys)
         ):
-            raise ValueError(f"duplicate API channel generationId: {generation}")
+            raise ValueError(f"duplicate channel generationId: {generation}")
         _generation_targets[generation_key] = channel_key
         return generation_key
 
@@ -63,10 +74,22 @@ def _direct_target(channel_key: str) -> str:
 
 
 def generation_id(channel_key: str) -> str | None:
-    """Extract the persisted opaque id from an API attempt identity."""
-    if channel_key.startswith(_GENERATION_PREFIX):
-        return channel_key[len(_GENERATION_PREFIX):] or None
+    """Extract the persisted opaque id from a channel attempt identity."""
+    for prefix in (_GENERATION_PREFIX, _OAUTH_GENERATION_PREFIX):
+        if channel_key.startswith(prefix):
+            return channel_key[len(prefix):] or None
     return None
+
+
+def oauth_generations(channel_key: str) -> set[str]:
+    """Live attempt identities targeting one OAuth account, including renames."""
+    with mutation_lock:
+        target = resolve(channel_key)
+        return {
+            source for source in _generation_targets
+            if source.startswith(_OAUTH_GENERATION_PREFIX)
+            and not is_deleted(source) and resolve(source) == target
+        }
 
 
 @contextmanager

@@ -40,6 +40,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
+from ... import model_names
 from ...management_control.oauth import CchMode, OAuthUsageDisplayMode
 from ...management_control.oauth.menu_bridge import (
     OpenAIImportParseError,
@@ -58,6 +59,7 @@ from ...management_control.oauth.menu_bridge import (
 )
 from .. import menu_cache, states, ui
 from . import main as main_menu
+from . import workbuddy_oauth_menu as workbuddy_menu
 from .sort_primitives import (
     move_bottom as _move_bottom,
     move_down as _move_down,
@@ -286,7 +288,7 @@ def _persist_new_or_stage_overwrite(
     provider = oauth_control.provider_of_snapshot(entry)
     if provider == "openai" and not _openai_workspace_id(entry):
         raise ValueError("OpenAI token 缺少 workspace identity，无法安全判断账户")
-    duplicate = oauth_control.find_exact_identity_snapshot(entry)
+    duplicate = oauth_control.prepare_account_save(_management_context(chat_id), entry)
     if duplicate is None:
         added = oauth_control.add_account_entry(
             _management_context(chat_id), entry, usage=usage, defer_post_save=True,
@@ -681,6 +683,9 @@ def _quota_cache_has_usage_signal(row: dict | None) -> bool:
 
 
 def _should_refresh_account_for_ui(acc: dict | None) -> bool:
+    if acc and oauth_control.provider_of_snapshot(acc) == "workbuddy":
+        # WorkBuddy pages read local snapshots only, even when email is present.
+        return False
     if not acc or not acc.get("email"):
         return False
     # 用户手动禁用 / auth_error 不做自动远端刷新；quota 禁用需要刷新，
@@ -688,8 +693,12 @@ def _should_refresh_account_for_ui(acc: dict | None) -> bool:
     return acc.get("disabled_reason") not in ("user", "auth_error")
 
 
-def _refreshable_account_keys_for_ui(accounts: list[dict]) -> list[str]:
-    return [_account_key(a) for a in accounts if _should_refresh_account_for_ui(a)]
+def _refreshable_account_keys_for_ui(accounts: list[dict], *, explicit: bool = False) -> list[str]:
+    return [_account_key(a) for a in accounts if _should_refresh_account_for_ui(a) or (
+        explicit and oauth_control.provider_of_snapshot(a) == "workbuddy"
+        and a.get("disabled_reason") not in ("user", "auth_error")
+        and (a.get("enabled", True) or a.get("disabled_reason") == "quota")
+    )]
 
 
 def _needs_initial_oauth_cache_sync_for_ui(account_key: str, *, include_details: bool = False) -> bool:
@@ -1754,7 +1763,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         tag = " [用户禁用]"
     elif reason == "quota":
         du = acc.get("disabled_until")
-        tag = f" [配额禁用 · 预计 {_format_bjt(du)}]"
+        tag = " [配额禁用]" if prov == "workbuddy" and not du else f" [配额禁用 · 预计 {_format_bjt(du)}]"
     elif reason == "auth_error":
         tag = " [认证失败]"
 
@@ -1768,7 +1777,9 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
     )
 
     # 套餐行
-    if prov == "openai":
+    if prov == "workbuddy":
+        lines.append(workbuddy_menu.provider_line(acc))
+    elif prov == "openai":
         plan = acc.get("plan_type") or ""
         workspace = _openai_workspace_label(acc)
         ws_suffix = f"（{ui.escape_html(workspace)}）" if workspace else ""
@@ -1812,7 +1823,9 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
     # 用量（5h / 7d）。Claude/OpenAI 百分比来自上游全局配额；Grok
     # 展示官方当前周期额度 + Parrot 本地累计金额/token。
     _now_ts = time.time()
-    if prov == "cursor":
+    if prov == "workbuddy":
+        lines.extend(workbuddy_menu.usage_block(ak).splitlines())
+    elif prov == "cursor":
         lines.extend(_format_cursor_usage_block(ak, detail=False).splitlines())
     elif prov == "xai":
         lines.extend(_format_xai_official_block(ak, detail=False).splitlines())
@@ -1925,6 +1938,10 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
                 ak, ts, local_period["money_label"],
             ))
 
+    if prov == "workbuddy" and not stats_loading and not _has_local_usage_or_billing(ts):
+        lines.append(f"💎 {local_period['usage_label']}: ↑ 0 · ↓ 0")
+        lines.append(f"💵 {local_period['money_label']} $0.00")
+
     # 冷却状态
     ck = f"oauth:{ak}"
     cds = [
@@ -1953,6 +1970,8 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
     period_stats = _account_period_stats(
         account_key, local_period, month_snapshot=month_snapshot,
     )
+    if provider == "workbuddy":
+        return workbuddy_menu.usage_block(account_key, detail=True)
     if provider == "cursor":
         return _format_cursor_usage_block(account_key, detail=True)
     if provider == "antigravity":
@@ -3009,7 +3028,7 @@ def _format_month_stats_block(account_key: str, *,
         lines.append("")
         lines.append("按模型:")
         for ms in by_model:
-            model = ui.escape_html(ms.get("final_model") or "?")
+            model = ui.escape_html(model_names.for_channel(f"oauth:{account_key}", ms.get("final_model") or "?"))
             m_prompt = ui.prompt_total(ms["input"], ms["cache_creation"], ms["cache_read"])
             model_line = (
                 f"    {ms['total']} 次 · ✅ {ms['success_count']} · ❌ {ms['error_count']}"
@@ -3038,7 +3057,8 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
                         reset_credit_count_override: int | None = None,
                         month_snapshot: dict | None = None,
                         model_stats: list[dict] | None = None,
-                        stats_loading: bool = False) -> tuple[Optional[str], Optional[dict]]:
+                        stats_loading: bool = False,
+                        workbuddy_package_page: int = 1) -> tuple[Optional[str], Optional[dict]]:
     acc = oauth_control.account_snapshot(account_key)
     if acc is None:
         return None, None
@@ -3071,7 +3091,9 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     )
     reset_credit_details = _openai_reset_credit_details_from_row(quota_row) if prov == "openai" else None
     provider_line = ""
-    if prov == "openai":
+    if prov == "workbuddy":
+        provider_line = workbuddy_menu.provider_line(acc, detail=True) + "\n"
+    elif prov == "openai":
         plan = acc.get("plan_type") or "?"
         workspace = _openai_workspace_label(acc, force=True)
         ws_suffix = f"（{ui.escape_html(workspace)}）" if workspace and _openai_same_email_count(acc) > 1 else ""
@@ -3135,6 +3157,11 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     max_cc = int(acc.get("maxConcurrent", 0) or 0)
     max_cc_label = str(max_cc) if max_cc > 0 else "默认"
     prov_icon = _provider_tag(prov)
+    usage_text = (
+        workbuddy_menu.usage_block(account_key, detail=True, package_page=workbuddy_package_page)
+        if prov == "workbuddy" else
+        _format_usage_block(account_key, month_snapshot=month_snapshot, stats_loading=stats_loading)
+    )
     text = (
         f"{icon} <b>{ui.escape_html(email)}</b> {prov_icon}\n\n"
         f"状态: <code>{ui.escape_html('enabled' if acc.get('enabled', True) and not acc.get('disabled_reason') else reason)}</code>\n"
@@ -3142,7 +3169,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         f"⚡ 并发上限: <code>{max_cc_label}</code>\n"
         f"⏳ Token: <code>{_fmt_time_full(acc.get('expired'))}</code>\n"
         f"🔄 刷新: <code>{_format_bjt(acc.get('last_refresh'))}</code>\n\n"
-        f"<b>📊 使用量</b>\n{_format_usage_block(account_key, month_snapshot=month_snapshot, stats_loading=stats_loading)}"
+        f"<b>📊 使用量</b>\n{usage_text}"
     )
     reset_cards_block = (
         _format_reset_credit_cards_block(
@@ -3172,7 +3199,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         text += "\n\n<b>⚠ 冷却中的模型：</b>\n"
         now_ms = int(__import__('time').time() * 1000)
         for e in cd_models:
-            mdl = ui.escape_html(e["model"])
+            mdl = ui.escape_html(model_names.for_channel(ck, e["model"]))
             cu = e.get("cooldown_until")
             if cu == -1:
                 text += f"  🔴 <code>{mdl}</code> — 永久冻结"
@@ -3186,7 +3213,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         [ui.btn("🔄 刷新 Token", f"oa:refresh_token:{payload}"),
          ui.btn("📊 刷新额度", f"oa:refresh_usage:{payload}")],
     ]
-    # All five OAuth providers enter the same model-management experience.
+    # All OAuth providers enter the same model-management experience.
     # Legacy oa:cursor_* handlers remain below for already-sent messages.
     manage_models_cb = f"oam:open:{short}:1:{max(1, int(page or 1))}:{filter_key}"
     rows += [
@@ -3197,6 +3224,10 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         [ui.btn(toggle_label, f"oa:toggle:{payload}"),
          ui.btn("🗑 删除账户", f"oa:delete_ask:{payload}")],
     ]
+    if prov == "workbuddy":
+        nav = (short, max(1, int(page or 1)), filter_key)
+        rows.extend(workbuddy_menu.package_page_buttons(account_key, nav, workbuddy_package_page))
+        rows.append([ui.btn("🎁 签到/领额度", workbuddy_menu._cb("activity", nav))])
     if prov == "openai":
         rows.append([ui.btn("♻️ 重置额度", f"oa:reset_quota_ask:{payload}")])
     elif acc.get("disabled_reason") == "quota":
@@ -3316,6 +3347,11 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
     ui.answer_cb(cb_id, "刷新中...")
 
     provider = oauth_control.provider_of_snapshot(ak)
+    if provider == "workbuddy" and not oauth_control.workbuddy_refresh_enabled_snapshot():
+        text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
+        if text:
+            ui.edit(chat_id, message_id, "🛡 保护模式已阻止刷新 Token，未发出刷新请求。\n\n" + text, reply_markup=kb)
+        return
     result = _run_sync(oauth_control.force_refresh_raw(ak))
     if isinstance(result, Exception):
         ui.send(chat_id, _oauth_error_html(
@@ -3360,6 +3396,13 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         return
     email = _account_email(ak)
     provider = oauth_control.provider_of_snapshot(ak)
+    if provider == "workbuddy":
+        ui.answer_cb(cb_id, "查询中…")
+        def render_query(feedback):
+            text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
+            return (feedback + "\n\n" + text if text else None), kb
+        workbuddy_menu.start_status_query(chat_id, message_id, ak, render_query, control=oauth_control)
+        return
     if provider == "openai":
         ui.answer_cb(cb_id, "拉取 OpenAI 用量/重置卡...")
     elif provider == "xai":
@@ -3630,7 +3673,7 @@ def _cursor_disable_text_and_kb(data: dict) -> tuple[str, dict] | None:
     for index, model_id in enumerate(models, start=1):
         status = "🚫" if model_id in selected else "✅"
         lines.append(
-            f"{index}. {status} <code>{ui.escape_html(model_id)}</code>"
+            f"{index}. {status} <code>{ui.escape_html(model_names.public_id('cursor', model_id))}</code>"
         )
 
     short = ui.register_code(account_key)
@@ -3805,7 +3848,7 @@ def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) ->
     for offset, item in enumerate(selected, start=1):
         display_index = start + offset
         model_id = str(item.get("id") or "")
-        name = str(item.get("name") or model_id)
+        name = model_names.display_name("cursor", model_id, item.get("name"))
         context = int(item.get("context_window") or 0)
         max_context = int(item.get("context_window_max_mode") or context)
         default_max = (
@@ -3818,7 +3861,7 @@ def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) ->
         disabled_suffix = " · 🚫 <b>已禁用</b>" if model_id in disabled_models else ""
         lines.extend([
             "",
-            f"<b>{display_index}. {ui.escape_html(name)}</b> · <code>{ui.escape_html(model_id)}</code>{disabled_suffix}",
+            f"<b>{display_index}. {ui.escape_html(name)}</b> · <code>{ui.escape_html(model_names.public_id('cursor', model_id))}</code>{disabled_suffix}",
             f"上下文：<code>{ui.fmt_tokens(effective_context)}</code>{context_suffix} · 推理 {'✅' if item.get('reasoning') else '—'} · 图片上游 {'✅' if item.get('supports_images') else '—'}",
         ])
         if effort_text:
@@ -3864,7 +3907,7 @@ def on_cursor_model_detail(chat_id: int, message_id: int, cb_id: str, payload: s
         return
     account_key, acc, item = resolved
     model_id = str(item.get("id") or "")
-    name = str(item.get("name") or model_id)
+    name = model_names.display_name("cursor", model_id, item.get("name"))
     model_disabled = model_id in oauth_control.cursor_disabled_models_snapshot(acc)
     context = int(item.get("context_window") or 0)
     max_context = int(item.get("context_window_max_mode") or context)
@@ -3880,7 +3923,7 @@ def on_cursor_model_detail(chat_id: int, message_id: int, cb_id: str, payload: s
     lines = [
         f"🧬 <b>{ui.escape_html(name)}</b>",
         f"账户：<code>{ui.escape_html(_account_display(acc))}</code>",
-        f"模型：<code>{ui.escape_html(model_id)}</code>",
+        f"模型：<code>{ui.escape_html(model_names.public_id('cursor', model_id))}</code>",
         f"使用状态：{'🚫 已禁用' if model_disabled else '✅ 已启用'}",
         "",
     ]
@@ -4239,6 +4282,8 @@ def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str, page: i
     acc = oauth_control.account_snapshot(ak)
     email = (acc or {}).get("email") or _account_email(ak)
     prov = oauth_control.provider_of_snapshot(ak)
+    if prov == "workbuddy" and acc:
+        email = _account_display(acc)
     prov_tag = _provider_tag(prov)
     ui.answer_cb(cb_id)
     ui.edit(
@@ -4684,7 +4729,7 @@ def _run_refresh_all_legacy_panel(chat_id: int, progress_mid: int, account_keys:
 def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ui.answer_cb(cb_id, "开始刷新用量/重置卡...")
     accounts = oauth_control.account_entries_snapshot()
-    account_keys = _refreshable_account_keys_for_ui(accounts)
+    account_keys = _refreshable_account_keys_for_ui(accounts, explicit=True)
     if not account_keys:
         ui.send(chat_id, "❌ 当前无可刷新的 OAuth 账户")
         return
@@ -4728,11 +4773,12 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1, fil
 def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
     """新增 OAuth 账户：把常用登录/导入入口扁平化到一级。"""
     # 这里也是所有新增流程的「取消」落点，进入时清掉等待输入状态，避免后续文本误触发旧流程。
+    workbuddy_menu.discard_state(chat_id)
     states.pop_state(chat_id)
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
-        f"<b>新增 OAuth 账户</b>\n请选择类型：\n\n{_provider_tag('claude')}、{_provider_tag('openai')}、{_provider_tag('xai')}、{_provider_tag('cursor')}、{_provider_tag('antigravity')}",
+        f"<b>新增 OAuth 账户</b>\n请选择类型：\n\n{_provider_tag('claude')}、{_provider_tag('openai')}、{_provider_tag('xai')}、{_provider_tag('cursor')}、{_provider_tag('antigravity')}、{_provider_tag('workbuddy')}",
         reply_markup=ui.inline_kb([
             [ui.provider_button("Claude 登录获取 Token", "oa:login", "claude")],
             [ui.provider_button("Claude 手动设置 JSON", "oa:set_json", "claude")],
@@ -4744,6 +4790,9 @@ def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
             [ui.provider_button("Antigravity 登录获取 Token", "oa:login:antigravity", "antigravity")],
             [ui.provider_button("OpenAI 导入 Sub2API 文件", "oa:import:sub2api", "openai")],
             [ui.provider_button("OpenAI 导入 CPA 文件", "oa:import:cpa", "openai")],
+            [ui.provider_button("WorkBuddy 中国区登录", "oa:wb:login", "workbuddy")],
+            [ui.provider_button("WorkBuddy 国际区登录", "oa:wb:login:global", "workbuddy")],
+            [ui.provider_button("WorkBuddy 中国区 JSON 导入", "oa:wb:import", "workbuddy")],
             [ui.btn("◀ 返回列表", "menu:oauth")],
             [ui.btn("🏠 返回主菜单", "menu:main")],
         ]),
@@ -6175,7 +6224,7 @@ def on_import_openai_overwrite(chat_id: int, message_id: int, cb_id: str, nonce:
 def _invalid_accounts() -> list[dict]:
     return [
         a for a in oauth_control.account_entries_snapshot()
-        if a.get("email") and a.get("disabled_reason") == "auth_error"
+        if (a.get("email") or oauth_control.provider_of_snapshot(a) == "workbuddy") and a.get("disabled_reason") == "auth_error"
     ]
 
 
@@ -6204,7 +6253,7 @@ def _render_invalid_remove(chat_id: int, message_id: int, *, selected: set[str] 
     else:
         for idx, acc in enumerate(invalid, 1):
             ak = _account_key(acc)
-            email = acc.get("email") or "?"
+            email = _account_display(acc) if oauth_control.provider_of_snapshot(acc) == "workbuddy" else acc.get("email") or "?"
             mark = "✅ " if ak in selected else "☐ "
             lines.append(f"{idx}. <code>{ui.escape_html(email)}</code>")
             rows.append([ui.btn(f"{mark}{email}", f"oa:invalid:toggle:{_invalid_select_token(ak)}")])
@@ -6305,6 +6354,8 @@ def on_clear_all_errors(chat_id: int, message_id: int, cb_id: str, page: int = 1
 
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
+    if workbuddy_menu.handle_callback(chat_id, message_id, cb_id, data):
+        return True
     if data == "menu:oauth":
         show(chat_id, message_id, cb_id)
         return True
@@ -6533,6 +6584,9 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
 
 
 def handle_text_state(chat_id: int, action: str, text: str) -> bool:
+    if action == "oa_wb_import":
+        workbuddy_menu.import_payload(chat_id, text)
+        return True
     if action == "oa_login_code":
         on_login_code_input(chat_id, text)
         return True
@@ -6570,6 +6624,9 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
 
 
 def handle_document_state(chat_id: int, action: str, msg: dict) -> bool:
+    if action == "oa_wb_import":
+        workbuddy_menu.handle_document(chat_id, msg)
+        return True
     if action == "oa_openai_import":
         on_import_openai_document_input(chat_id, msg)
         return True

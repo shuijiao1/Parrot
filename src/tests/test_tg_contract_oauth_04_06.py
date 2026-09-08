@@ -433,7 +433,25 @@ RUNNERS = {"TG-OA-04": _run_oa04, "TG-OA-05": _run_oa05, "TG-OA-06": _run_oa06}
 
 @pytest.mark.parametrize("case", CASES, ids=lambda item: item["caseId"])
 def test_oauth_04_06_strict_trace(case, monkeypatch):
-    check_trace(case, RUNNERS[case["capabilityId"]](case, monkeypatch))
+    observed = RUNNERS[case["capabilityId"]](case, monkeypatch)
+    expected = case
+    if case["caseId"] in {"TG-OA-04.add_menu_cancel", "TG-OA-06.import_cancel"}:
+        # The v0.31.13 recording stays immutable. This explicitly approved
+        # feature delta adds exactly two WorkBuddy entry rows, without masking
+        # any actual output, state changes, existing labels, or old row order.
+        from copy import deepcopy
+        expected = deepcopy(case)
+        payload = expected["tgApi"][1]["payload"]
+        assert payload["text"].startswith("<b>新增 OAuth 账户</b>")
+        payload["text"] += '、<tg-emoji emoji-id="6120617435214132136">✉</tg-emoji> WorkBuddy'
+        rows = payload["reply_markup"]["inline_keyboard"]
+        assert len(rows) == 12 and rows[-2][0]["callback_data"] == "menu:oauth"
+        rows[-2:-2] = [
+            [{"text": "WorkBuddy 中国区登录", "callback_data": "oa:wb:login", "icon_custom_emoji_id": "6120617435214132136"}],
+            [{"text": "WorkBuddy 国际区登录", "callback_data": "oa:wb:login:global", "icon_custom_emoji_id": "6120617435214132136"}],
+            [{"text": "WorkBuddy 中国区 JSON 导入", "callback_data": "oa:wb:import", "icon_custom_emoji_id": "6120617435214132136"}],
+        ]
+    check_trace(expected, observed)
 
 
 @pytest.mark.parametrize(

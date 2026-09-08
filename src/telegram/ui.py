@@ -752,10 +752,11 @@ PROVIDER_CUSTOM_EMOJI = {
     "xai": "5819115571463068721",
     "cursor": "6062261319426390107",
     "antigravity": "6077644693984779782",
+    "workbuddy": "6120617435214132136",
 }
 PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦", "cursor": "🖱️", "antigravity": "✨"}
-PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity"}
-PROVIDER_FULL_LABEL = {"claude": "Anthropic Claude", "anthropic": "Anthropic Claude", "openai": "OpenAI", "xai": "xAI Grok", "cursor": "Cursor OAuth", "antigravity": "Antigravity"}
+PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity", "workbuddy": "WorkBuddy"}
+PROVIDER_FULL_LABEL = {"claude": "Anthropic Claude", "anthropic": "Anthropic Claude", "openai": "OpenAI", "xai": "xAI Grok", "cursor": "Cursor OAuth", "antigravity": "Antigravity", "workbuddy": "WorkBuddy"}
 
 
 def _provider_key(provider: str | None) -> str:
@@ -914,8 +915,8 @@ def channel_display_name(channel_key: Any, *, with_family: bool = True) -> str:
     """Human-facing channel name for TG UI.
 
     Internal channel keys may contain OpenAI workspace ids. Never show those raw
-    keys in user-facing menus/logs; resolve OAuth channels back to email and use
-    only a short provider tag for disambiguation.
+    keys in user-facing menus/logs; resolve OAuth channels back to a display name
+    or email and use only a short provider tag for disambiguation.
     """
     key = str(channel_key or "?")
     if key.startswith("oauth:"):
@@ -929,6 +930,8 @@ def channel_display_name(channel_key: Any, *, with_family: bool = True) -> str:
                     (acc.get("label") or acc.get("email") or "?")
                     if provider == "cursor" else (acc.get("email") or "?")
                 )
+                if provider == "workbuddy":
+                    name = str(acc.get("label") or acc.get("nickname") or acc.get("email") or acc.get("uid") or "?")
                 if provider == "openai":
                     same_email_count = sum(
                         1 for item in oauth_manager.list_accounts()

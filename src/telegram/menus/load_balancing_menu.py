@@ -41,7 +41,7 @@ def _all_channels() -> list:
 def _channel_icon(ch, *, model_context: bool = False) -> str:
     if ch.type == "oauth":
         provider = load_balancing_control.provider_from_channel_key(ch.key)
-        if provider in {"openai", "xai", "cursor", "claude", "antigravity"}:
+        if provider in {"openai", "xai", "cursor", "claude", "antigravity", "workbuddy"}:
             return f"{ui.provider_custom_emoji_html(provider)} 🔐"
         return "✉ 🔐"
     return "🤖" if model_context else "📡"

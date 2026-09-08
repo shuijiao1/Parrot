@@ -8,7 +8,7 @@
 import hmac
 from typing import Optional
 
-from . import config
+from . import config, model_names
 
 
 def validate(headers) -> tuple[Optional[str], list[str], Optional[str]]:
@@ -42,7 +42,7 @@ def validate(headers) -> tuple[Optional[str], list[str], Optional[str]]:
         if hmac.compare_digest(str(key_value), token):
             if entry.get("enabled") is False:
                 return None, [], "API key is disabled"
-            allowed = list(entry.get("allowedModels") or [])
+            allowed = model_names.expand_legacy_permissions(list(entry.get("allowedModels") or []))
             return name, allowed, None
 
     return None, [], "Invalid API key"

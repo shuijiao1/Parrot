@@ -154,7 +154,8 @@ def test_openapi_exact_operation_ids_typed_schemas_examples_and_write_only(tmp_p
         assert schemas["ApiKeyCreateRequest"]["properties"]["customSecret"]["writeOnly"] is True
         assert schemas["ApiKeyReplaceSecretRequest"]["properties"]["customSecret"]["writeOnly"] is True
         assert schemas["ApiKeyRegenerateRequest"]["properties"]["planToken"]["writeOnly"] is True
-        assert schemas["ApiKeySecretData"]["properties"]["secret"]["writeOnly"] is True
+        assert not schemas["ApiKeySecretData"]["properties"]["secret"].get("writeOnly", False)
+        assert not schemas["ApiKeyReplacementPlanData"]["properties"]["planToken"].get("writeOnly", False)
         serialized = json.dumps(document, ensure_ascii=False)
         assert "alpha-secret" not in serialized
         assert "client-secret+/=" not in serialized

@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
-from . import config, model_pricing
+from . import config, model_names, model_pricing
 
 SUMMARY_OUTPUT_RESERVE_TOKENS = 20_000
 DEFAULT_COMPACT_BUFFER_TOKENS = 20_000
@@ -399,6 +399,12 @@ def resolve_binding(
     scope = normalize_model_name(scope_key) or None
     if not model:
         return None
+    # Provider-owned public names read through old raw-ID bindings in the same
+    # account scope. Never migrate config or resolve aliases across providers.
+    legacy_model = model_names.upstream_for_channel(scope, model)
+    lookup_models = [model] if legacy_model == model else [model, legacy_model]
+    if legacy_model != model and not outbound_model:
+        outbound_model = legacy_model
     native = _oauth_account_record(model, scope_key=scope, outbound_model=outbound_model)
     # A Cursor account without a matching AvailableModels record is not a
     # routable/capability source. Fail closed before scoped/default/legacy
@@ -409,24 +415,26 @@ def resolve_binding(
     defaults, scoped = _binding_roots(cfg)
     if scope:
         scope_bindings = scoped.get(scope) or {}
-        if isinstance(scope_bindings, Mapping) and model in scope_bindings:
+        for lookup in lookup_models:
+            if isinstance(scope_bindings, Mapping) and lookup in scope_bindings:
+                binding = _record_for(
+                    model, scope_bindings.get(lookup), scope_key=scope,
+                    known_outbound_model=outbound_model,
+                )
+                if binding is not None:
+                    return MetadataBinding(
+                        **{**binding.__dict__, "metadata": _merge_effective_metadata(binding.metadata, native)}
+                    )
+    for lookup in lookup_models:
+        if lookup in defaults:
             binding = _record_for(
-                model, scope_bindings.get(model), scope_key=scope,
-                known_outbound_model=outbound_model,
+                model, defaults.get(lookup), scope_key=None,
+                known_outbound_model=None,
             )
             if binding is not None:
                 return MetadataBinding(
                     **{**binding.__dict__, "metadata": _merge_effective_metadata(binding.metadata, native)}
                 )
-    if model in defaults:
-        binding = _record_for(
-            model, defaults.get(model), scope_key=None,
-            known_outbound_model=None,
-        )
-        if binding is not None:
-            return MetadataBinding(
-                **{**binding.__dict__, "metadata": _merge_effective_metadata(binding.metadata, native)}
-            )
     # Read-through compatibility before the one-time startup migration has run.
     legacy_target = _legacy_default_target(model, cfg)
     if legacy_target:
@@ -438,9 +446,12 @@ def resolve_binding(
             return MetadataBinding(
                 **{**binding.__dict__, "metadata": _merge_effective_metadata(binding.metadata, native)}
             )
-    return _account_native_binding(
-        model, scope_key=scope, outbound_model=outbound_model,
+    binding = _account_native_binding(
+        legacy_model, scope_key=scope, outbound_model=outbound_model,
     )
+    if binding is not None and legacy_model != model:
+        return MetadataBinding(**{**binding.__dict__, "client_visible_model": model})
+    return binding
 
 
 def set_binding(

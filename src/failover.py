@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import re
 import time
@@ -123,6 +124,18 @@ _codex_snapshot_lock = threading.Lock()
 _codex_snapshot_inflight: set[str] = set()
 
 
+def _live_oauth_effect(function):
+    """Short response-side effects cannot cross a delete/re-add boundary."""
+    from functools import wraps
+    @wraps(function)
+    def guarded(ch, *args, **kwargs):
+        with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
+            if current:
+                return function(ch, *args, **kwargs)
+    return guarded
+
+
+@_live_oauth_effect
 def _maybe_record_codex_snapshot(
     ch: Channel, resp: Any, translator_ctx: dict | None = None,
 ) -> None:
@@ -190,6 +203,7 @@ _anthropic_snapshot_lock = threading.Lock()
 _anthropic_snapshot_inflight: set[str] = set()
 
 
+@_live_oauth_effect
 def _maybe_record_anthropic_snapshot(ch: Channel, resp: httpx.Response) -> None:
     # 延迟 import 避免循环依赖
     from .channel.oauth_channel import OAuthChannel
@@ -2182,7 +2196,9 @@ async def run_failover(
                 account_key = getattr(ch, "account_key", None)
                 if account_key:
                     try:
-                        oauth_manager.set_disabled_by_quota(account_key, None)
+                        with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
+                            if current:
+                                oauth_manager.set_disabled_by_quota(account_key, None)
                     except Exception as exc:
                         print(f"[failover] Antigravity quota disable failed for {account_key}: {exc}")
                 retry_count += 1
@@ -2260,6 +2276,9 @@ async def run_failover(
             _recovery_retry_allowed("oauthRefresh", cfg)
             and ch.type == "oauth"
             and result.http_status in (401, 403)
+            and (getattr(ch, "provider", "") != "workbuddy" or (
+                result.http_status == 401 and os.environ.get("PARROT_NO_REFRESH") != "1"
+            ))
             and not result.openai_oauth_html_403
             and quota_exhaustion is None
             and ch.key not in refreshed_once
@@ -2267,15 +2286,30 @@ async def run_failover(
             refreshed_once.add(ch.key)
             ak = getattr(ch, "account_key", None) or getattr(ch, "email", "")
             try:
-                await oauth_manager.force_refresh(ak)
+                expected = getattr(ch, "state_key", None)
+                if expected is None:
+                    await oauth_manager.force_refresh(ak)
+                else:
+                    await oauth_manager.force_refresh(ak, expected_state_key=expected)
+                with oauth_manager.account_generation_guard(expected) as current:
+                    if not current:
+                        raise ValueError("OAuth account generation was deleted")
                 print(f"[failover] OAuth 401/403 on {ch.key}, refreshed; retrying same channel")
                 retry_count += 1
                 continue
             except Exception as exc:
                 print(f"[failover] OAuth refresh failed for {ch.key}: {exc}")
+                with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
+                    if not current:
+                        retry_count += 1
+                        idx += 1
+                        continue
                 email = getattr(ch, "email", "?")
+                disable_auth = getattr(ch, "provider", "") != "workbuddy" or getattr(exc, "auth_error", False)
                 try:
-                    oauth_manager.set_enabled(ak, False, reason="auth_error")
+                    with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
+                        if disable_auth and current:
+                            oauth_manager.set_enabled(ak, False, reason="auth_error")
                 except Exception:
                     pass
                 try:
@@ -2286,7 +2320,8 @@ async def run_failover(
                         "⚠ <b>OAuth Token 刷新失败</b>（请求路径触发）\n"
                         f"账号: <code>{ek(email)}</code> · {notifier.provider_tag(prov)}\n"
                         f"原因: <code>{ek(str(exc))}</code>\n"
-                        "账号已被自动禁用 (auth_error)。请通过 TG Bot 重新登录或粘贴新 JSON。"
+                        + ("账号已被自动禁用 (auth_error)。请通过 TG Bot 重新登录或粘贴新 JSON。"
+                           if disable_auth else "账号未自动禁用；请稍后重试。")
                     )
                 except Exception:
                     pass
@@ -2923,9 +2958,11 @@ def _capture_codex_response_event(
 ) -> bool:
     captured = capture_turn_state_event(translator_ctx, frame)
     if isinstance(ch, OpenAIOAuthChannel):
-        oauth_manager.observe_openai_response_event(
-            ch.account_key, frame, translator_ctx,
-        )
+        with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
+            if current:
+                oauth_manager.observe_openai_response_event(
+                    ch.account_key, frame, translator_ctx,
+                )
     return captured
 
 
@@ -4058,7 +4095,6 @@ async def _consume_oauth_responses_ws_stream(
     async def finalize_success() -> None:
         if state["finalized"]:
             return
-        state["finalized"] = True
         timing_snapshot = await persist_terminal("success")
         request_elapsed_ms = _elapsed_ms(start_monotonic)
         total_ms = timing_snapshot.total_ms
@@ -4102,11 +4138,11 @@ async def _consume_oauth_responses_ws_stream(
             upstream_protocol="openai-responses", upstream_transport="ws",
             proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
         ))
+        state["finalized"] = True
 
     async def finalize_error(result: AttemptResult) -> None:
         if state["finalized"]:
             return
-        state["finalized"] = True
         await persist_terminal(result.outcome, result.error_detail)
         # encrypted_content 只做透明透传；无本地 cache 需要清理。
         await _finalize_oauth_ws_error(
@@ -4114,11 +4150,11 @@ async def _consume_oauth_responses_ws_stream(
             affinity_hit, start_time, start_monotonic, connect_ms, first_byte_ms,
             tracker, proxy_name, proxy_bytes, identity_state, timing,
         )
+        state["finalized"] = True
 
     async def finalize_disconnect() -> None:
         if state["finalized"]:
             return
-        state["finalized"] = True
         timing_snapshot = await persist_terminal(
             "client_disconnected", "client disconnected",
         )
@@ -4141,15 +4177,20 @@ async def _consume_oauth_responses_ws_stream(
             upstream_protocol="openai-responses", upstream_transport="ws",
             proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
         )
+        state["finalized"] = True
 
     async def stream_generator():
         try:
+            # A terminal-only first batch is already a complete upstream result.
+            if pre_error is not None:
+                await await_ws_owned(finalize_error(pre_error))
+            elif tracker.response_completed:
+                await await_ws_owned(finalize_success())
             for data in first_chunks:
                 out = _ws_json_to_responses_sse(_identity_expose_frame(data, identity_state))
                 if out is not None:
                     yield out
-            if pre_error is not None:
-                await await_ws_owned(finalize_error(pre_error))
+            if state["finalized"]:
                 return
             while True:
                 if tracker.response_completed:
@@ -4241,19 +4282,19 @@ async def _consume_oauth_responses_ws_stream(
                         ),
                     )
                     return
-                if step.data is not None and not step.skip_downstream:
-                    out = _ws_json_to_responses_sse(_identity_expose_frame(step.data, identity_state))
-                    if out is not None:
-                        yield out
                 if step.outcome in ("stream_upstream_error", "request_rejected"):
                     await await_ws_owned(finalize_error(AttemptResult(
                         outcome=step.outcome,
                         error_detail=step.error_detail or "upstream stream error",
                         http_status=400 if step.outcome == "request_rejected" else 503,
                     )))
-                    return
-                if step.outcome == "success":
+                elif step.outcome == "success":
                     await await_ws_owned(finalize_success())
+                if step.data is not None and not step.skip_downstream:
+                    out = _ws_json_to_responses_sse(_identity_expose_frame(step.data, identity_state))
+                    if out is not None:
+                        yield out
+                if state["finalized"]:
                     return
                 if step.skip_downstream:
                     continue
@@ -4821,8 +4862,8 @@ async def _consume_stream_as_non_stream(
 ) -> AttemptResult:
     """处理 upstream_stream_only=True 渠道的非流式下游请求。
 
-    读取上游 SSE → 用 ResponsesSSEAssistantBuilder 聚合 → 构造成完整 /v1/responses
-    JSON → 走与 _consume_non_stream 一致的 translator / 黑名单 / 落库 / 亲和链路。
+    读取上游 SSE → 按 Chat/Responses 协议聚合为对应完整 JSON → 走与
+    _consume_non_stream 一致的 translator / 黑名单 / 落库 / 亲和链路。
     """
     if start_monotonic is None:
         start_monotonic = time.monotonic()
@@ -4830,10 +4871,9 @@ async def _consume_stream_as_non_stream(
     first_byte_timeout = int(round_timeouts.first_byte) if round_timeouts is not None else 30
     idle_timeout = int(round_timeouts.idle) if round_timeouts is not None else 30
 
-    # 上游是 openai-responses SSE（目前唯一 stream-only 渠道是 OpenAIOAuthChannel，
-    # 其 protocol 固定为 "openai-responses"）
-    assert getattr(ch, "protocol", "") == "openai-responses", \
-        f"_consume_stream_as_non_stream only supports openai-responses upstream, got {getattr(ch, 'protocol', None)!r}"
+    # Stream-only providers may expose Responses (Codex/xAI) or Chat (WorkBuddy).
+    assert getattr(ch, "protocol", "") in {"openai-responses", "openai-chat"}, \
+        f"unsupported stream-only upstream protocol: {getattr(ch, 'protocol', None)!r}"
 
     prepared = await aggregate_stream_as_non_stream_response(
         ctx,
@@ -4922,7 +4962,8 @@ async def _consume_stream_as_non_stream(
     response = JSONResponse(
         content=out_obj,
         status_code=upstream_resp.status_code,
-        headers=resp_headers,
+        # The SSE upstream was aggregated; downstream MIME must describe the JSON.
+        headers={**resp_headers, "content-type": "application/json"},
     )
     result = AttemptResult(
         outcome="success", success=True, response=response,
@@ -5085,6 +5126,14 @@ async def _consume_stream(
     def _chat_done_received() -> bool:
         return ch_proto == "openai-chat" and bool(getattr(tracker, "done_received", False))
 
+    def _explicit_terminal_received() -> bool:
+        # Chat finish_reason can precede a separate usage frame: wait for DONE.
+        return (
+            _responses_terminal_received()
+            or _chat_done_received()
+            or (ch_proto == "anthropic" and bool(getattr(tracker, "saw_stream_end", False)))
+        )
+
     async def _finish_stream_timing(outcome: str, error_detail: str | None = None):
         if timing is None:
             return None
@@ -5128,7 +5177,6 @@ async def _consume_stream(
     async def _finalize_success():
         if state["finalized"]:
             return
-        state["finalized"] = True
         request_elapsed_ms = _elapsed_ms(start_monotonic)
         timing_preview = timing.snapshot(terminal=True) if timing is not None else None
         round_total_ms = timing_preview.total_ms if timing_preview is not None else None
@@ -5287,11 +5335,11 @@ async def _consume_stream(
             proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
             **_timing_stage_kwargs(timing, terminal=True),
         ))
+        state["finalized"] = True
 
     async def _emit_error_and_finalize(err_type: str, message: str, outcome: str):
         if state["finalized"]:
             return
-        state["finalized"] = True
         request_elapsed_ms = _elapsed_ms(start_monotonic)
 
         # 已发首包的普通上游错误视为本次渠道失败；但上下文/请求级错误
@@ -5334,6 +5382,7 @@ async def _consume_stream(
             proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
             **_timing_stage_kwargs(timing, terminal=True),
         ))
+        state["finalized"] = True
 
     async def _finalize_client_cancelled():
         """客户端断开：不计 cooldown/scorer，仅记日志便于审计。
@@ -5359,7 +5408,6 @@ async def _consume_stream(
         if cancel_plan.terminal == "success":
             await _finalize_success()
             return
-        state["finalized"] = True
         request_elapsed_ms = _elapsed_ms(start_monotonic)
         # The outer request record is the user-visible terminal truth.  Persist
         # it before the retry-chain bookkeeping: a disconnect can interrupt the
@@ -5387,6 +5435,7 @@ async def _consume_stream(
             proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
             **_timing_stage_kwargs(timing, terminal=True),
         ))
+        state["finalized"] = True
         await _persist_stream_retry_attempt(
             timing_snapshot, "client_disconnected", "client disconnected",
         )
@@ -5397,15 +5446,21 @@ async def _consume_stream(
         terminal_chunks: list[bytes] = []
         if stream_translator is not None:
             terminal_chunks = list(stream_translator.close())
-        await await_ws_owned(_finalize_success())
-        await _close_terminal_resources_and_release()
+        async def settle_terminal() -> None:
+            await _finalize_success()
+            await _close_terminal_resources_and_release()
+
+        await await_ws_owned(settle_terminal())
         return terminal_chunks
 
     async def _finalize_terminal_error(err_type: str, message: str, outcome: str) -> None:
-        """Persist an explicit Responses error and release resources before output."""
+        """Persist an explicit stream error and release resources before output."""
 
-        await await_ws_owned(_emit_error_and_finalize(err_type, message, outcome))
-        await _close_terminal_resources_and_release()
+        async def settle_terminal() -> None:
+            await _emit_error_and_finalize(err_type, message, outcome)
+            await _close_terminal_resources_and_release()
+
+        await await_ws_owned(settle_terminal())
 
     async def stream_generator():
         """把首包 + 后续 chunk 转发给下游，同时在中途错误时用 SSE error event 收尾。"""
@@ -5437,27 +5492,17 @@ async def _consume_stream(
 
             if getattr(tracker, "saw_stream_error", False):
                 msg = getattr(tracker, "stream_error_message", None) or "upstream stream error"
-                if _responses_terminal_error_received():
-                    await _finalize_terminal_error(
-                        "api_error", msg,
-                        outcome="stream_upstream_error",
-                    )
-                    for out in first_downstream_chunks:
-                        yield out
-                else:
-                    for out in first_downstream_chunks:
-                        yield out
-                    await await_ws_owned(_emit_error_and_finalize(
-                        "api_error", msg,
-                        outcome="stream_upstream_error",
-                    ))
+                await _finalize_terminal_error(
+                    "api_error", msg, outcome="stream_upstream_error",
+                )
+                for out in first_downstream_chunks:
+                    yield out
                 return
 
-            # Responses 客户端可以在读到 response.completed 后立即返回工具调用，
-            # 不再继续拉取 HTTP EOF，也不一定显式关闭 body iterator。因此显式
-            # 终态必须先完成 Store / retry / request_log 落账，再把终态帧交给下游；
-            # 否则生成器会永久停在 yield，最终被 stale cleaner 误标成 crash。
-            if _responses_terminal_received():
+            # Every explicit terminal frame is a valid client stop boundary,
+            # including Chat DONE and Anthropic message_stop. Persist before
+            # exposing it; the consumer need not pull again or wait for HTTP EOF.
+            if _explicit_terminal_received():
                 terminal_chunks = await _finalize_terminal_success()
                 for out in first_downstream_chunks:
                     yield out
@@ -5467,11 +5512,6 @@ async def _consume_stream(
 
             for out in first_downstream_chunks:
                 yield out
-            if _chat_done_received():
-                terminal_chunks = await _finalize_terminal_success()
-                for out in terminal_chunks:
-                    yield out
-                return
 
             # 后续 chunk，带 first-byte / idle / total 超时
             while True:
@@ -5533,28 +5573,18 @@ async def _consume_stream(
                     yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API, msg)
                     return
 
-                # Responses 的显式错误终态与 completed 一样，是客户端停止读取的
-                # 正常边界：必须先落库、关闭上游并释放渠道 slot，再原样转发终态。
-                # 非终态 event:error 及 Chat/Anthropic error chunk 保持原有时序。
+                # Error frames also let the client stop immediately. Preserve
+                # their payload, but complete accounting before exposing them.
                 if getattr(tracker, "saw_stream_error", False):
                     msg = getattr(tracker, "stream_error_message", None) or "upstream stream error"
-                    if _responses_terminal_error_received():
-                        await _finalize_terminal_error(
-                            "api_error", msg,
-                            outcome="stream_upstream_error",
-                        )
-                        for out in step.downstream_chunks:
-                            yield out
-                    else:
-                        for out in step.downstream_chunks:
-                            yield out
-                        await await_ws_owned(_emit_error_and_finalize(
-                            "api_error", msg,
-                            outcome="stream_upstream_error",
-                        ))
+                    await _finalize_terminal_error(
+                        "api_error", msg, outcome="stream_upstream_error",
+                    )
+                    for out in step.downstream_chunks:
+                        yield out
                     return
 
-                if _responses_terminal_received():
+                if _explicit_terminal_received():
                     terminal_chunks = await _finalize_terminal_success()
                     for out in step.downstream_chunks:
                         yield out
@@ -5564,11 +5594,6 @@ async def _consume_stream(
 
                 for out in step.downstream_chunks:
                     yield out
-                if _chat_done_received():
-                    terminal_chunks = await _finalize_terminal_success()
-                    for out in terminal_chunks:
-                        yield out
-                    return
 
             if not getattr(tracker, "saw_stream_end", False):
                 # A transport EOF after visible output cannot be retried without
@@ -5617,7 +5642,7 @@ async def _consume_stream(
             ))
             raise
         finally:
-            await _close_stream_resources()
+            await await_ws_owned(_close_stream_resources())
 
     sresp = StreamingResponse(
         stream_generator(),

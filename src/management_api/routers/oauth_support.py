@@ -259,6 +259,7 @@ def detail(value) -> OAuthAccountDetailData:
         ],
         credentialConfigured=value.credential_configured,
         lastModelSync=value.last_model_sync,
+        workbuddy=public_value(value.workbuddy, camel_case_keys=True) if value.workbuddy is not None else None,
     )
 
 
@@ -306,6 +307,9 @@ def models(value, request: Request) -> OAuthModelListEnvelope:
                     maxContextWindow=item.max_context_window,
                     serviceTier=item.service_tier,
                     maxContextDefault=item.max_context_default,
+                    maxInputTokens=item.max_input_tokens,
+                    maxOutputTokens=item.max_output_tokens,
+                    reasoningEfforts=list(item.reasoning_efforts),
                 )
                 for item in value.items
             ],
@@ -327,6 +331,10 @@ def credential(value):
             workspace_id=value.workspaceId,
             project_id=value.projectId,
             expires_at=value.expiresAt,
+            realm=value.realm,
+            uid=value.uid,
+            enterprise_id=value.enterpriseId,
+            domain=value.domain,
         )
     if isinstance(value, JsonOAuthCredential):
         return JsonCredential(

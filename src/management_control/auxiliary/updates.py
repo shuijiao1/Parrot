@@ -128,6 +128,7 @@ class UpdateGateway(Protocol):
     def current_version(self) -> str: ...
     def cached_release(self) -> dict[str, Any]: ...
     def is_newer(self, version: str | None) -> bool: ...
+    def check_latest(self) -> None: ...
     def force_refresh(self) -> None: ...
     def add_ignored(self, version: str) -> None: ...
     def remove_ignored(self, version: str) -> None: ...
@@ -155,6 +156,9 @@ class ModuleUpdateGateway:
 
     def is_newer(self, version: str | None) -> bool:
         return update_checker._has_newer(version)
+
+    def check_latest(self) -> None:
+        update_checker._check_once(push=False, raise_on_error=True)
 
     def force_refresh(self) -> None:
         update_checker.force_refresh_sync()
@@ -322,7 +326,7 @@ class UpdateControl:
     def check(self, context: ManagementContext) -> UpdateCheckResult:
         require(context, Capability.WRITE)
         try:
-            self._updates.force_refresh()
+            self._updates.check_latest()
         except Exception as exc:
             audit(self._audit_sink, context, action="updates.check", target="updates", result="failed")
             raise ManagementError(ManagementErrorCode.UPSTREAM_ERROR, retryable=True) from exc

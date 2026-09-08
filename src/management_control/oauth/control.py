@@ -6,9 +6,10 @@ import asyncio
 import copy
 import secrets
 from concurrent.futures import Executor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable
 
+from src import model_names
 from src.model_pricing import TICKS_PER_USD
 from src.management_auth.policy import CapabilityDenied, authorize
 from src.management_auth.principal import AuthMethod, Capability
@@ -57,6 +58,7 @@ from .models import (
 )
 from .plans import OneShotPlanStore
 from .queries import OAuthQueryControlMixin
+from .workbuddy_control import WorkBuddyControlMixin
 
 
 def _page(items: list, spec: PageSpec) -> tuple[list, PageMeta]:
@@ -73,6 +75,7 @@ def _page(items: list, spec: PageSpec) -> tuple[list, PageMeta]:
 
 
 class OAuthControl(
+    WorkBuddyControlMixin,
     OAuthAccountOrchestrationControlMixin,
     OAuthAccountMutationControlMixin,
     OAuthImportControlMixin,
@@ -109,6 +112,9 @@ class OAuthControl(
         )
         self._import_plans: OneShotPlanStore[dict] = OneShotPlanStore(
             prefix="oimport", clock=self._clock,
+        )
+        self._workbuddy_plans: OneShotPlanStore[dict] = OneShotPlanStore(
+            prefix="wbaction", ttl_seconds=300, clock=self._clock,
         )
 
     @staticmethod
@@ -317,7 +323,8 @@ class OAuthControl(
                     resets_at=utc_datetime(row.get(reset_key)),
                 )
             )
-        month_start = self._clock().astimezone(timezone.utc).replace(
+        # Match Telegram's BJT accounting month, even while UTC is in the previous month.
+        month_start = self._clock().astimezone(timezone(timedelta(hours=8))).replace(
             day=1, hour=0, minute=0, second=0, microsecond=0,
         )
         try:
@@ -357,6 +364,7 @@ class OAuthControl(
             runtime_errors=tuple(runtime_errors),
             credential_configured=bool(account.get("refresh_token") or account.get("access_token")),
             last_model_sync=utc_datetime(account.get("last_model_sync")),
+            workbuddy=self.backend.workbuddy_snapshot(account_id) if summary.provider is OAuthProvider.WORKBUDDY else None,
         )
 
     def reorder_accounts_preserving_unlisted(
@@ -369,10 +377,20 @@ class OAuthControl(
         self._audit(context, "oauth.account.reorder", "oauthAccounts")
 
     @audit_failures("oauth.login.start", target_arg="provider")
-    def start_login_flow(self, context: ManagementContext, provider: OAuthProvider) -> OAuthLoginFlow:
+    def start_login_flow(self, context: ManagementContext, provider: OAuthProvider, *, realm=None, client_profile=None) -> OAuthLoginFlow:
         self._require(context, Capability.SECRETS_WRITE)
+        if provider is OAuthProvider.WORKBUDDY:
+            realm = realm or "cn"
+            expected_profile = "ide" if realm == "global" else "cli"
+            if realm not in {"cn", "global"} or client_profile not in (None, expected_profile):
+                raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE,
+                    fields=[ErrorField("clientProfile", "REGION_PROFILE_MISMATCH", "Unsupported WorkBuddy login region/profile")])
+            client_profile = expected_profile
+        elif realm is not None or client_profile is not None:
+            raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         try:
-            flow = self._flows.start(context.actor.subject_id, provider)
+            flow = (self._flows.start(context.actor.subject_id, provider, realm=realm, client_profile=client_profile)
+                    if provider is OAuthProvider.WORKBUDDY else self._flows.start(context.actor.subject_id, provider))
         except ManagementError:
             raise
         except Exception as exc:
@@ -381,6 +399,17 @@ class OAuthControl(
             ) from exc
         self._audit(context, "oauth.login.start", provider.value)
         return flow
+
+    @audit_failures("oauth.login.poll", target="oauthLogin")
+    def poll_login_flow(self, context: ManagementContext, flow_id: str, flow_secret: str):
+        self._require(context, Capability.SECRETS_WRITE)
+        return self._flows.workbuddy.poll(context.actor.subject_id, flow_id, flow_secret)
+
+    @audit_failures("oauth.login.cancel", target="oauthLogin")
+    def cancel_login_flow(self, context: ManagementContext, flow_id: str, flow_secret: str) -> None:
+        self._require(context, Capability.SECRETS_WRITE)
+        self._flows.workbuddy.cancel(context.actor.subject_id, flow_id, flow_secret)
+        self._audit(context, "oauth.login.cancel", "oauthLogin")
 
     def list_invalid_accounts(self, context: ManagementContext, *, page: PageSpec) -> OAuthAccountPage:
         return self.list_accounts(context, account_filter=OAuthAccountFilter.INVALID, page=page)
@@ -393,7 +422,7 @@ class OAuthControl(
         invalid = [
             self.backend.account_id(account)
             for account in self.backend.list_accounts()
-            if account.get("email") and account.get("disabled_reason") == "auth_error"
+            if (account.get("email") or self.backend.provider_of(account) == "workbuddy") and account.get("disabled_reason") == "auth_error"
         ]
         selected = invalid if account_ids is None else list(account_ids)
         if not selected or len(selected) != len(set(selected)) or not set(selected).issubset(invalid):
@@ -435,7 +464,10 @@ class OAuthControl(
     @audit_failures("oauth.token.refresh", target_arg="account_id")
     def refresh_token(self, context: ManagementContext, account_id: str) -> OAuthMutationResult:
         self._require(context, Capability.WRITE)
-        self._account(account_id)
+        account = self._account(account_id)
+        if self.backend.provider_of(account) == "workbuddy" and not self.backend.workbuddy_refresh_enabled():
+            raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE,
+                fields=[ErrorField("instance", "REFRESH_DISABLED", "PARROT_NO_REFRESH=1; no refresh was performed")])
         try:
             asyncio.run(self.backend.force_refresh(account_id))
         except Exception as exc:
@@ -506,7 +538,7 @@ class OAuthControl(
         self._require(context, Capability.DESTRUCTIVE)
         account = self._account(account_id)
         provider = OAuthProvider(self.backend.provider_of(account))
-        if provider in {OAuthProvider.CURSOR, OAuthProvider.XAI, OAuthProvider.ANTIGRAVITY}:
+        if provider in {OAuthProvider.CURSOR, OAuthProvider.XAI, OAuthProvider.ANTIGRAVITY, OAuthProvider.WORKBUDDY}:
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         row = copy.deepcopy(self.backend.quota_load(account_id) or {})
         credit_count = row.get("openai_reset_credit_count")
@@ -612,12 +644,15 @@ class OAuthControl(
             until = state.get("cooldown_until")
             models.append(
                 OAuthModel(
-                    model_id=model_id,
-                    name=sanitize_text(record.get("name") or model_id),
+                    model_id=model_names.public_id(self.backend.provider_of(account), model_id),
+                    name=sanitize_text(model_names.display_name(self.backend.provider_of(account), model_id, record.get("name"))),
                     disabled=model_id in disabled,
                     cooldown_until=utc_datetime(until),
                     cooldown_permanent=until == -1,
                     metadata_source=sanitize_text(record.get("metadataSource") or selection.get("source")) if (record.get("metadataSource") or selection.get("source")) else None,
+                    max_input_tokens=int(record.get("maxInputTokens") or 0) or None,
+                    max_output_tokens=int(record.get("maxOutputTokens") or 0) or None,
+                    reasoning_efforts=tuple(str(e) for e in record.get("reasoningEfforts") or []),
                     context_window=int(record.get("contextWindow") or record.get("context_window") or 0) or None,
                     max_context_window=int(record.get("contextWindowMaxMode") or record.get("context_window_max_mode") or 0) or None,
                     service_tier=sanitize_text(record.get("serviceTier") or record.get("service_tier")) if (record.get("serviceTier") or record.get("service_tier")) else None,
@@ -647,7 +682,7 @@ class OAuthControl(
                 raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
             selection = self.backend.account_model_selection(account)
             visible = set(selection.get("models") or [])
-            requested_list = list(model_ids)
+            requested_list = [model_names.upstream_id(self.backend.provider_of(account), model_id) for model_id in model_ids]
             fields = [
                 ErrorField(f"modelIds[{index}]", "UNKNOWN_MODEL", "Model is not visible")
                 for index, model_id in enumerate(requested_list)
@@ -694,6 +729,7 @@ class OAuthControl(
                     ManagementErrorCode.UNSUPPORTED_VALUE,
                     fields=(ErrorField("modelId", "WRONG_PROVIDER", "Cursor account required"),),
                 )
+            model_id = model_names.upstream_id(self.backend.provider_of(account), model_id)
             visible = set(selection.get("models") or [])
             record = next((
                 item for item in selection.get("records") or []

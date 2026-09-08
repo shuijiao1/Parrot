@@ -14,6 +14,7 @@ from src.providers.catalog import get_preset
 
 from ..errors import ManagementError, ManagementErrorCode
 from .models import DiscoveryCommand, DiscoveryResult
+from .validation import validate_base_url
 
 
 async def discover_models(endpoint: str, api_key: str, **kwargs: Any) -> list[str]:
@@ -70,6 +71,7 @@ async def run_model_discovery(
         elif preset:
             raise ModelsDiscoveryError("该提供商未公开模型列表")
         elif base_url:
+            validate_base_url(base_url)
             models = await discoverer(derive_custom_models_url(base_url, api_path), key)
         else:
             raise ModelsDiscoveryError("无法从 URL 推导模型列表地址")

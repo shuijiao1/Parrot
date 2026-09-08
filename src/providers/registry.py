@@ -24,6 +24,7 @@ from .base import (
     OpenAIApiAdapter,
     OpenAICodexAdapter,
     XAIOAuthAdapter,
+    WorkBuddyOAuthAdapter,
     ProviderAdapter,
     ProviderAttemptContext,
 )
@@ -36,6 +37,7 @@ _CURSOR_OAUTH = CursorOAuthAdapter()
 _OPENAI_CODEX = OpenAICodexAdapter()
 _XAI_OAUTH = XAIOAuthAdapter()
 _ANTIGRAVITY_OAUTH = AntigravityOAuthAdapter()
+_WORKBUDDY_OAUTH = WorkBuddyOAuthAdapter()
 
 
 def adapter_for_channel(channel) -> ProviderAdapter:
@@ -51,6 +53,8 @@ def adapter_for_channel(channel) -> ProviderAdapter:
                 return _CURSOR_OAUTH
             if provider == "antigravity":
                 return _ANTIGRAVITY_OAUTH
+            if provider == "workbuddy":
+                return _WORKBUDDY_OAUTH
             return _OPENAI_CODEX
         return _OPENAI_API
 

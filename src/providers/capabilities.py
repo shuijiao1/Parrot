@@ -190,6 +190,15 @@ CURSOR_OAUTH_CAPABILITIES = ProviderCapabilities(
 )
 
 
+WORKBUDDY_OAUTH_CAPABILITIES = ProviderCapabilities(
+    adapter_name="workbuddy-oauth", family="openai",
+    protocols=frozenset({"openai-chat"}), transports=frozenset({"sse"}),
+    passthrough_request_fields={"openai-chat": CHAT_REQ_ALLOWED},
+    native_state=frozenset({"reasoning_content"}),
+    notes=("WorkBuddy CLI OAuth forces stream=true; non-stream clients aggregate Chat SSE",),
+)
+
+
 OPENAI_CODEX_CAPABILITIES = ProviderCapabilities(
     adapter_name="openai-codex",
     family="openai",

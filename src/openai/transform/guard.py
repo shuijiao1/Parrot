@@ -43,6 +43,18 @@ def _fail(status: int, err_type: str, message: str, *, param: str | None = None,
     raise GuardError(status, err_type, message, param=param, scope=scope)
 
 
+def guard_collection_fields(body: dict, *names: str) -> None:
+    """Protect local iteration/counting without imposing a vendor's full schema.
+
+    Missing/null collections retain their existing empty-list semantics; item
+    capabilities and vendor-specific fields remain the downstream guard's job.
+    """
+    for name in names:
+        value = body.get(name)
+        if value is not None and not isinstance(value, list):
+            _fail(400, "invalid_request_error", f"{name} must be an array", param=name)
+
+
 # ─── Chat ingress ────────────────────────────────────────────────
 
 def guard_chat_ingress(body: dict) -> None:
@@ -61,6 +73,7 @@ def guard_chat_ingress(body: dict) -> None:
     if not model or not isinstance(model, str):
         _fail(400, "invalid_request_error",
               "missing required field 'model'", param="model")
+    guard_collection_fields(body, "messages", "tools")
 
 
 # ─── Responses ingress ───────────────────────────────────────────
@@ -84,6 +97,7 @@ def guard_responses_ingress(body: dict, *, store_enabled: bool = True) -> None:
     if not model or not isinstance(model, str):
         _fail(400, "invalid_request_error",
               "missing required field 'model'", param="model")
+    guard_collection_fields(body, "tools")
 
     if body.get("previous_response_id") and not store_enabled:
         _fail(400, "invalid_request_error",

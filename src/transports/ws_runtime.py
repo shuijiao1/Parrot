@@ -15,6 +15,7 @@ from urllib.parse import urlparse, urlunparse
 import websockets
 
 from .. import blacklist
+from ..async_owned import await_owned
 from ..protocols import errors as protocol_errors
 from ..protocols.runtime import (
     connection_lifecycle_outcome,
@@ -110,13 +111,7 @@ class ManagedWsConnection:
                 self._close_impl(*args, **kwargs),
                 name="managed-websocket-close",
             )
-        try:
-            await asyncio.shield(self._close_task)
-        except asyncio.CancelledError:
-            try:
-                await self._close_task
-            finally:
-                raise
+        await await_owned(self._close_task)
 
 
 @dataclass
@@ -332,16 +327,9 @@ async def connect_upstream_ws(
 
 
 async def await_ws_owned(awaitable):
-    """Finish one WS terminal/cleanup owner even if its caller is cancelled."""
+    """Finish one terminal/cleanup owner even under repeated ASGI cancellation."""
 
-    task = asyncio.ensure_future(awaitable)
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        try:
-            await task
-        finally:
-            raise
+    return await await_owned(awaitable)
 
 
 async def wait_ws_round_io(

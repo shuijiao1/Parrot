@@ -46,6 +46,8 @@ from ..schemas.oauth import (
     OAuthImportPreviewData,
     OAuthImportProblemData,
     OAuthLoginFlowData,
+    OAuthLoginPollData,
+    PollOAuthLoginFlowRequest,
     OAuthMutationData,
     OAuthOperationEnvelope,
     OAuthQuotaResetPlanData,
@@ -246,7 +248,8 @@ async def start_oauth_login_flow(
     context: SecretContext,
     control: Control,
 ) -> DataEnvelope[OAuthLoginFlowData]:
-    result = await asyncio.to_thread(control.start_login_flow, context, body.provider)
+    result = await asyncio.to_thread(control.start_login_flow, context, body.provider,
+                                     realm=body.realm, client_profile=body.clientProfile)
     return DataEnvelope(
         data=OAuthLoginFlowData(
             flowId=result.flow_id,
@@ -258,6 +261,36 @@ async def start_oauth_login_flow(
         ),
         meta=meta(request),
     )
+
+
+@router.post(
+    "/oauth/login-flows/{flowId}/poll",
+    operation_id="pollOAuthLoginFlow",
+    response_model=DataEnvelope[OAuthLoginPollData],
+    responses=responses(200, {"flowId": "wbflow_example", "status": "pending", "expiresAt": "2026-01-02T03:09:05Z"}, ManagementErrorCode.INVALID_OPERATION_STATE, ManagementErrorCode.UPSTREAM_ERROR),
+)
+async def poll_oauth_login_flow(
+    flowId: Annotated[str, Path(min_length=1, max_length=200)],
+    body: Annotated[PollOAuthLoginFlowRequest, Body()],
+    request: Request, context: SecretContext, control: Control,
+) -> DataEnvelope[OAuthLoginPollData]:
+    result = await asyncio.to_thread(control.poll_login_flow, context, flowId, body.flowSecret.get_secret_value())
+    return DataEnvelope(data=OAuthLoginPollData(flowId=result.flow_id, status=result.status,
+                         expiresAt=result.expires_at, accountPreview=result.account_preview), meta=meta(request))
+
+
+@router.post(
+    "/oauth/login-flows/{flowId}/cancel", operation_id="cancelOAuthLoginFlow",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses=responses(204, None, ManagementErrorCode.INVALID_OPERATION_STATE),
+)
+async def cancel_oauth_login_flow(
+    flowId: Annotated[str, Path(min_length=1, max_length=200)],
+    body: Annotated[PollOAuthLoginFlowRequest, Body()],
+    context: SecretContext, control: Control,
+) -> Response:
+    await asyncio.to_thread(control.cancel_login_flow, context, flowId, body.flowSecret.get_secret_value())
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post(
@@ -841,3 +874,7 @@ def discover_oauth_defaultmodels(
     runtime: Runtime,
 ) -> OAuthOperationEnvelope:
     return operation_envelope(control.discover_default_models(context, family, runtime.operations), request)
+
+
+from .oauth_workbuddy import router as workbuddy_router
+router.include_router(workbuddy_router)

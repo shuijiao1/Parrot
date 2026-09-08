@@ -472,12 +472,21 @@ def discover_cursor(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
     return DiscoveryResult(models, payload, "upstream:cursor")
 
 
+def discover_workbuddy(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
+    from .oauth import workbuddy
+    records = workbuddy.fetch_models_sync(
+        account, account_key=proxy_channel.removeprefix("oauth:"), timeout=timeout,
+    )
+    return DiscoveryResult([item["id"] for item in records], _catalog(records), "upstream:workbuddy", profile_id="cli")
+
+
 ADAPTERS: dict[str, Callable[..., DiscoveryResult]] = {
     "openai": discover_openai,
     "claude": discover_claude,
     "xai": discover_xai,
     "antigravity": discover_antigravity,
     "cursor": discover_cursor,
+    "workbuddy": discover_workbuddy,
 }
 
 

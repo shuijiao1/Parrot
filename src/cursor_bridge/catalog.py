@@ -297,7 +297,11 @@ def metadata_from_record(record: Mapping[str, Any] | None) -> dict[str, Any]:
     if max_context:
         result["contextWindowMaxMode"] = _positive_int(max_context, context)
     if efforts:
-        if "medium" in efforts:
+        # Advertise the Claude channel default only when the catalog actually
+        # exposes that effort; thinking-only models must not invent a high tier.
+        if str(record.get("id") or "").startswith("claude-") and "high" in efforts:
+            result["defaultReasoningEffort"] = "high"
+        elif "medium" in efforts:
             result["defaultReasoningEffort"] = "medium"
         elif "high" in efforts:
             result["defaultReasoningEffort"] = "high"

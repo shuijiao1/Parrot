@@ -14,6 +14,7 @@ class OAuthProvider(str, Enum):
     OPENAI = "openai"
     XAI = "xai"
     ANTIGRAVITY = "antigravity"
+    WORKBUDDY = "workbuddy"
 
 
 class OAuthAccountFilter(str, Enum):
@@ -129,6 +130,7 @@ class OAuthAccountDetail:
     runtime_errors: tuple[OAuthRuntimeError, ...]
     credential_configured: bool
     last_model_sync: datetime | None
+    workbuddy: dict | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +144,10 @@ class ManualCredential:
     workspace_id: str | None = None
     project_id: str | None = None
     expires_at: str | None = None
+    realm: str | None = None
+    uid: str | None = None
+    enterprise_id: str | None = None
+    domain: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +194,14 @@ class OAuthLoginFlow:
     auth_url: str | None
     instruction: str | None
     expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthLoginPoll:
+    flow_id: str
+    status: str
+    expires_at: datetime
+    account_preview: dict | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +280,9 @@ class OAuthModel:
     max_context_window: int | None
     service_tier: str | None
     max_context_default: bool | None
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    reasoning_efforts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

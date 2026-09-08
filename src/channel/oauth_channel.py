@@ -95,7 +95,7 @@ class OAuthChannel(Channel):
         if cc_request_context:
             requested_body.update(cc_request_context)
         # OAuth：确保 token 有效 → 走完整 CC 伪装 → 拼 OAuth headers
-        access_token = await oauth_manager.ensure_valid_token(self.account_key)
+        access_token = await oauth_manager.ensure_channel_token(self)
 
         body_with_model = provider_registry.filter_request_payload(
             self,

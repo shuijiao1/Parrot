@@ -4,6 +4,7 @@ addDefaultBlacklistTerm
 bulkReplaceModelChannelOrders
 cancelLogRetentionPlan
 cancelManagementOperation
+cancelOAuthLoginFlow
 cancelStagedUpdate
 checkForUpdates
 clearAllAffinity
@@ -46,6 +47,7 @@ deleteProxyGroup
 discoverChannelModels
 discoverOAuthDefaultModels
 downloadMediaArtifact
+executeOAuthWorkBuddyAction
 getAffinitySettings
 getApiKey
 getApiKeyConcurrencySettings
@@ -80,6 +82,8 @@ getNotificationSettings
 getOAuthAccount
 getOAuthDefaultModels
 getOAuthSettings
+getOAuthWorkBuddyAccount
+getOAuthWorkBuddyPolicy
 getOpenAiWebSocketSettings
 getProxy
 getProxyGroup
@@ -120,6 +124,7 @@ listModelMetadata
 listNetworkChecks
 listOAuthAccountModels
 listOAuthAccounts
+listOAuthWorkBuddyActions
 listProxies
 listProxyGroups
 listRecentCalls
@@ -131,6 +136,8 @@ muteStatusIncident
 planApiKeyRegeneration
 planInvalidOAuthAccountDeletion
 planOAuthQuotaReset
+planOAuthWorkBuddyAction
+pollOAuthLoginFlow
 previewOAuthImport
 probeChannelDraft
 probeExistingChannel
@@ -142,6 +149,7 @@ refreshAllOAuthUsage
 refreshChannelProviderUsage
 refreshOAuthToken
 refreshOAuthUsage
+refreshOAuthWorkBuddyStatus
 refreshStatusAlerts
 regenerateApiKey
 reorderApiKeys
@@ -186,6 +194,7 @@ updateOAuthAccount
 updateOAuthAccountModelSettings
 updateOAuthAccountModels
 updateOAuthSettings
+updateOAuthWorkBuddySettings
 updateOpenAiWebSocketSettings
 updateProxy
 updateProxyGroup

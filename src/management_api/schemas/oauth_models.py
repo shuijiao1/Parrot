@@ -21,6 +21,9 @@ class OAuthModelData(StrictSchema):
     maxContextWindow: int | None = None
     serviceTier: str | None = None
     maxContextDefault: bool | None = None
+    maxInputTokens: int | None = None
+    maxOutputTokens: int | None = None
+    reasoningEfforts: list[str] = Field(default_factory=list)
 
 
 class OAuthModelListData(StrictSchema):

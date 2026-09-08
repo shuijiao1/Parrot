@@ -136,6 +136,9 @@ class InMemoryOAuthBackend(OAuthBackend):
         if account.get("_id"):
             return str(account["_id"])
         provider = self.provider_of(account)
+        if provider == "workbuddy":
+            from src.oauth_ids import account_key
+            return account_key(account)
         identity = str(account.get("subject") or account.get("email") or "")
         if provider == "openai" and (account.get("workspace_id") or account.get("chatgpt_account_id")):
             return f"openai:{identity}:{account.get('workspace_id') or account.get('chatgpt_account_id')}"
@@ -668,6 +671,15 @@ class InMemoryOAuthBackend(OAuthBackend):
 
     def xai_extract_user_info(self, claims):
         return claims
+
+    def workbuddy_start_login(self):
+        return {"realm": "cn", "state": "fixture-workbuddy-state", "status": "pending",
+                "auth_url": "https://www.codebuddy.cn/login"}
+
+    def workbuddy_poll_login(self, payload):
+        from src.oauth.workbuddy.auth import normalize_credential
+        payload.update(status="ready", entry=normalize_credential({"realm": "cn", "uid": "fixture-workbuddy",
+            "nickname": "WorkBuddy Flow", "access_token": "fixture-workbuddy-at", "refresh_token": "fixture-workbuddy-rt"}))
 
     def cursor_generate_login(self):
         return CursorLogin()

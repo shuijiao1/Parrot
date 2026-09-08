@@ -18,6 +18,7 @@ from typing import Any
 import httpx
 
 from .. import blacklist, log_db, upstream
+from ..async_owned import await_owned
 from ..providers import registry as provider_registry
 from ..protocols import errors as protocol_errors
 from ..protocols.commit_gate import SseCommitGate
@@ -143,7 +144,7 @@ async def _await_http_owned(awaitable):
         return await asyncio.shield(task)
     except BaseException:
         try:
-            await task
+            await await_owned(task)
         except BaseException:
             pass
         raise
@@ -538,7 +539,12 @@ async def aggregate_stream_as_non_stream_response(
             )
         )
 
-    builder = toolkit["stream_builder"]()
+    chat_upstream = getattr(channel, "protocol", "") == "openai-chat"
+    if chat_upstream:
+        from .chat_aggregate import ChatAggregateBuilder
+        builder = ChatAggregateBuilder()
+    else:
+        builder = toolkit["stream_builder"]()
     tracker = toolkit["stream_tracker"]()
     builder.feed(first_chunk_restored)
     tracker.feed(first_chunk_restored)
@@ -565,7 +571,7 @@ async def aggregate_stream_as_non_stream_response(
         await close_response_context(ctx)
         return StreamAsNonStreamResult(error=with_partial_billing(err))
 
-    while True:
+    while not (chat_upstream and builder.done_received):
         try:
             chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
         except asyncio.CancelledError:
@@ -663,14 +669,14 @@ async def aggregate_stream_as_non_stream_response(
     obj = builder.to_full_json(fallback_model=resolved_model)
     try:
         usage_from_tracker = tracker.usage if hasattr(tracker, "usage") else None
-        if usage_from_tracker:
+        if usage_from_tracker and not chat_upstream:
             obj.setdefault("usage", usage_from_tracker)
     except Exception:
         pass
 
     total_ms = timing.snapshot(terminal=True).total_ms if timing is not None else None
     usage = toolkit["extract_usage_json"](obj)
-    assistant_msg = {"role": "assistant", "content": obj.get("output") or []}
+    assistant_msg = builder.get_assistant() if chat_upstream else {"role": "assistant", "content": obj.get("output") or []}
 
     return StreamAsNonStreamResult(
         obj=obj,

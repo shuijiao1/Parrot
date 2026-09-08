@@ -60,6 +60,7 @@ from src.management_control import OperationRegistry, OperationStore, StoreAudit
 from src.management_control.composition import ManagementControls
 from src.protocols import errors as protocol_errors
 from src.openai.codex_constants import codex_cli_version
+from src.openai.transform.guard import GuardError, guard_collection_fields
 from src.transform.cc_mimicry import (
     DEVICE_ID,
     PARROT_DOWNSTREAM_BETAS_KEY,
@@ -121,6 +122,7 @@ def _telegram_control_bindings(controls: ManagementControls):
         (tgbot.channel_menu, "_CONTROL", controls.channels),
         (tgbot.apikey_menu, "_CONTROL", controls.api_keys),
         (tgbot.oauth_menu, "oauth_control", controls.oauth),
+        (tgbot.oauth_menu.workbuddy_menu, "oauth_control", controls.oauth),
         (tgbot.oauth_account_models_menu, "oauth_control", controls.oauth),
         (tgbot.oauth_defaults_menu, "oauth_control", controls.oauth),
         (tgbot.translation_menu, "_CONTROL", auxiliary.translation),
@@ -537,12 +539,12 @@ async def lifespan(app: FastAPI):
         _background_tasks.append(asyncio.create_task(_wal_checkpoint_loop()))
         _background_tasks.append(asyncio.create_task(_stale_pending_loop()))
         _background_tasks.append(asyncio.create_task(_affinity_cleanup_loop()))
-        # ⛔ 双实例重构期：关掉后台主动刷新（每 60s 自动刷将过期 token，最危险）
-        # 和 quota_monitor（周期拉 usage，对共享账号的多余访问）。PARROT_NO_REFRESH=1 时跳过。
-        if os.environ.get("PARROT_NO_REFRESH") != "1":
-            _background_tasks.append(asyncio.create_task(oauth_manager.proactive_refresh_loop()))
-            _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
-            _background_tasks.append(asyncio.create_task(oauth_manager.oauth_model_sync_loop()))
+        # PARROT_NO_REFRESH only disables token rotation inside the refresh loop
+        # and central token acquisition guard. Usage/models and opted-in check-in
+        # remain available; none requires rotating shared credentials.
+        _background_tasks.append(asyncio.create_task(oauth_manager.proactive_refresh_loop()))
+        _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
+        _background_tasks.append(asyncio.create_task(oauth_manager.oauth_model_sync_loop()))
         _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
         _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
         _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
@@ -955,12 +957,11 @@ async def health():
             if not ch.enabled or ch.disabled_reason:
                 continue
             models = getattr(ch, "models", [])
-            # 有至少一个模型未冷却
-            if ch.type == "oauth":
-                model_list = models
-            else:
-                model_list = [m.get("real") for m in models if isinstance(m, dict)]
-            if any(not cooldown.is_blocked(ch.key, m) for m in model_list):
+            # OAuth providers may expose raw IDs or real/alias mappings (WorkBuddy).
+            # Cooldown is keyed by the upstream ID, never the public alias/object.
+            model_list = [m.get("real") if isinstance(m, dict) else m for m in models]
+            if any(isinstance(m, str) and m and not cooldown.is_blocked(ch.key, m)
+                   for m in model_list):
                 active += 1
                 break
         if active == 0 and enabled_total > 0:
@@ -1216,6 +1217,15 @@ async def proxy_messages(request: Request):
             400, errors.ErrType.INVALID_REQUEST, f"invalid json: {e}"
         )
 
+    if not isinstance(body, dict):
+        return errors.json_error_response(
+            400, errors.ErrType.INVALID_REQUEST, "request body must be a JSON object"
+        )
+    if body.get("model") is not None and not isinstance(body["model"], str):
+        return errors.json_error_response(
+            400, errors.ErrType.INVALID_REQUEST, "model must be a string"
+        )
+
     # 2.1 保存下游显式能力信号，再做模型映射 / 入口默认模型：
     #     - anthropic-beta 可显式请求 context-1m；
     #     - 原始模型名可能是 `sonnet[1m]` / `*-1m` / `*-context-1m` 这类 1M 别名；
@@ -1266,6 +1276,11 @@ async def proxy_messages(request: Request):
             f"Model '{model}' is not allowed for this API key "
             f"(allowed: {', '.join(allowed_models) or 'none'})",
         )
+
+    try:
+        guard_collection_fields(body, "messages", "tools")
+    except GuardError as exc:
+        return errors.json_error_response(400, errors.ErrType.INVALID_REQUEST, exc.message)
 
     is_stream = bool(body.get("stream", False))
     messages = body.get("messages") or []
@@ -1323,9 +1338,12 @@ async def proxy_messages(request: Request):
             f"[scheduler] no channels ingress=anthropic model={model}: "
             f"{exclusion_summary}"
         )
+        # Resolve once so the log and downstream response describe the same error.
+        err_type = errors.ErrType.NOT_FOUND if _model_never_supported(model) else errors.ErrType.API
+        status = 404 if err_type == errors.ErrType.NOT_FOUND else 503
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,
-            http_status=503, affinity_hit=(1 if result.affinity_hit else 0),
+            http_status=status, affinity_hit=(1 if result.affinity_hit else 0),
             total_ms=int((time.monotonic() - start_monotonic) * 1000),
         )
         # 主动告警（节流 5min）：帮助运维第一时间发现
@@ -1338,9 +1356,6 @@ async def proxy_messages(request: Request):
             f"筛选详情: <code>{ek(exclusion_summary)}</code>\n"
             "请按筛选详情检查渠道状态。"
         )
-        # 先尝试更精准的错误类型：model 不在任何渠道 → not_found；所有渠道冷却 → api_error
-        err_type = errors.ErrType.NOT_FOUND if _model_never_supported(model) else errors.ErrType.API
-        status = 404 if err_type == errors.ErrType.NOT_FOUND else 503
         return errors.json_error_response(status, err_type, msg)
 
     preflight = _anthropic_to_openai_context_preflight(body, result)
