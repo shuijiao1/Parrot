@@ -18,6 +18,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Architecture gates compare against historical baselines.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
