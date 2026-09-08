@@ -449,6 +449,11 @@ class SS2022DuplexBridge:
         return self._terminal
 
     @property
+    def read_termination(self):
+        """Expose bounded read-end metadata without changing pump/close policy."""
+        return getattr(self._conn, "read_termination", None)
+
+    @property
     def close_error(self) -> BaseException | None:
         return self._close_error
 

@@ -575,7 +575,7 @@ async def test_responses_ws_routes_maps_model_and_relays(monkeypatch, m):
 ])
 @pytest.mark.asyncio
 async def test_responses_ws_visible_then_lifecycle_close_terminates_once_and_releases_capacity(
-    monkeypatch, m, upstream_code, downstream_code,
+    monkeypatch, m, upstream_code, downstream_code, caplog,
 ):
     cfg = _setup(m)
     cfg["apiKeyConcurrency"] = {
@@ -620,6 +620,13 @@ async def test_responses_ws_visible_then_lifecycle_close_terminates_once_and_rel
         item["channel_key"]: item for item in m["concurrency"].snapshot()
     }
     assert channel_rows[ch.key]["in_flight"] == 0
+    diagnostics = [json.loads(r.args[0]) for r in caplog.records
+                   if r.name == "src.transports.ws_diagnostics"]
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["request_id"] == row["request_id"]
+    assert diagnostics[0]["round_id"] == row["final_round_id"]
+    assert diagnostics[0]["proxy_name"] == "direct"
+    assert diagnostics[0]["phase"] == "after_accept"
 
 
 @pytest.mark.asyncio
@@ -3732,7 +3739,7 @@ async def test_responses_ws_previsible_metadata_buffer_is_bounded(m):
 
 @pytest.mark.asyncio
 async def test_http_responses_oauth_ws_non_stream_close_before_terminal_is_error(
-    monkeypatch, m,
+    monkeypatch, m, caplog,
 ):
     cfg = _setup(m)
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
@@ -3767,6 +3774,93 @@ async def test_http_responses_oauth_ws_non_stream_close_before_terminal_is_error
     assert attempts[0]["cost_source"] == "unpriced"
     assert not m["cooldown"].is_blocked(ch.key, "test-model")
     assert m["scorer"].get_stats(ch.key, "test-model") is None
+    diagnostics = [json.loads(r.args[0]) for r in caplog.records
+                   if r.name == "src.transports.ws_diagnostics"]
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["request_id"] == rid
+    assert diagnostics[0]["round_id"] == detail["log"]["final_round_id"]
+    assert diagnostics[0]["proxy_name"] == "direct"
+
+
+@pytest.mark.asyncio
+async def test_http_responses_sse_close_diagnostic_is_private_and_request_bound(monkeypatch, m, caplog):
+    cfg = _setup(m)
+    cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
+    ch = _make_oauth_channel_for_failover(m, name="stream-diagnostic@example.com")
+
+    async def fake_token(account_key):
+        return "tok"
+
+    fake_ws = FakeOAuthHttpStreamWs([
+        {"type": "response.created", "response": {"id": "resp_diagnostic"}},
+        {"type": "response.output_text.delta", "output_index": 0,
+         "content_index": 0, "delta": "partial"},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_ws
+
+    monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
+    response, rid = await _call_failover_responses(
+        m, ch, {"model": "test-model", "stream": True, "input": "hello"},
+    )
+    text = b"".join([chunk async for chunk in response.body_iterator]).decode()
+    assert response.status_code == 200
+    assert "partial" in text and "upstream websocket closed" in text
+    assert "ws-close-diagnostic" not in text
+    detail = m["log_db"].log_detail(rid)
+    assert detail["log"]["status"] == "error"
+    assert detail["log"]["error_message"] == "upstream websocket closed"
+    assert len(_retry_chain(m, rid)) == 1
+    diagnostics = [json.loads(r.args[0]) for r in caplog.records
+                   if r.name == "src.transports.ws_diagnostics"]
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["request_id"] == rid
+    assert diagnostics[0]["round_id"] == detail["log"]["final_round_id"]
+    assert diagnostics[0]["phase"] == "after_accept"
+    assert fake_ws.closed is True
+
+
+@pytest.mark.asyncio
+async def test_reused_oauth_ws_close_diagnostic_uses_second_turn_identity(monkeypatch, m, caplog):
+    cfg = _setup(m)
+    cfg["retry"] = {"transient": {"enabled": False}}
+    cfg["openai"] = {"store": {"enabled": False}}
+    _make_oauth_channel_for_failover(m, name="second-turn-diagnostic@example.com")
+
+    async def fake_token(account_key):
+        return "tok"
+
+    ws = SequentialFakeWebSocket(
+        {"type": "response.create", "model": "test-model", "input": "first", "stream": True},
+        {"type": "response.create", "model": "test-model", "input": "second", "stream": True},
+    )
+    upstream = FakeUpstreamWebSocket([
+        {"type": "response.completed", "response": {
+            "id": "resp_first_diagnostic", "output": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }},
+        {"type": "response.output_text.delta", "output_index": 0,
+         "content_index": 0, "delta": "partial second"},
+    ])
+    connects = []
+
+    async def fake_connect(*args, **kwargs):
+        connects.append(True)
+        return upstream
+
+    monkeypatch.setattr(m["responses_ws"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await asyncio.wait_for(m["responses_ws"].handle_responses_ws(ws), timeout=2)
+    assert len(connects) == 1 and len(upstream.sent) == 2
+    last = _last_request_log(m)
+    assert last["status"] == "error" and last["request_id"].endswith(":ws:2")
+    diagnostics = [json.loads(r.args[0]) for r in caplog.records
+                   if r.name == "src.transports.ws_diagnostics"]
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["request_id"] == last["request_id"]
+    assert diagnostics[0]["round_id"] == last["final_round_id"]
 
 
 @pytest.mark.asyncio

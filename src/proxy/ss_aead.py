@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from .ss_common import (
     AEAD_CIPHERS,
     Reader,
+    SSReadTermination,
     SSAEADError,
     Writer,
     encode_addr,
@@ -120,6 +121,10 @@ class SSAEADConnection:
         if not self._writer:
             raise RuntimeError("not connected")
         await self._writer.write(data)
+
+    @property
+    def read_termination(self) -> SSReadTermination | None:
+        return self._reader.read_termination if self._reader is not None else None
 
     async def read(self, n: int = -1) -> bytes:
         if not self._resp_ok:

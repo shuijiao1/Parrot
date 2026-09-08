@@ -3293,7 +3293,10 @@ async def _try_openai_oauth_responses_ws_channel(
         proxy_attempt_order += 1
         proxy_attempt_id = None
         upstream_ws = None
-        timing = WsAttemptTiming(route_type=route_type, round_id=round_id)
+        timing = WsAttemptTiming(
+            route_type=route_type, round_id=round_id,
+            request_id=request_id, proxy_name=route_log_name,
+        )
         route_state = {"dispatched": False}
         tracker = _WsResponsesTracker(ch)
         try:

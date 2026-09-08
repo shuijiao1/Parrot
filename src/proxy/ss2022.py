@@ -30,6 +30,7 @@ from .ss_common import (
     CipherSpec,
     Reader,
     SS2022Error,
+    SSReadTermination,
     SSAEADError,
     SSError,
     Writer,
@@ -186,6 +187,10 @@ class SS2022Connection:
         if not self._writer:
             raise RuntimeError("not connected")
         await self._writer.write(data)
+
+    @property
+    def read_termination(self) -> SSReadTermination | None:
+        return self._reader.read_termination if self._reader is not None else None
 
     async def read(self, n: int = -1) -> bytes:
         if not self._resp_ok:

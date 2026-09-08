@@ -647,6 +647,8 @@ class WsAttemptTiming(UpstreamRoundTiming):
         *,
         route_type: str = "direct",
         round_id: str | None = None,
+        request_id: str | None = None,
+        proxy_name: str | None = None,
         clock: Clock = time.monotonic,
         wall_clock: WallClock = time.time,
     ) -> None:
@@ -658,6 +660,10 @@ class WsAttemptTiming(UpstreamRoundTiming):
             clock=clock,
             wall_clock=wall_clock,
         )
+        # Diagnostic-only correlation; never part of timeout or billing math.
+        self.diagnostic_request_id = request_id
+        self.diagnostic_proxy_name = proxy_name
+        self._ws_close_diagnostic_logged = False
 
     def mark_handshake_complete(self, at: float | None = None) -> None:
         self.mark_connection_complete(at)

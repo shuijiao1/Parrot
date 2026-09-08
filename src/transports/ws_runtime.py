@@ -34,6 +34,7 @@ from ..proxy.connector import (
 )
 from .timing import BusinessTimeoutError, RoundTimeouts, WsAttemptTiming
 from .websocket import event_type as ws_event_type, frame_size as ws_frame_size
+from .ws_diagnostics import log_ws_close
 
 
 @dataclass
@@ -435,6 +436,7 @@ async def read_until_first_responses_ws_visible_event(
         except websockets.ConnectionClosed as exc:
             if timing is not None:
                 timing.mark_io_complete()
+            log_ws_close(upstream_ws, tracker, exc, phase="before_visible", timing=timing)
             close_code = _connection_closed_code(exc)
             if close_code == 1009:
                 result.outcome = "request_invalid"
@@ -619,6 +621,7 @@ async def read_next_responses_ws_step(
     except websockets.ConnectionClosed as exc:
         if timing is not None:
             timing.mark_io_complete()
+        log_ws_close(upstream_ws, tracker, exc, phase="after_accept", timing=timing)
         close_code = _connection_closed_code(exc)
         close_reason = str(exc.rcvd.reason if exc.rcvd else "")
         if getattr(tracker, "response_completed", False):

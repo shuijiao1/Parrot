@@ -1401,7 +1401,10 @@ async def _try_ws_channel(
         route_type = str(getattr(connector, "type", "direct") or "direct")
         round_id = str(uuid.uuid4())
         route_attempt_id = None
-        timing = WsAttemptTiming(route_type=route_type, round_id=round_id)
+        timing = WsAttemptTiming(
+            route_type=route_type, round_id=round_id,
+            request_id=request_id, proxy_name=route_log_name,
+        )
         route_state = {"dispatched": False}
         relay_state: dict[str, Any] = {}
         upstream_ws = None
@@ -1656,6 +1659,7 @@ async def _try_ws_channel(
                 round_id = str(uuid.uuid4())
                 timing = WsAttemptTiming(
                     route_type=route_type, round_id=round_id,
+                    request_id=request_id, proxy_name=route_log_name,
                 )
                 route_state = {"dispatched": False}
                 relay_state = {}

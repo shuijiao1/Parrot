@@ -123,14 +123,51 @@ class Writer:
             off += sz
 
 
+@dataclass(frozen=True)
+class SSReadTermination:
+    """First read-end metadata; never retain plaintext, ciphertext or traceback."""
+
+    phase: str
+    error_type: str
+    error_module: str
+    errno: int | None = None
+    expected_bytes: int | None = None
+    partial_bytes: int | None = None
+
+
 class Reader:
-    __slots__ = ("_r", "_aead", "_nonce", "_buf")
+    __slots__ = ("_r", "_aead", "_nonce", "_buf", "_read_phase", "_read_termination")
 
     def __init__(self, r, aead, nonce: bytearray):
         self._r = r
         self._aead = aead
         self._nonce = nonce
         self._buf = b""
+        self._read_phase = "idle"
+        self._read_termination: SSReadTermination | None = None
+
+    @property
+    def read_termination(self) -> SSReadTermination | None:
+        return self._read_termination
+
+    def _note_read_termination(self, exc: Exception) -> None:
+        if self._read_termination is not None:
+            return
+        try:
+            errno = getattr(exc, "errno", None)
+            self._read_termination = SSReadTermination(
+                phase=self._read_phase,
+                error_type=type(exc).__name__,
+                error_module=type(exc).__module__,
+                errno=errno if type(errno) is int else None,
+                expected_bytes=(exc.expected if isinstance(exc, asyncio.IncompleteReadError)
+                                and type(exc.expected) is int else None),
+                partial_bytes=(len(exc.partial) if isinstance(exc, asyncio.IncompleteReadError)
+                               else None),
+            )
+        except Exception:
+            # Diagnostics must not change the existing EOF/exception contract.
+            pass
 
     def _dec(self, ct: bytes) -> bytes:
         pt = self._aead.decrypt(bytes(self._nonce), ct, None)
@@ -138,9 +175,16 @@ class Reader:
         return pt
 
     async def _chunk(self) -> bytes:
+        self._read_phase = "length"
         lc = await self._r.readexactly(2 + AEAD_OVERHEAD)
+        self._read_phase = "length_decrypt"
         plen = struct.unpack("!H", self._dec(lc))[0]
-        return self._dec(await self._r.readexactly(plen + AEAD_OVERHEAD))
+        self._read_phase = "payload"
+        payload = await self._r.readexactly(plen + AEAD_OVERHEAD)
+        self._read_phase = "payload_decrypt"
+        data = self._dec(payload)
+        self._read_phase = "idle"
+        return data
 
     async def read(self, n: int = -1) -> bytes:
         """Read up to *n* bytes.  Returns as soon as any data is available
@@ -155,8 +199,11 @@ class Reader:
             return r
         try:
             self._buf = await self._chunk()
-        except (asyncio.IncompleteReadError, ConnectionError, OSError):
-            pass
+        except (asyncio.IncompleteReadError, ConnectionError, OSError) as exc:
+            self._note_read_termination(exc)
+        except Exception as exc:
+            self._note_read_termination(exc)
+            raise
         if n < 0:
             r, self._buf = self._buf, b""
         else:
@@ -174,8 +221,12 @@ class Reader:
                 if not c:
                     break
                 parts.append(c)
-            except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            except (asyncio.IncompleteReadError, ConnectionError, OSError) as exc:
+                self._note_read_termination(exc)
                 break
+            except Exception as exc:
+                self._note_read_termination(exc)
+                raise
         return b"".join(parts)
 
 
